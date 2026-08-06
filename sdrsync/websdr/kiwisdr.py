@@ -1,0 +1,337 @@
+"""Driver for the KiwiSDR software family (e.g. *.proxy.kiwisdr.com instances).
+
+Strategy: same as the websdr.org driver -- drive the real page's own control
+functions (confirmed by reading the live site's actual JS source and
+calling them live in a real browser tab) via Playwright's page.evaluate,
+rather than reimplementing KiwiSDR's websocket wire protocol.
+
+Confirmed global functions/objects on the page:
+    ext_tune(freq_dial_kHz, mode, zoom, zlevel, low_cut, high_cut, opt)
+        -- omitted args are left as JS `undefined` and treated as "don't
+        change this": ext_tune(khz) alone retunes frequency only (mode
+        unaffected); ext_tune(undefined, mode) alone changes mode only
+        (frequency unaffected). Confirmed live against a real instance.
+    ext_get_freq_kHz()  -- returns a STRING like "14074.00", not a number.
+    ext_get_mode()      -- returns the current mode as a lowercase string.
+    ws_snd              -- the sound WebSocket; ws_snd.readyState === 1
+                            (OPEN) is the reliable "ready" signal.
+    toggle_or_set_mute(1|0) -- mutes/unmutes local playback volume.
+
+Unlike PA3FWM, a KiwiSDR instance is a single continuous-range receiver --
+there is no setband()-equivalent and no band table. That does NOT mean
+tune/mode requests can't silently fail though: public instances can drop
+ws_snd out from under you (user-count/time limits), and admin-configured
+frequency ranges can silently clamp/reject a request -- so tune_hz/set_mode
+both check ws_snd.readyState and verify via a readback, the same
+"only report success if it actually happened" discipline as websdr_org.py.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+from typing import Optional
+
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
+
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
+
+logger = logging.getLogger("sdrsync.websdr.kiwisdr")
+
+LOAD_TIMEOUT_MS = 15000
+FREQ_VERIFY_TOLERANCE_HZ = 10
+NARROW_THRESHOLD_HZ = 2000
+WIDE_AM_THRESHOLD_HZ = 8000
+
+# hamlib mode name -> (kiwi base mode, kiwi narrow-variant mode or None if
+# this mode has no narrow variant). Narrow-variant strings are taken
+# verbatim from the live site's passbands_fallback table -- most do NOT
+# follow a simple "+ n" suffix rule (usb -> usn, lsb -> lsn), so they're
+# listed explicitly rather than derived.
+_MODE_MAP: dict[str, tuple[str, Optional[str]]] = {
+    "USB": ("usb", "usn"),
+    "PKTUSB": ("usb", "usn"),
+    "LSB": ("lsb", "lsn"),
+    "PKTLSB": ("lsb", "lsn"),
+    "CW": ("cw", "cwn"),
+    "CWR": ("cw", "cwn"),
+    "AM": ("am", "amn"),
+    "SAM": ("sam", None),
+    "FM": ("nbfm", "nnfm"),
+    "WFM": ("nbfm", "nnfm"),
+}
+
+
+def map_hamlib_mode_kiwi(hamlib_mode: str, passband_hz: Optional[int]) -> Optional[str]:
+    """Pure mapping from a hamlib mode name (+ optional passband) to a
+    KiwiSDR mode string. Returns None if there's no known mapping (caller
+    should skip mode sync and log, not raise). Mirrors
+    websdr_org.map_hamlib_mode's shape but with KiwiSDR's own mode-string
+    table (confirmed from the live site's passbands_fallback object):
+    am/amn/amw, sam/sal/sau/sas/qam, drm, lsb/lsn, usb/usn, cw/cwn,
+    nbfm/nnfm, iq."""
+    mapped = _MODE_MAP.get(hamlib_mode.upper())
+    if mapped is None:
+        return None
+    base_mode, narrow_mode = mapped
+    if narrow_mode is None or not passband_hz:
+        return base_mode
+    if base_mode == "am":
+        if passband_hz < NARROW_THRESHOLD_HZ:
+            return narrow_mode
+        if passband_hz > WIDE_AM_THRESHOLD_HZ:
+            return "amw"
+        return "am"
+    return narrow_mode if passband_hz < NARROW_THRESHOLD_HZ else base_mode
+
+
+def _base_mode_of(kiwi_mode: str) -> str:
+    """Strip a KiwiSDR mode string down to its base ('usn'/'cwn'/'amn'/'nnfm'
+    -> 'usb'/'cw'/'am'/'nbfm'), for comparisons that must not care about the
+    narrow/wide variant (e.g. "is the rig in CW so the CW offset applies").
+    Falls back to returning the string unchanged if it's not a known
+    variant (covers 'amw', 'sam', and any mode this driver doesn't map to)."""
+    for base_mode, narrow_mode in _MODE_MAP.values():
+        if kiwi_mode == narrow_mode:
+            return base_mode
+    return kiwi_mode
+
+
+class KiwiSDRDriver:
+    """WebSDRDriver implementation for the KiwiSDR software family.
+
+    Does not own the Playwright Page/Browser lifecycle -- see
+    WebsdrOrgDriver's docstring, same contract.
+    """
+
+    FINGERPRINT_MARKERS = ("kiwisdr.min.js",)
+
+    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+        self.url = url
+        self.cw_offset_hz = cw_offset_hz
+
+        self._page: Optional[Page] = None
+        self._current_mode: Optional[str] = None
+        self._attached = False
+        self._listeners_registered = False
+        self._last_attach_error: Optional[str] = None
+        self._last_page_error: Optional[str] = None
+        self._last_tune_error: Optional[str] = None
+        self._last_mode_error: Optional[str] = None
+
+    @property
+    def attached(self) -> bool:
+        return self._attached
+
+    # ------------------------------------------------------------------
+    async def attach(self, page: Page) -> None:
+        self._page = page
+        if not self._listeners_registered:
+            page.on("console", self._on_console)
+            page.on("pageerror", self._on_pageerror)
+            self._listeners_registered = True
+
+        try:
+            await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
+            await page.wait_for_function(
+                "typeof window.ext_tune === 'function' "
+                "&& typeof window.ext_get_mode === 'function' "
+                "&& typeof window.ext_get_freq_kHz === 'function' "
+                "&& window.ws_snd && window.ws_snd.readyState === 1 "
+                # ws_snd opening doesn't mean the page is ready to be
+                # retuned yet -- the page's own default demodulator is
+                # created slightly *after* the sound socket opens (its own
+                # init callback), and calling ext_tune() before that exists
+                # throws inside the page's own JS (demodulators[0] is
+                # undefined). Confirmed empirically: readyState hits 1 up
+                # to ~1-2s before demodulators.length goes from 0 to 1.
+                "&& typeof demodulators !== 'undefined' && demodulators.length > 0",
+                timeout=LOAD_TIMEOUT_MS,
+            )
+        except PlaywrightError as e:
+            self._last_attach_error = (
+                f"Page at {self.url} did not behave like a compatible KiwiSDR "
+                f"within {LOAD_TIMEOUT_MS}ms (control functions and/or open sound "
+                f"socket not found): {e!r}"
+            )
+            raise WebSDRIncompatibleError(self._last_attach_error) from e
+
+        self._attached = True
+        self._current_mode = None
+        self._last_attach_error = None
+        self._last_page_error = None
+        self._last_tune_error = None
+        self._last_mode_error = None
+
+    # ------------------------------------------------------------------
+    async def tune_hz(self, freq_hz: int) -> bool:
+        """Returns True only if actually applied and verified via readback."""
+        if not self._attached:
+            return False
+        effective_hz = freq_hz
+        if self._current_mode is not None and _base_mode_of(self._current_mode) == "cw":
+            effective_hz += self.cw_offset_hz
+
+        try:
+            result = await self._page.evaluate(
+                "(khz) => { "
+                "if (!window.ws_snd || window.ws_snd.readyState !== 1) return 'not_ready'; "
+                "window.ext_tune(khz); "
+                "return 'ok'; "
+                "}",
+                effective_hz / 1000.0,
+            )
+        except PlaywrightError as e:
+            self._last_tune_error = f"ext_tune() failed: {e}"
+            logger.warning(self._last_tune_error)
+            return False
+
+        if result == "not_ready":
+            self._last_tune_error = "KiwiSDR sound socket is not open (disconnected mid-session?)"
+            logger.warning(self._last_tune_error)
+            self._attached = False
+            return False
+
+        actual_hz = await self._read_freq_hz()
+        if actual_hz is None:
+            self._last_tune_error = "Could not read back frequency to verify ext_tune()"
+            logger.warning(self._last_tune_error)
+            return False
+        if abs(actual_hz - effective_hz) > FREQ_VERIFY_TOLERANCE_HZ:
+            self._last_tune_error = (
+                f"KiwiSDR did not apply requested frequency: wanted {effective_hz/1000:.3f} kHz, "
+                f"reads {actual_hz/1000:.3f} kHz (out of the receiver's configured range?)"
+            )
+            logger.warning(self._last_tune_error)
+            return False
+
+        self._last_tune_error = None
+        return True
+
+    async def _read_freq_hz(self) -> Optional[int]:
+        try:
+            khz_str = await self._page.evaluate("() => window.ext_get_freq_kHz()")
+            return int(round(float(khz_str) * 1000))
+        except (PlaywrightError, TypeError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------
+    async def set_mode(self, hamlib_mode: str, passband_hz: Optional[int]) -> bool:
+        """Returns True only if actually applied and verified via readback."""
+        if not self._attached:
+            return False
+        kiwi_mode = map_hamlib_mode_kiwi(hamlib_mode, passband_hz)
+        if kiwi_mode is None:
+            self._last_mode_error = (
+                f"hamlib mode {hamlib_mode!r} has no KiwiSDR equivalent; frequency sync continues"
+            )
+            logger.warning(self._last_mode_error)
+            return False
+
+        try:
+            result = await self._page.evaluate(
+                "(mode) => { "
+                "if (!window.ws_snd || window.ws_snd.readyState !== 1) return 'not_ready'; "
+                "window.ext_tune(undefined, mode); "
+                "return 'ok'; "
+                "}",
+                kiwi_mode,
+            )
+        except PlaywrightError as e:
+            self._last_mode_error = f"ext_tune(mode) failed: {e}"
+            logger.warning(self._last_mode_error)
+            return False
+
+        if result == "not_ready":
+            self._last_mode_error = "KiwiSDR sound socket is not open (disconnected mid-session?)"
+            logger.warning(self._last_mode_error)
+            self._attached = False
+            return False
+
+        actual_mode = await self._read_mode()
+        if actual_mode != kiwi_mode:
+            self._last_mode_error = (
+                f"KiwiSDR did not apply requested mode: wanted {kiwi_mode!r}, reads {actual_mode!r}"
+            )
+            logger.warning(self._last_mode_error)
+            return False
+
+        self._current_mode = kiwi_mode
+        self._last_mode_error = None
+        return True
+
+    async def _read_mode(self) -> Optional[str]:
+        try:
+            return await self._page.evaluate("() => window.ext_get_mode()")
+        except PlaywrightError:
+            return None
+
+    # ------------------------------------------------------------------
+    async def set_muted(self, muted: bool) -> None:
+        if not self._attached:
+            return
+        try:
+            await self._page.evaluate(
+                "(m) => { if (window.toggle_or_set_mute) window.toggle_or_set_mute(m ? 1 : 0); }", muted
+            )
+        except PlaywrightError as e:
+            logger.debug("toggle_or_set_mute() call failed (non-fatal): %s", e)
+
+    # ------------------------------------------------------------------
+    def _combined_error(self) -> Optional[str]:
+        parts = [
+            e for e in (
+                self._last_attach_error, self._last_page_error,
+                self._last_tune_error, self._last_mode_error,
+            ) if e
+        ]
+        return " | ".join(parts) if parts else None
+
+    async def get_status(self) -> WebSDRStatus:
+        if not self._attached:
+            return WebSDRStatus(connected=False, last_error=self._combined_error())
+        try:
+            data = await self._page.evaluate(
+                "() => ({freq: window.ext_get_freq_kHz ? window.ext_get_freq_kHz() : null, "
+                "mode: window.ext_get_mode ? window.ext_get_mode() : null, "
+                "audio: window.ws_snd ? window.ws_snd.readyState === 1 : null})"
+            )
+            freq_str = data.get("freq")
+            mode_str = data.get("mode")
+            # ext_get_freq_kHz() can legitimately return "nan" (e.g. right
+            # after attach, before any tune has been sent yet) -- that's
+            # "frequency not known yet", not a fatal error, so it must not
+            # raise out of this try block and flip self._attached off.
+            freq_hz: Optional[int] = None
+            if freq_str is not None:
+                freq_khz = float(freq_str)
+                if not math.isnan(freq_khz):
+                    freq_hz = int(round(freq_khz * 1000))
+            return WebSDRStatus(
+                connected=True,
+                freq_hz=freq_hz,
+                mode=mode_str.upper() if mode_str else None,
+                # Proxy: "is the sound socket open", not a true audio-is-
+                # actually-playing signal -- no confirmed AudioContext
+                # global for KiwiSDR yet (see project_brief.md).
+                audio_active=data.get("audio"),
+                last_error=self._combined_error(),
+            )
+        except (PlaywrightError, TypeError, ValueError) as e:
+            self._attached = False
+            self._last_page_error = str(e)
+            return WebSDRStatus(connected=False, last_error=self._combined_error())
+
+    async def close(self) -> None:
+        self._attached = False
+        self._page = None
+
+    # ------------------------------------------------------------------
+    def _on_console(self, msg) -> None:
+        if msg.type in ("error", "warning"):
+            logger.warning("[KiwiSDR page console:%s] %s", msg.type, msg.text)
+
+    def _on_pageerror(self, exc) -> None:
+        self._last_page_error = f"Unhandled JS error on KiwiSDR page: {exc}"
+        logger.error(self._last_page_error)
