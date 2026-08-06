@@ -26,10 +26,10 @@ import logging
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Callable, Optional
 
-from sdrsync.config import AppSettings, KNOWN_SITES, WebSDRSite, find_site_by_url
+from sdrsync.config import AppSettings, KNOWN_SITES, WebSDRSite
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.preflight import (
     DetectResult,
@@ -48,6 +48,35 @@ SHUTDOWN_TIMEOUT_S = 5.0
 CUSTOM_URL_SENTINEL = "Custom URL..."
 
 
+class _Tooltip:
+    """Minimal hover tooltip. text_func() is re-evaluated on every hover so
+    it can explain a *currently disabled* control (e.g. why a button won't
+    click); returning None/"" shows nothing."""
+
+    def __init__(self, widget: tk.Widget, text_func: Callable[[], Optional[str]]) -> None:
+        self._widget = widget
+        self._text_func = text_func
+        self._tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+
+    def _on_enter(self, event: tk.Event) -> None:
+        text = self._text_func()
+        if not text:
+            return
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+        ttk.Label(
+            self._tip, text=text, background="#ffffe0", relief="solid", borderwidth=1, padding=(4, 2),
+        ).pack()
+
+    def _on_leave(self, _event: tk.Event) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
 class App:
     def __init__(self, root: tk.Tk, settings: AppSettings) -> None:
         self.root = root
@@ -61,6 +90,14 @@ class App:
         # Set on a successful Detect click; the actual WebSDRSite to connect
         # to when the Custom URL sentinel is selected. None until detected.
         self._custom_site: Optional[WebSDRSite] = None
+
+        # User-saved Custom URL sites (persisted via AppSettings.user_sites,
+        # separate from the app's built-in KNOWN_SITES). Loaded before the
+        # dropdown is built so it can include them from the start.
+        self._user_sites: list[WebSDRSite] = [
+            WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
+            for d in self.settings.user_sites
+        ]
 
         # Mirrors of the engine's independent subsystem states, updated
         # from each StatusSnapshot -- drive button labels/enabled-state and
@@ -125,27 +162,36 @@ class App:
     def _build_websdr_panel(self, f: ttk.Frame) -> None:
         ttk.Label(f, text="WebSDR site:").grid(row=0, column=0, sticky="w")
         self.site_var = tk.StringVar()
-        site_names = [s.name for s in KNOWN_SITES] + [CUSTOM_URL_SENTINEL]
-        selected_site = find_site_by_url(self.settings.last_site_url) or KNOWN_SITES[0]
+        selected_site = self._find_any_site_by_url(self.settings.last_site_url) or KNOWN_SITES[0]
         self.site_var.set(selected_site.name)
-        self.site_combo = ttk.Combobox(f, textvariable=self.site_var, values=site_names, state="readonly", width=30)
+        self.site_combo = ttk.Combobox(f, textvariable=self.site_var, values=[], state="readonly", width=30)
         self.site_combo.grid(row=0, column=1, columnspan=2, sticky="ew")
         self.site_combo.bind("<<ComboboxSelected>>", self._on_site_selected)
 
         self.websdr_connect_btn = ttk.Button(f, text="Connect", command=self._on_websdr_connect_clicked)
         self.websdr_connect_btn.grid(row=0, column=3, sticky="ew")
+        _Tooltip(self.websdr_connect_btn, self._websdr_connect_tooltip_text)
+
+        self.delete_site_btn = ttk.Button(f, text="Delete", command=self._on_delete_site_clicked)
+        self.delete_site_btn.grid(row=0, column=4, sticky="ew")
+        _Tooltip(self.delete_site_btn, self._delete_site_tooltip_text)
+        self._refresh_site_dropdown_values()
 
         ttk.Label(f, text="Custom URL:").grid(row=1, column=0, sticky="w")
         self.custom_url_var = tk.StringVar(value="")
+        self.custom_url_var.trace_add("write", self._on_custom_url_edited)
         self.custom_url_entry = ttk.Entry(f, textvariable=self.custom_url_var, width=32)
         self.custom_url_entry.grid(row=1, column=1, columnspan=2, sticky="ew")
         self.detect_btn = ttk.Button(f, text="Detect", command=self._on_detect_clicked)
         self.detect_btn.grid(row=1, column=3, sticky="ew")
 
         self.detect_result_var = tk.StringVar(value="")
-        ttk.Label(f, textvariable=self.detect_result_var, wraplength=380).grid(
-            row=2, column=0, columnspan=4, sticky="w"
+        ttk.Label(f, textvariable=self.detect_result_var, wraplength=300).grid(
+            row=2, column=0, columnspan=3, sticky="w"
         )
+        self.save_site_btn = ttk.Button(f, text="Save to list", command=self._on_save_site_clicked)
+        self.save_site_btn.grid(row=2, column=3, sticky="ew")
+        _Tooltip(self.save_site_btn, self._save_site_tooltip_text)
 
         self.headless_var = tk.BooleanVar(value=self.settings.headless)
         self.headless_check = ttk.Checkbutton(
@@ -263,6 +309,15 @@ class App:
 
     # ------------------------------------------------------------------ WebSDR panel
     def _on_site_selected(self, _event=None) -> None:
+        # A Test result (or a stale error already shown from a previous
+        # site) describes whatever was selected when it ran -- leaving it
+        # on screen after switching sites is misleading, since it reads as
+        # if it still applies to the newly selected one.
+        self.websdr_preflight_var.set("")
+        self._update_websdr_controls()
+
+    def _on_custom_url_edited(self, *_args) -> None:
+        self.websdr_preflight_var.set("")
         self._update_websdr_controls()
 
     def _update_websdr_controls(self) -> None:
@@ -271,8 +326,35 @@ class App:
         self.custom_url_entry.configure(state=state)
         self.detect_btn.configure(state=state)
 
+        # Save to list: only offer once this exact Custom URL has actually
+        # connected -- saving an unreachable/untested URL would just
+        # pollute the dropdown with something that doesn't work.
+        selected = self._resolve_selected_site()
+        can_save = (
+            is_custom
+            and self._websdr_active
+            and self._active_websdr_site is not None
+            and selected is not None
+            and selected.url == self._active_websdr_site.url
+            and self.websdr_conn_var.get() == "connected"
+            and not self._site_already_saved(selected)
+        )
+        self.save_site_btn.configure(state="normal" if can_save else "disabled")
+
+        # Delete: only sites the user saved themselves can be removed --
+        # KNOWN_SITES are the app's built-in defaults, not user data.
+        can_delete = not is_custom and any(s.name == self.site_var.get() for s in self._user_sites)
+        self.delete_site_btn.configure(state="normal" if can_delete else "disabled")
+
         if not self._websdr_active:
-            self.websdr_connect_btn.configure(text="Connect", state="normal")
+            # Connecting a WebSDR before the transceiver is up means the
+            # first frequency it reports has no rig context yet (and any
+            # out-of-range rejection reads as a mystery instead of an
+            # explainable "the rig wants a frequency this profile doesn't
+            # cover") -- require the rig connected first.
+            self.websdr_connect_btn.configure(
+                text="Connect", state="normal" if self._rig_active else "disabled"
+            )
             self.headless_check.configure(state="normal")
             return
 
@@ -287,6 +369,15 @@ class App:
         else:
             self.websdr_connect_btn.configure(text="Switch WebSDR", state="normal")
 
+    def _websdr_connect_tooltip_text(self) -> Optional[str]:
+        # The only reason Connect is ever disabled (as opposed to clickable
+        # but rejected with an error, e.g. an undetected Custom URL) is the
+        # rig-first gate -- explain that on hover rather than leaving a
+        # greyed-out button with no clue why.
+        if str(self.websdr_connect_btn["state"]) == "disabled" and not self._rig_active:
+            return "Connect the transceiver first"
+        return None
+
     def _resolve_selected_site(self) -> Optional[WebSDRSite]:
         """Returns the WebSDRSite the WebSDR panel's controls currently
         point at, or None if the selection is invalid (unrecognized name,
@@ -298,10 +389,60 @@ class App:
             if self._custom_site is not None and self._custom_site.url == self.custom_url_var.get().strip():
                 return self._custom_site
             return None
-        return next((s for s in KNOWN_SITES if s.name == name), None)
+        return next((s for s in KNOWN_SITES + self._user_sites if s.name == name), None)
+
+    def _find_any_site_by_url(self, url: str) -> Optional[WebSDRSite]:
+        return next((s for s in KNOWN_SITES + self._user_sites if s.url == url), None)
+
+    def _site_already_saved(self, site: WebSDRSite) -> bool:
+        return self._find_any_site_by_url(site.url) is not None
+
+    def _refresh_site_dropdown_values(self) -> None:
+        names = [s.name for s in KNOWN_SITES + self._user_sites] + [CUSTOM_URL_SENTINEL]
+        self.site_combo.configure(values=names)
+
+    def _persist_user_sites(self) -> None:
+        self.settings.user_sites = [
+            {"name": s.name, "url": s.url, "driver_type": s.driver_type} for s in self._user_sites
+        ]
+        self.settings.save()
+
+    def _save_site_tooltip_text(self) -> Optional[str]:
+        if str(self.save_site_btn["state"]) == "disabled":
+            return "Connect this Custom URL successfully first, then Save to list"
+        return None
+
+    def _delete_site_tooltip_text(self) -> Optional[str]:
+        if str(self.delete_site_btn["state"]) == "disabled":
+            return "Only sites you've saved to the list can be deleted"
+        return None
+
+    def _on_save_site_clicked(self) -> None:
+        site = self._resolve_selected_site()
+        if site is None or self._site_already_saved(site):
+            return
+        self._user_sites.append(site)
+        self._persist_user_sites()
+        self._refresh_site_dropdown_values()
+        self.detect_result_var.set(f"Saved to list: {site.name}")
+        self._update_websdr_controls()
+
+    def _on_delete_site_clicked(self) -> None:
+        name = self.site_var.get()
+        site = next((s for s in self._user_sites if s.name == name), None)
+        if site is None:
+            return  # built-in sites can't be deleted -- guarded by button state too
+        if not messagebox.askyesno("Delete WebSDR site", f"Remove '{site.name}' from the list?"):
+            return
+        self._user_sites = [s for s in self._user_sites if s.url != site.url]
+        self._persist_user_sites()
+        self._refresh_site_dropdown_values()
+        # The deleted entry can no longer be selected.
+        self.site_var.set(KNOWN_SITES[0].name)
+        self._on_site_selected()
 
     def _restore_custom_site_if_needed(self) -> None:
-        if find_site_by_url(self.settings.last_site_url) is not None:
+        if self._find_any_site_by_url(self.settings.last_site_url) is not None:
             return
         if not self.settings.last_site_driver_type or not self.settings.last_site_url:
             return
@@ -393,12 +534,19 @@ class App:
         self.websdr_preflight_var.set(("OK: " if result.ok else "FAIL: ") + result.message)
 
     def _on_websdr_connect_clicked(self) -> None:
+        active = self._active_websdr_site
+        if not self._websdr_active and not self._rig_active:
+            # Belt-and-suspenders -- the button is disabled in this state
+            # (see _update_websdr_controls()), but guard the handler too in
+            # case of a race between a click and a state-changing snapshot.
+            self.websdr_err_var.set("Connect the transceiver first")
+            return
+
         site = self._resolve_selected_site()
         if site is None:
             self.websdr_err_var.set("Select a known site, or Detect a Custom URL first")
             return
 
-        active = self._active_websdr_site
         if self._websdr_active and active is not None and site.url == active.url and site.driver_type == active.driver_type:
             self.websdr_connect_btn.configure(state="disabled", text="Disconnecting...")
             self.engine.stop_websdr_from_other_thread()
@@ -407,7 +555,7 @@ class App:
         # Connect (not active) or Switch (active, different site) -- same
         # call either way; the engine replaces whatever's currently loaded.
         self.settings.last_site_url = site.url
-        self.settings.last_site_driver_type = site.driver_type if find_site_by_url(site.url) is None else ""
+        self.settings.last_site_driver_type = site.driver_type if self._find_any_site_by_url(site.url) is None else ""
         self.settings.headless = self.headless_var.get()
         self.settings.save()
 

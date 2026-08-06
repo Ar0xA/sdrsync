@@ -22,6 +22,12 @@ class WebSDRSite:
 
 # Starter list for the dropdown. Add more sites here as they're supported;
 # driver_type must match a key in sdrsync.websdr.registry.DRIVERS.
+#
+# NOTE: these are all third-party public receivers, not ours -- they can go
+# offline, move, or (as already happened once with the original KiwiSDR
+# entry, which had a server-side bug breaking set_mode()) develop instance-
+# specific quirks. Treat this list as needing occasional revalidation, not
+# a permanent fixture.
 KNOWN_SITES: list[WebSDRSite] = [
     WebSDRSite(
         name="Twente wide-band (websdr.org)",
@@ -29,9 +35,23 @@ KNOWN_SITES: list[WebSDRSite] = [
         driver_type="websdr_org",
     ),
     WebSDRSite(
-        name="KiwiSDR example (Rouveen)",
-        url="http://23126.proxy.kiwisdr.com:8073/",
+        name="KiwiSDR example (VK5ARG)",
+        url="http://kiwisdr.areg.org.au:8073/",
         driver_type="kiwisdr",
+    ),
+    WebSDRSite(
+        # 80m HF band (~2.65-4.65 MHz), confirmed live -- the previous
+        # example (sdr2.justjakob.de) was VHF-only (2m, ~144-146 MHz),
+        # which made every ordinary HF rig frequency report as "out of
+        # range" by default. OpenWebRX instances with true full-HF
+        # (0-30 MHz) single-profile coverage are uncommon (most consumer
+        # SDR hardware this software runs on doesn't have that much
+        # instantaneous bandwidth), so this is a deliberately narrower but
+        # actually-useful-for-HF-testing default rather than a wideband one
+        # like the websdr.org/KiwiSDR entries above.
+        name="OpenWebRX example (OH6KK, 80m)",
+        url="http://oh6kk.dy.fi:8073/",
+        driver_type="openwebrx",
     ),
 ]
 
@@ -46,6 +66,12 @@ class AppSettings:
     # KNOWN_SITES) can be reconstructed on restart instead of silently
     # reverting to KNOWN_SITES[0]. Empty string means "not a custom site".
     last_site_driver_type: str = ""
+    # WebSDR sites the user saved to the dropdown via the "Save to list"
+    # button (a proven-working Custom URL), each dict:
+    # {"name": str, "url": str, "driver_type": str}. Separate from
+    # KNOWN_SITES, which are the app's built-in defaults and aren't
+    # user-editable.
+    user_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
     mute_on_tx: bool = True
     # Despite the name, this does NOT use Chromium's real --headless mode --

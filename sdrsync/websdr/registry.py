@@ -10,11 +10,13 @@ import re
 from typing import Optional
 
 from sdrsync.websdr.kiwisdr import KiwiSDRDriver
+from sdrsync.websdr.openwebrx import OpenWebRXDriver
 from sdrsync.websdr.websdr_org import WebsdrOrgDriver
 
 DRIVERS = {
     "websdr_org": WebsdrOrgDriver,
     "kiwisdr": KiwiSDRDriver,
+    "openwebrx": OpenWebRXDriver,
 }
 
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
