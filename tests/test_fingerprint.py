@@ -12,6 +12,12 @@ KIWISDR_HTML = """
 </head><body>KiwiSDR</body></html>
 """
 
+OPENWEBRX_HTML = """
+<html><head>
+<script src="compiled/receiver.js"></script>
+</head><body>OpenWebRX</body></html>
+"""
+
 UNRELATED_HTML = """
 <html><head>
 <script src="jquery.min.js"></script>
@@ -22,6 +28,14 @@ BOTH_MARKERS_HTML = """
 <html><head>
 <script src="websdr-base.js?3"></script>
 <script src="kiwisdr.min.js"></script>
+</head><body>Ambiguous</body></html>
+"""
+
+ALL_THREE_MARKERS_HTML = """
+<html><head>
+<script src="websdr-base.js?3"></script>
+<script src="kiwisdr.min.js"></script>
+<script src="compiled/receiver.js"></script>
 </head><body>Ambiguous</body></html>
 """
 
@@ -43,12 +57,20 @@ def test_detects_kiwisdr():
     assert detect_driver_type(KIWISDR_HTML) == "kiwisdr"
 
 
+def test_detects_openwebrx():
+    assert detect_driver_type(OPENWEBRX_HTML) == "openwebrx"
+
+
 def test_no_marker_returns_none():
     assert detect_driver_type(UNRELATED_HTML) is None
 
 
 def test_ambiguous_matches_return_none_not_first_registered():
     assert detect_driver_type(BOTH_MARKERS_HTML) is None
+
+
+def test_three_way_ambiguous_matches_return_none():
+    assert detect_driver_type(ALL_THREE_MARKERS_HTML) is None
 
 
 def test_marker_string_in_body_text_is_not_a_match():

@@ -20,21 +20,34 @@ site's own JavaScript control functions. This means:
   is true even with the browser window hidden (see "Hidden window mode"
   below); Chromium's actual `--headless` mode has no audio output at all
   (confirmed by testing), so sdrsync never uses it.
-- Each WebSDR *software family* (websdr.org's classic "WebSDR", OpenWebRX,
-  KiwiSDR, ...) has its own unrelated control API, so each gets its own
-  driver module implementing `sdrsync.websdr.base.WebSDRDriver`. Two
+- Each WebSDR *software family* (websdr.org's classic "WebSDR", KiwiSDR,
+  OpenWebRX, ...) has its own unrelated control API, so each gets its own
+  driver module implementing `sdrsync.websdr.base.WebSDRDriver`. Three
   families are implemented today: websdr.org
   (`sdrsync/websdr/websdr_org.py`), which covers
-  `websdr.ewi.utwente.nl:8901` and other sites running the same software,
-  and KiwiSDR (`sdrsync/websdr/kiwisdr.py`), which covers
-  `*.proxy.kiwisdr.com` and other KiwiSDR instances.
+  `websdr.ewi.utwente.nl:8901` and other sites running the same software;
+  KiwiSDR (`sdrsync/websdr/kiwisdr.py`), which covers `*.proxy.kiwisdr.com`
+  and other KiwiSDR instances; and OpenWebRX/OpenWebRX+
+  (`sdrsync/websdr/openwebrx.py`), likely the most common self-hosted
+  WebSDR software by receiver count.
+  - **OpenWebRX limitation**: some OpenWebRX stations run multiple SDR
+    "profiles" (e.g. a separate HF device and a separate VHF/UHF device).
+    Automatically switching profiles to follow a rig frequency outside the
+    *currently active* profile's range isn't implemented yet — a
+    frequency outside range is reported clearly (same as an unsupported
+    mode: logged, shown in the WebSDR panel, frequency/mode sync elsewhere
+    unaffected) rather than silently dropped or retried forever.
+  - **OpenWebRX mute-on-TX**: uses the page's own mute toggle
+    (`toggleMute()`), confirmed working live — unlike the other two
+    drivers this one doesn't need a documented no-op fallback here.
 - Pasting an arbitrary WebSDR URL doesn't require knowing which software
   it runs: pick **Custom URL...** in the site dropdown, paste the URL, and
   click **Detect** — sdrsync fetches the page's HTML and checks its
   `<script src="...">` tags against each registered driver's known marker
   filename(s) (e.g. `websdr-base.js` for websdr.org, `kiwisdr.min.js` for
-  KiwiSDR). If the site doesn't match any known driver, or matches more
-  than one (ambiguous), Detect reports that rather than guessing.
+  KiwiSDR, `compiled/receiver.js` for OpenWebRX). If the site doesn't
+  match any known driver, or matches more than one (ambiguous), Detect
+  reports that rather than guessing.
 - **The rig connection and the WebSDR connection are two fully independent
   subsystems, each with its own Connect/Disconnect in its own panel** —
   not one combined session. Picking a different WebSDR has nothing to do

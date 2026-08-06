@@ -1,6 +1,18 @@
-# sdrsync — project brief
+# SDRSync — project brief
 
-_Last updated: 2026-08-06 (v3 round: KiwiSDR driver + WebSDR type auto-detection, plus the pa3fwm→websdr_org rename)_
+_Last updated: 2026-08-06 (v4 round: OpenWebRX driver, git repo init, project renamed sdrsync -> SDRSync)_
+
+**Catch-up note**: this file was last fully rewritten after v3. Since then,
+in the same session: two real bugs found by testing the KiwiSDR driver
+against a second live instance (see "v3.5" note below the v3 table), a
+GUI redesign decoupling the rig and WebSDR connections into two
+independent panels/lifecycles (see "v3.6" note), the project was put under
+git (`git init` + initial commit in the project root) and renamed
+**SDRSync** for display purposes (window title, README H1) while the
+Python package/import path stays lowercase `sdrsync` (renaming that would
+be a risky import-path refactor for what was a branding-only request).
+Some detail in the earlier sections of this file below predates those
+changes and is kept for history rather than corrected line-by-line.
 
 ## What this is
 
@@ -75,12 +87,67 @@ name a new user would recognize — "websdr.org" (the software's actual
 project site) is the more discoverable name for the `driver_type` string
 and module name. No behavior change.
 
+**v3.5 — KiwiSDR bug fixes from live click-through (not a numbered
+block, done directly against a running app + a fresh live instance)**:
+testing the app for real surfaced that the example KiwiSDR site
+(`23126.proxy.kiwisdr.com:8073`) has its own server-side bug (`set_mode()`
+throws inside the site's own `kiwi_passbands()` because that instance's
+`cfg.passbands` is `undefined` — not our bug, confirmed by reading the
+site's own JS). Testing against a second, healthy instance
+(`kiwisdr.areg.org.au:8073`, picked fresh from `kiwisdr.com/public/`)
+found two real bugs in our own driver, both fixed: (1) `attach()`'s
+readiness gate only checked `ws_snd.readyState === 1`, but the page's own
+demodulator object isn't created until ~1-3s after that, so the very
+first `tune_hz`/`set_mode` call could throw inside the page — fixed by
+also waiting for `demodulators.length > 0`; (2) `get_status()` crashed on
+a transient `"nan"` frequency reading right after attach (before any tune
+landed), which incorrectly flipped `_attached` to `False` and made every
+subsequent call a no-op — fixed by treating `NaN` as "not known yet"
+instead of raising. `KNOWN_SITES`' KiwiSDR entry was later swapped to the
+healthy instance in the v4 round (see below) since the example site issue
+persists.
+
+**v3.6 — decoupled rig/WebSDR connection lifecycles (GUI + engine
+redesign, user-requested, not a numbered block)**: the user pointed out
+that pressing "Disconnect" to switch WebSDR sites also killed the
+rigctld connection, which made no sense ("we'd only be interested in
+switching sdrs, not trancievers"). This was a real architecture gap, not
+just a button-label fix — `SyncEngine` was rewritten so the rig and
+WebSDR subsystems have fully independent start/stop lifecycles
+(`start_rig_from_other_thread()`/`stop_rig_from_other_thread()`/
+`start_websdr_from_other_thread()`/`stop_websdr_from_other_thread()`),
+with a single `SyncEngine` instance now created once at app startup and
+living for the whole session (not recreated per Connect click). The GUI
+was split into two independent panels (**WebSDR** and **Transceiver**),
+each with its own Connect/Test buttons and status/error display; the
+WebSDR panel's Connect button is context-aware — labeled **Connect** when
+nothing's loaded, **Switch WebSDR** when a different site is selected
+while one's already active (same call either way, the engine just
+replaces whatever's loaded), **Disconnect** when the selected site is the
+one that's active. `preflight.PreflightResult` was split into
+`RigPreflightResult`/`WebsdrPreflightResult` to match. Covered by
+`tests/test_engine_switch_site.py` (renamed in spirit, not just for
+site-switching anymore — proves rig/WebSDR start/stop never touch each
+other). All 44 tests passed after this round; live-tested via the running
+app (connect rig once, switch WebSDR sites repeatedly, confirm
+Transceiver panel stays connected throughout).
+
+v4 added 3 more blocks (R–T) per a follow-up request to research and
+support a third WebSDR software family, OpenWebRX (likely the most
+common self-hosted WebSDR by receiver count):
+
+| Block | What | File(s) |
+|---|---|---|
+| R. OpenWebRX driver | New driver for the OpenWebRX/OpenWebRX+ family. Unlike the other two drivers, control is via a jQuery-widget object (`$('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator()`), frequency is offset-relative to a `center_freq` global (not absolute), and mode strings have no narrow/wide suffix convention (confirmed live via `Modes.getModes()`) | `websdr/openwebrx.py` |
+| S. Registration | `DRIVERS["openwebrx"]`; added an OpenWebRX example site to `KNOWN_SITES` and swapped the flaky KiwiSDR example for the healthy one from v3.5 | `websdr/registry.py`, `config.py` |
+| T. Tests + docs | `test_openwebrx_mode_mapping.py`; extended `test_fingerprint.py` with OpenWebRX + three-way-ambiguous cases; README + this file updated | `tests/`, `README.md`, `project_brief.md` |
+
 Prior single-file prototypes (`websdrSync.py`, `websdrSync1.1.py`,
 `websdrSync.1.2.py`) are still in the repo root — superseded by the
 `sdrsync/` package, safe to delete once the package is confirmed working
 against real hardware, or keep as reference.
 
-### Three review passes done so far
+### Review passes done so far (plan review + implementation review each round)
 1. Opus reviewed the **v1 plan** before coding (band-switching, autoplay
    gating, thread-safety contract, debounce/rate-cap).
 2. Opus reviewed the **v1 implementation** and found 11 real bugs (thread
@@ -166,9 +233,96 @@ against real hardware, or keep as reference.
    latches on a `False` return — cosmetic/bandwidth cost only, no
    correctness impact, and the same shape already exists implicitly
    elsewhere in the engine's retry design.
+6. Opus reviewed the **v4 plan** before coding, catching 12 issues fixed
+   before implementation, several substantive: (a) the readiness gate
+   drafted for `attach()` checked a different JS access path
+   (`getDemodulators()`) than the control calls actually use
+   (`$('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator()`)
+   — the exact "gate passes, control call still throws" bug class already
+   hit twice before; (b) the range guard could fail *open* if
+   `window.bandwidth` weren't included in the readiness check (`NaN > x`
+   is `false` in JS); (c) the plan omitted `cw_offset_hz` from the driver
+   constructor entirely — since `engine.py` constructs every driver
+   identically and the call site isn't wrapped in try/except, a
+   constructor mismatch would raise an exception that's silently
+   swallowed (scheduled via `run_coroutine_threadsafe` with nobody
+   awaiting the future), making Connect appear to do nothing with zero
+   error anywhere; (d) same-`page.evaluate` write-then-readback was being
+   treated as delivery confirmation, but it can only prove the page's own
+   client-side guard accepted the write, never that a dead control
+   WebSocket didn't swallow it — needs the same explicit `readyState`
+   check `kiwisdr.py` already has; (e) **unique to this driver's
+   offset-relative frequency model**: if the SDR profile's `center_freq`
+   changes after a successful tune (someone switches profile in the
+   browser, or the server pushes a new center on reconnect), the
+   demodulator keeps its stale offset and the receiver silently drifts to
+   the wrong absolute frequency, since the rig's own frequency hasn't
+   moved so nothing would re-trigger a push — no existing driver has this
+   failure mode since the other two push absolute frequencies; (f)
+   treating "frequency outside the active profile's range" as
+   equivalent-cost to an unmapped hamlib mode understated it — an
+   unmapped mode is rare/transient, while a rig parked outside range is
+   the expected steady state for the exact scenario this limitation
+   exists for, and retrying every 200ms tick against the unrotated,
+   uncapped `sdrsync.log` is a real disk-growth risk; (g) three
+   conventions already established (and each already bug-fixed once) in
+   the other two drivers were missing from the plan text: the `attached`
+   property itself, clearing all `_last_*_error` fields on a successful
+   `attach()`, and `get_status()` setting `_attached = False` on a caught
+   `PlaywrightError`; (h) `get_status()`'s frequency arithmetic risked
+   repeating the exact NaN-crash bug already found and fixed once for
+   KiwiSDR. All fixed in the plan before any code was written — see
+   `C:\Users\ABEL75\.claude\plans\rippling-roaming-forest.md`'s v4
+   section for the full revised Block R text.
+7. Opus reviewed the **v4 implementation** and found 4 real bugs, all
+   fixed and then verified against the live OpenWebRX example instance:
+   - **Drift-recovery reload was undoing the exact recovery it was meant
+     to do.** Detaching on a detected `center_freq`/`bandwidth` change
+     routed through the normal attach path, which unconditionally
+     `page.goto()`'d — a full reload that resets OpenWebRX back to its
+     *default* SDR profile. An operator who'd manually switched to a
+     non-default profile in the browser tab would have that choice
+     silently reverted every time drift-detection fired. Fixed by having
+     `attach()` check the readiness predicate **in place first** (a
+     harmless no-op `page.evaluate` on a fresh/blank page) and only
+     navigate if it's not already satisfied — so a drift-triggered
+     reattach re-baselines against whatever profile is actually loaded
+     instead of discarding it.
+   - **`typeof x === 'number'` doesn't exclude `NaN`** in both the
+     readiness predicate and `tune_hz`'s range check — `Math.abs(NaN) >
+     n` is `false`, so a transiently-`NaN` `center_freq` could pass the
+     in-range check and get a `NaN` offset written to the live
+     demodulator (Python-side `isfinite` checks caught the aftermath and
+     kept the engine from latching it, but the page had already been
+     handed a bad value). Fixed by switching to `Number.isFinite()`.
+   - **A dropped control WebSocket went undetected indefinitely once the
+     rig stopped moving.** `get_status()` read `ws.readyState` but never
+     acted on it; the actual recovery trigger (`tune_hz`/`set_mode`'s own
+     `readyState` re-checks) only runs when the engine has a reason to
+     call them, which stops happening once a frequency/mode is latched as
+     already-sent. Fixed by having `get_status()` itself detach when
+     `ws_ready` is false, the same treatment as the drift-detection path.
+   - **The page-side `out_of_range` branch wasn't rate-limited**, only the
+     local Python-side pre-check was — reachable whenever the cache was
+     momentarily empty, defeating part of the point of the rate-limiting
+     fix from the plan review. Fixed by mirroring the same
+     compare-before-logging guard in both places.
+   Verified afterward with a standalone script driving the real
+   `OpenWebRXDriver` against `sdr2.justjakob.de`: clean attach, an
+   in-range `tune_hz` that verifies to the exact requested Hz, an
+   out-of-range `tune_hz` correctly rejected with the repeat call
+   downgraded to `debug` (not re-logged as `warning`), `set_mode('USB')`
+   succeeding, and `set_muted(True)`/`set_muted(False)` completing
+   without error. One unrelated, harmless observation from that run: the
+   site's own JS occasionally logs a console error
+   (`TypeError: Cannot read properties of null (reading
+   'get_offset_frequency')` inside `zoom_set`) that doesn't affect
+   correctness and isn't triggered by anything this driver calls directly
+   — a pre-existing quirk in that instance's waterfall/zoom code, not
+   flagged as an action item.
 
 ### What's been verified so far
-- `pytest` — 39/39 passing (pure-logic + stubbed-engine tests: mode
+- `pytest` — 51/51 passing (pure-logic + stubbed-engine tests: mode
   mapping, band selection, rigctld response parsing, mode/frequency-sync
   independence, and the new failed-push-is-retried regression test; no
   browser/hardware needed).
@@ -346,6 +500,65 @@ attach, Test button, clean Disconnect — see log excerpt below), but:
      issue, consider swapping `KNOWN_SITES`' KiwiSDR entry for a
      less-flaky instance** — pick one from `kiwisdr.com/public/` (click
      through the captcha-style "Click to show KiwiSDRs" splash first).
+     **Done in v4**: swapped to `kiwisdr.areg.org.au:8073`.
+
+5. **OpenWebRX driver (v4) — driver-level live testing done, app-level not
+   yet, and its multi-profile limitation is a real, common-case gap, not
+   an edge case.** `OpenWebRXDriver` was built, its individual JS calls
+   confirmed live in a research browser tab, and — after the
+   implementation review's 4 bug fixes — the whole driver (`attach`,
+   in-range `tune_hz` with exact readback verification, out-of-range
+   rejection + rate-limiting, `set_mode`, `set_muted`) was exercised
+   end-to-end via a standalone script against a real receiver
+   (`sdr2.justjakob.de`) and confirmed working. What's still missing is
+   the same pass the other two drivers got: **through the actual app**
+   (mock rig + real GUI session, Connect/Switch WebSDR buttons) rather
+   than a standalone script — needs that before being considered as
+   trustworthy as the other two in normal use.
+
+   The bigger open item: some OpenWebRX stations run multiple SDR
+   profiles (e.g. a separate HF device and a separate VHF/UHF device),
+   switchable client-side via
+   `ws.send(JSON.stringify({type: "selectprofile", params: {profile: id}}))`
+   (source-confirmed, never live-tested — no multi-profile instance was
+   available during research). `tune_hz()` reports a frequency outside the
+   *currently active* profile's range the same way an unsupported hamlib
+   mode is reported (logged once, shown in the WebSDR panel, retried
+   without spamming — see the rate-limiting note in `openwebrx.py`), but
+   does **not** attempt to automatically find and switch to a profile that
+   would cover the requested frequency. For an operator who works HF and
+   VHF/UHF on the same rig against a station like that, this means
+   sdrsync will simply stop following them across that boundary until
+   they manually pick the right profile in the browser tab. Needs a real
+   multi-profile instance to research the missing piece: where the client
+   learns each profile's frequency range *before* switching to it (the
+   profile list populates a dropdown with just id/name pairs; the actual
+   center/bandwidth seemed to only arrive *after* switching, in this
+   round's research).
+
+6. **"Save to list" button reported staying disabled even when the
+   WebSDR panel's status shows "connected" (user report, 2026-08-06,
+   not yet reproduced/root-caused).** Feature (v5): a "Save to list"
+   button next to the Custom URL Detect result persists a proven-working
+   Custom URL into `AppSettings.user_sites` (`config.py`) and adds it to
+   the site dropdown; a "Delete" button next to the dropdown removes a
+   previously-saved entry (confirmation dialog first). Both wired up in
+   `gui/app.py` (`_on_save_site_clicked`, `_on_delete_site_clicked`,
+   `_update_websdr_controls()`'s `can_save`/`can_delete` gating,
+   `_resolve_selected_site`/`_find_any_site_by_url`/`_site_already_saved`
+   helpers). `can_save` requires all of: Custom URL currently selected,
+   WebSDR subsystem active, the *exact* resolved site URL matching
+   `self._active_websdr_site.url`, `websdr_conn_var == "connected"`, and
+   the site not already present in `KNOWN_SITES`/`self._user_sites`. User
+   reported the button stayed disabled despite the status label reading
+   "connected" -- by explicit instruction, not investigated or fixed yet
+   ("leave it at that"). Suspect areas for a future pass: a URL-string
+   mismatch between what `_resolve_selected_site()` returns and
+   `self._active_websdr_site.url` (e.g. trailing slash, or a stale
+   `_custom_site` vs. what's actually loaded), or `_update_websdr_controls()`
+   not being re-invoked by the specific snapshot that flips status to
+   "connected" in this scenario. Needs a live click-through with the
+   Custom URL flow to reproduce before touching the code.
 
 Log excerpt from that run (full log at
 `C:\Users\ABEL75\.sdrsync\sdrsync.log`):
@@ -422,7 +635,7 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
 1. `cd` into the project, confirm `pip install -r requirements.txt` deps
    are still present (they're in the normal Python 3.12 user site-packages,
    should survive a restart).
-2. `pytest` to confirm the 39 tests still pass after the restart.
+2. `pytest` to confirm the 51 tests still pass after the restart.
 3. Smoke test without hardware first: `python -m sdrsync.main`, check
    **Use mock rig**, Connect, try the Mock Rig Control panel and the
    **Test** button.
