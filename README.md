@@ -77,6 +77,12 @@ control functions. This means:
 pip install -r requirements.txt
 ```
 
+Or, as an editable install (also registers an `sdrsync` command):
+
+```bash
+pip install -e .
+```
+
 ## Run
 
 1. Point hamlib's `rigctld` at your radio, e.g.:
@@ -110,6 +116,15 @@ window positioned far off any screen while genuinely shown (not
 minimized/hidden, which suspends WebView2's rendering and audio) —
 this keeps the real audio pipeline intact while showing nothing on
 screen.
+
+### Poll interval
+
+The Transceiver panel's **Poll interval (s)** control sets how often
+sdrsync reads your rig's frequency/mode/PTT and pushes changes to the
+WebSDR (default 0.2s / 5 times a second). Lower it further for snappier
+tracking, or raise it if you're on a slow CAT link (e.g. low-baud-rate
+serial) or sharing `rigctld` with other software and want to reduce CAT
+traffic. Takes effect immediately, no reconnect needed.
 
 ### Testing without real hardware
 
@@ -154,3 +169,12 @@ pytest
 Covers pure logic and stubbed-object engine behavior only (mode mapping,
 band selection, rigctld response parsing, mode/frequency-sync
 independence) — no browser, socket, or real hardware needed.
+
+## License
+
+GPL-3.0-only — see [LICENSE](LICENSE).
+
+## Platform support
+
+Windows only for now (the embedded browser is Edge WebView2). Linux/macOS
+support is a known, tracked gap — not yet started.

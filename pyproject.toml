@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdrsync"
+dynamic = ["version"]
+description = "Keeps a WebSDR in sync with a real transceiver over hamlib's rigctld (one-way: rig -> WebSDR)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "Ar0xA" }]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "wxPython>=4.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+sdrsync = "sdrsync.gui.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "sdrsync.__version__" }
+
+[tool.setuptools.packages.find]
+# Explicit include -- without it, setuptools' auto-discovery also picks up
+# the top-level tests/ package (it has its own __init__.py) and pip install
+# -e . fails with "multiple top-level packages discovered".
+include = ["sdrsync*"]

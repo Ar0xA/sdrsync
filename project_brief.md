@@ -660,16 +660,310 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
    this round only covered the Windows/WebView2 backend, since that's
    the only OS available in this dev environment; treat cross-platform
    as still open, not assumed working.
-2. **Add flrig as a second rig backend, alongside rigctld.** Requested by
+2. **v6 hardening round -- DONE, 2026-08-07.** After the v5
+   browser migration, asked for a 1.0-readiness brainstorm (own read +
+   an independent Opus pass, both grounded in the actual code, not
+   generic checklist advice). User picked the top 5 findings to
+   implement now, ordered ahead of flrig; explicitly out of scope for
+   this round: bidirectional sync (one-way transceiver->WebSDR is a
+   fixed design decision) and Linux/macOS support (already a tracked,
+   separate gap). Following the usual plan review -> implement -> review
+   -> verify cycle. Live progress/resume-state tracked via TaskList
+   (tasks #29-#35) and updated here after each block completes, in case
+   of a session break. The 5 items, in the order they'll be implemented:
+   1. **Fix the dead "Hide browser window" setting.** Verified bug:
+      `AppSettings.headless` is written by `gui/app.py` but nothing in
+      `gui/webview_host.py` reads it post-wxPython-migration -- the
+      WebView is now *always* off-screen regardless of the checkbox, so
+      there's currently no way to ever see a WebSDR's waterfall/spectrum
+      through the app. A real regression from the v5 rewrite, not a
+      pre-existing gap.
+   2. **Fix `RigctldClient.get_mode()`'s RPRT hang.** Verified bug:
+      `get_mode()` (`rig/rigctld.py`) unconditionally reads two lines for
+      the `m` command; a rig/backend replying with a single-line
+      `RPRT -x` error leaves the second `readline()` blocked until
+      `cmd_timeout`, forcing a disconnect/reconnect instead of degrading
+      to frequency-only sync.
+   3. **Config robustness.** `AppSettings.load()`'s `user_sites` entries
+      are used unguarded downstream (`gui/app.py`), so a hand-edited or
+      partially-written `config.json` crashes at startup with a bare
+      traceback; `save()` is also a non-atomic `write_text` (a crash
+      mid-write can truncate the config). Validate/skip malformed
+      entries; make `save()` write-temp-then-replace.
+   4. **License + packaging basics.** No `LICENSE`, no `pyproject.toml`/
+      version string anywhere, and the superseded `websdrSync*.py`
+      prototypes are still sitting in the repo root. User chose
+      **GPL-3.0** for the license (asked explicitly, since it's a
+      decision only they can make). Add `LICENSE`, a `pyproject.toml`
+      entry point, `__version__` logged at startup, remove the old
+      prototype files.
+   5. **Configurable poll interval.** `SyncEngine`'s poll loop is a fixed
+      `POLL_INTERVAL_S = 0.2` issuing 3 CAT commands/tick (15/sec) with
+      no way to slow it down -- risky on slower rigs (e.g. 4800-baud
+      CI-V) or when rigctld is shared with other software. Make it a
+      setting with a GUI control.
+
+   **Plan review (Opus, independent pass, done 2026-08-07) — 2 corrections
+   made before implementation, rest confirmed sound:**
+   - **Item 1 (headless fix) had a real blocking conflict, caught and
+     verified against the actual code.** `WebViewHost.present()`
+     (`gui/webview_host.py`) hardcodes `ON_SCREEN_POS`/`OFF_SCREEN_POS`;
+     `WxPageAdapter._simulate_click`'s audio-unlock click (`browser_shim.py`
+     line ~500) always calls `on_screen_presenter(False)` in its `finally`
+     — so naively "show the frame on connect when not headless" would get
+     silently yanked back off-screen the moment audio unlocks, on every
+     connection. **Revised fix**: `WebViewHost` needs its own "rest
+     position" concept (on-screen when not headless, off-screen when
+     headless) that `present(False)` restores to, rather than a hardcoded
+     off-screen constant. Live-toggle-while-connected is still out of
+     scope for this round, confirmed.
+   - **Item 4 (packaging) had a real blocker**: `tests/__init__.py` exists,
+     so setuptools' auto-discovery would see two top-level packages
+     (`sdrsync` and `tests`) and error on `pip install -e .` without an
+     explicit `[tool.setuptools.packages.find] include = ["sdrsync*"]`.
+     Also: `main()` confirmed to exist at `gui/app.py`, so
+     `sdrsync.gui.app:main` is the correct entry point; use
+     `dynamic = ["version"]` sourced from `sdrsync/__init__.py` to avoid
+     version drift; keep `pytest` out of the packaged install (optional
+     extra, not a hard dependency); `rig/rigctld.py`'s docstring citing
+     `websdrSync.1.2.py` needs updating alongside the file deletions.
+   - **Item 2 (rigctld RPRT) confirmed correct, motivation sharpened**: the
+     failure mode isn't just "hangs" — the blocked `readline()` hits the
+     1s `cmd_timeout`, the client then calls `close()`, so it's a full
+     disconnect/reconnect every affected tick; worse, if a stray reply
+     *does* eventually arrive, the leftover `readline()` desyncs the next
+     command's response from its request. Fix belongs in a small pure
+     helper next to `parse_mode_response()` so the existing rigctld
+     parsing test file can cover it directly; `fake_rigctld.py` already
+     emits `RPRT -11` for unknown commands, a ready-made test fixture.
+   - **Item 3 (config robustness) confirmed correct, scope widened
+     slightly**: `user_sites` is the only list-of-dicts field, but
+     `AppSettings.load()` does `cls(**filtered)` with no type-checking on
+     *any* field, so a hand-edited scalar (e.g. `rigctld_port: "4532"`)
+     also passes through uncaught — worth coercing/validating scalars too,
+     especially since items 1 and 5 below add new fields. Also: since
+     `_persist_user_sites` rewrites the whole list from in-memory objects,
+     an entry skipped at load time is silently dropped on the next save —
+     log skips at WARNING, not DEBUG, so this is visible. Atomic save
+     should `fsync()` before `os.replace()`, not just write-then-replace.
+   - **Item 5 (poll interval) confirmed correct, one implementation
+     refinement**: read `self.settings.poll_interval_s` live inside the
+     poll loop rather than threading it through `__init__` — the engine
+     already reads `self.settings` live elsewhere, so this is simpler and
+     gives free live-updates without a reconnect. Note `FREQ_DEBOUNCE_S`
+     (0.2s) interacts with this: any interval ≥0.2s makes the debounce
+     window satisfiable in a single tick, degrading jitter filtering to
+     just the threshold check — not a bug, but worth a GUI-control clamp
+     (~0.05–5.0s) so a user can't pick a value that defeats debouncing
+     entirely by accident.
+
+   **Revised implementation order** (per the review): rigctld RPRT fix
+   first (fully isolated), then config robustness (since items 1 and 5
+   both add fields it should validate), then the headless fix, then poll
+   interval, then license/packaging last.
+
+   **Progress (resume point if this session ends -- update after each
+   block, per explicit user instruction):**
+   - [x] **Item 2, rigctld RPRT fix — DONE.** Added `is_rprt_error()`
+     helper (`rig/rigctld.py`) checking a response line for the `RPRT`
+     error prefix; `get_mode()` now checks the first readline result
+     before attempting the second, returning `None` immediately instead
+     of blocking until `cmd_timeout` and disconnecting. `fake_rigctld.py`
+     gained a `FakeRigState.mode_error` flag (emits `RPRT -11` for `m`
+     when set) as a test fixture. New tests: `is_rprt_error` unit tests in
+     `tests/test_rigctld_parsing.py`; a new `tests/test_rigctld_client.py`
+     with a real-socket regression test proving the RPRT case returns
+     `None` promptly, doesn't disconnect, and doesn't desync the next
+     command's response (no leftover unread line). Full suite: 57/57
+     passing (was 53; +4 new tests, this project has no pytest-asyncio
+     dependency so the new async tests use the existing
+     `asyncio.run(run())`-inside-a-sync-test pattern already used
+     elsewhere in the suite).
+   - [x] **Item 3, config robustness — DONE.** `config.py`:
+     `_validate_scalars()` drops any scalar `AppSettings` field whose JSON
+     value has the wrong type (e.g. a quoted `rigctld_port`), falling back
+     to the dataclass default instead of silently storing a
+     wrong-typed value or crashing; `_validate_user_sites()`/
+     `_validate_user_site()` drop malformed `user_sites` entries (missing
+     keys, wrong types, non-dict, non-list container) the same way,
+     logged at WARNING (matches `gui/app.py`'s unguarded
+     `d["name"]`/`d["url"]`/`d["driver_type"]` access, confirmed still
+     exactly matches the validated shape). `save()` is now
+     write-temp-then-`fsync()`-then-`os.replace()`, so a crash mid-write
+     can't truncate the real config file. New `tests/test_config.py` (7
+     tests): defaults-on-missing-file, malformed/non-dict/wrong-container
+     `user_sites` entries all skipped correctly, wrong-type scalars fall
+     back to defaults, garbage JSON doesn't crash `load()`, a full
+     save-then-load round-trip, and no leftover `.tmp` file after a save.
+     Full suite: 64/64 passing (was 57; +7).
+   - [x] **Item 1, headless fix — DONE.** `gui/webview_host.py`:
+     `WebViewHost` now takes a `headless` constructor arg and tracks a
+     "rest position" (`_rest_pos()`) that's on-screen when not headless,
+     off-screen when headless; `present(on_screen)` restores to
+     `_rest_pos()` on `False` instead of the old hardcoded off-screen
+     constant, and `set_headless()` lets the GUI update it. Fixed exactly
+     the conflict the plan review caught: the audio-unlock click's
+     `finally` block (`browser_shim.py`'s `_simulate_click`) always calls
+     `on_screen_presenter(False)`, which would have silently re-hidden a
+     visible window on every single connection if `present(False)` still
+     hardcoded off-screen. `gui/app.py`: `WebViewHost` is now constructed
+     with `headless=settings.headless` at startup, and
+     `_webview_host.set_headless(self.settings.headless)` is called right
+     before every Connect/Switch WebSDR click (picked up fresh per
+     connection, not live-toggled while already connected -- confirmed
+     out of scope for this round). Frame also given a real
+     `VISIBLE_SIZE` (1000x700, was never sized before) and title changed
+     from "(hidden WebSDR host)" to "SDRSync WebSDR" since it's not
+     always hidden anymore. No unit-test coverage is possible here
+     (needs a real wx.App + WebView2), so verified with a standalone
+     script against the real API instead (scratchpad, not committed):
+     confirmed `headless=True` rests off-screen, `headless=False` rests
+     on-screen, and — the specific regression the review caught —
+     `present(True)` then `present(False)` correctly returns to the
+     on-screen rest position when not headless, not off-screen. All
+     checks passed. `pytest` unaffected (64/64, no new tests needed here
+     since it's pure wx-state logic already covered by the live check).
+   - [x] **Item 5, poll interval — DONE.** `config.py`: new
+     `AppSettings.poll_interval_s: float = 0.2` (matches the previous
+     hardcoded value, so no behavior change for existing users), added to
+     `_SCALAR_TYPES` as `(int, float)` (the validator's type map now
+     supports a type-tuple, with a small `_type_name()` helper for the
+     warning message). `sync/engine.py`: `_poll_loop()` reads
+     `self.settings.poll_interval_s` live each iteration (per the plan
+     review's suggestion) instead of a module constant, so a GUI change
+     applies on the *next* wait cycle with no reconnect needed --
+     confirmed via test that a change only takes effect once the
+     *currently in-flight* wait completes, not mid-wait (expected,
+     `asyncio.wait_for`'s timeout is fixed at call time; not a bug). Old
+     `POLL_INTERVAL_S` constant renamed `DEFAULT_POLL_INTERVAL_S` for
+     documentation purposes only (nothing reads it anymore). `gui/app.py`:
+     new `wx.SpinCtrlDouble` control ("Poll interval (s):") in the
+     Transceiver panel next to host/port, clamped to
+     `MIN_POLL_INTERVAL_S`/`MAX_POLL_INTERVAL_S` (0.05-5.0, new module
+     constants) per the review's note that `FREQ_DEBOUNCE_S` is also
+     0.2s so an interval at or above that starts degrading jitter
+     filtering; `_on_poll_interval_changed` writes straight to
+     `self.settings`+`save()` with no connect-gating needed, since the
+     engine already reads it live. New `tests/test_engine_poll_interval.py`
+     (3 tests: faster interval ticks more in a fixed window, a live
+     settings change is picked up without a reconnect, and the default
+     matches the old hardcoded 0.2); `tests/test_config.py` gained a
+     poll_interval_s int-or-float/invalid-string-falls-back-to-default
+     test. Verified `wx.SpinCtrlDouble` against the real wx API + that
+     `gui/app.py` still imports cleanly (standalone check, not committed).
+     Full suite: 68/68 passing (was 64; +4).
+   - [x] **Item 4, license/packaging — DONE.** Added `LICENSE` (GPL-3.0,
+     fetched verbatim from a GitHub-hosted mirror of the canonical FSF
+     text after a direct `gnu.org` fetch timed out, frontmatter stripped,
+     675-line body confirmed matching the standard GPLv3 text). Added
+     `sdrsync/__init__.py` with `__version__ = "1.0.0"`, logged once at
+     startup in `gui/app.py`'s `SDRSyncApp.OnInit()`. Added
+     `pyproject.toml`: `dynamic = ["version"]` sourced from
+     `sdrsync.__version__` (no drift risk), `[project.scripts]` entry
+     point `sdrsync = "sdrsync.gui.app:main"`, `pytest` moved to an
+     `optional-dependencies.test` extra rather than a hard runtime
+     dependency, and (the confirmed real blocker from the plan review)
+     an explicit `[tool.setuptools.packages.find] include = ["sdrsync*"]`
+     so `tests/`'s own `__init__.py` doesn't make setuptools' package
+     auto-discovery see two top-level packages and fail. Deleted the
+     three superseded `websdrSync*.py` prototypes from the repo root
+     (`git rm`); updated `rig/rigctld.py`'s docstring, which cited one of
+     them, to drop the reference. README: added an `pip install -e .`
+     alternative to the Install section, a License section, and an
+     explicit "Platform support: Windows only for now" note (Linux/macOS
+     already tracked as a separate gap, not re-litigated here).
+     **Verified for real, not just written**: `pip install -e .
+     --no-deps` actually run in this environment -- confirmed it
+     succeeds, confirmed `python -c "import sdrsync; print(sdrsync.
+     __version__)"` and the `sdrsync` console-script entry point both
+     resolve correctly via `importlib.metadata`, then uninstalled the
+     editable install again to leave the dev environment as it was.
+     `sdrsync.egg-info/` (generated by that install) is already covered
+     by `.gitignore`'s existing `*.egg-info/` pattern -- confirmed via
+     `git status --ignored`. Full suite: 68/68 passing, unaffected (no
+     new tests needed -- this block is packaging metadata + a real
+     `pip install -e .` run as verification, not app logic).
+
+   **Implementation review (Opus, independent pass over the whole v6
+   diff, done 2026-08-07) — 3 real bugs found, all fixed and re-verified
+   against the real APIs:**
+   - **`AppSettings.load()` crashed on non-object top-level JSON**
+     (`config.json` containing `[]`, `"foo"`, `5`, or `null` — all valid
+     JSON, just not an object). `data.items()` raised `AttributeError`,
+     which the existing `except` clause didn't catch, so the app died at
+     startup instead of falling back to defaults — inside the exact load
+     path item 3 was meant to harden. Confirmed by reproducing it live,
+     fixed with an explicit `isinstance(data, dict)` check before the
+     `.items()` call, re-verified fixed live.
+   - **The now-visible host frame (item 1's fix) had a close box and no
+     `EVT_CLOSE` handler.** With `headless=False` (the default), an empty
+     1000x700 "SDRSync WebSDR" frame now sits on-screen from startup;
+     `FRAME_NO_TASKBAR` means no taskbar button, so clicking its X is the
+     natural move — wx's default handler would `Destroy()` it, and every
+     later `create_page()`/`present()`/`set_headless()` call would then
+     touch a deleted C++ object. Unreachable before item 1 (the frame was
+     always off-screen); genuinely new exposure from this round. Fixed:
+     `WebViewHost.__init__` now binds `wx.EVT_CLOSE` to veto a
+     user-initiated close; `gui/app.py`'s shutdown path already calls
+     `frame.Destroy()` directly (not `Close()`), which doesn't fire
+     `EVT_CLOSE`, so shutdown is unaffected — confirmed both halves live
+     (user-close-attempt survives, explicit `Destroy()` still works).
+   - **`poll_interval_s` was type-validated but not range-validated.** A
+     hand-edited `0` or negative value passed `_validate_scalars`
+     unchanged and reached `asyncio.wait_for(timeout=...)` in
+     `_poll_loop`, turning it into a full-CPU busy loop hammering
+     rigctld; the GUI's `wx.SpinCtrlDouble` only clamped its *displayed*
+     value, never writing the clamped number back to `self.settings`.
+     Fixed: `MIN_POLL_INTERVAL_S`/`MAX_POLL_INTERVAL_S` moved from
+     `gui/app.py` into `config.py` (the canonical/authoritative location
+     now, `gui/app.py` imports them) and a new `_clamp_poll_interval()`
+     step in `load()` clamps an out-of-range value at load time, not just
+     in the widget — confirmed live (`-5` and `9999` both correctly
+     clamp to the bounds).
+   Also confirmed clean (no action needed): `_SCALAR_TYPES`' bool-vs-
+   `(int, float)` handling doesn't collide across fields; exactly one
+   config load path exists, nothing bypasses the new validators;
+   `is_rprt_error()` handles leading whitespace and can't false-positive
+   on a real mode name; the atomic `save()`'s Windows behavior is
+   correct; `_simulate_click`'s pre-existing `SafeYield` re-entrancy
+   guard has no new interaction with the changed `present(False)`;
+   `python -m sdrsync.main` and the `pyproject.toml`/version/entry-point
+   wiring all still work correctly. Test quality was checked too, not
+   just presence: the reviewer confirmed the new tests actually assert
+   on the fixed behavior (e.g. the RPRT test proves no leftover unread
+   line via a follow-up `get_freq()` call) rather than just "doesn't
+   crash," and found no tautological tests.
+
+   New regression tests added for the 3 fixes: `test_config.py` gained
+   `test_load_clamps_out_of_range_poll_interval` and
+   `test_load_does_not_crash_on_non_object_top_level_json`. The frame
+   close-veto fix has no unit test (would need a real wx.App/WebView2,
+   consistent with this project's existing practice for wx-level GUI
+   logic) — verified instead via a standalone live script against the
+   real wx API (not committed), same as item 1's original verification.
+
+   **v6 hardening round is now complete.** Full suite: 70/70 passing
+   (was 68; +2). All 5 items implemented, reviewed (plan review + this
+   implementation review), fixed, and verified. Next up per the roadmap:
+   flrig support (item 3 below).
+
+   Other brainstormed items were deliberately left out of this round
+   (not forgotten -- candidates for later): live-togglable window
+   visibility while connected, `cw_offset_hz`/`mute_on_tx` GUI controls,
+   an "open log folder" button, log rotation (already known), the
+   unreproduced "Save to list stays disabled" bug and the
+   URL-string/display-text comparison fragility suspected to underlie
+   it, renamable/editable saved sites, and first-run onboarding.
+3. **Add flrig as a second rig backend, alongside rigctld.** Requested by
    the user, explicitly *after* the browser migration above, which is now
-   done -- this is next. Not scoped or researched yet. `rig/rigctld.py`'s
-   `RigctldClient` is the existing pattern to mirror (or generalize
-   behind a shared interface, TBD during scoping) for a new
-   `FlrigClient` -- flrig exposes its own XML-RPC control interface
-   (distinct wire protocol from hamlib's rigctld line protocol), so this
-   is a new client from scratch, not a config option on the existing
-   one. Needs its own research pass (like every WebSDR driver in this
-   project got) before planning, not assumed from memory.
+   done -- this comes after the v6 hardening round above. Not scoped or
+   researched yet. `rig/rigctld.py`'s `RigctldClient` is the existing
+   pattern to mirror (or generalize behind a shared interface, TBD during
+   scoping) for a new `FlrigClient` -- flrig exposes its own XML-RPC
+   control interface (distinct wire protocol from hamlib's rigctld line
+   protocol), so this is a new client from scratch, not a config option
+   on the existing one. Needs its own research pass (like every WebSDR
+   driver in this project got) before planning, not assumed from memory.
 
 ## Next steps after restart
 
