@@ -1564,7 +1564,25 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
      genuine HTTP 200 and correctly reports `([], "...has an empty site
      list")` -- confirming both the fetch mechanism end-to-end and the
      Blocker-2 empty-vs-error distinction against production GitHub, not
-     just against local fixtures. No other manual GUI click-through was
+     just against local fixtures.
+     **Further update (2026-08-07, commit `90b0866`)**: at the user's
+     request, populated `sites/websdr_sites.json` with 20 real public
+     sites (7 KiwiSDR, 7 websdr_org, 6 OpenWebRX, ~15 countries) sourced
+     from receiverbook.de listings. Each candidate was checked against the
+     app's own `preflight.check_websdr_url` (real reachability) +
+     `detect_websdr_type` (real driver-type fingerprint match, not
+     assumed from the directory listing or URL naming) before inclusion
+     -- roughly half the ~50 candidates gathered turned out unreachable
+     (typical for dynamic-DNS home stations) and were dropped, not
+     included speculatively. The final 20-entry batch was also confirmed
+     to round-trip cleanly through `sitesource.validate_site_list` against
+     `KNOWN_SITES` with zero rejections before committing. **Post-push,
+     the real "Update from GitHub" path was exercised end-to-end**: a
+     fresh `fetch_site_list(CURATED_LIST_URL, ...)` call now returns a
+     genuine HTTP 200 with all 20 sites correctly parsed -- this is the
+     first time the curated-update feature has actually delivered real
+     sites through the full network path, not just an empty-list
+     round-trip. No other manual GUI click-through was
      possible in this environment (no
      display automation for a native desktop app) -- consistent with
      every prior wx-heavy round in this project, verification here is
