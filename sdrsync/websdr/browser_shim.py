@@ -349,8 +349,13 @@ class WxPageAdapter:
         WebView/frame -- Block C's engine owns and destroys those, same
         as the other drivers only ever drop their own page reference
         rather than calling browser.close() themselves. Safe to call
-        more than once."""
-        self._mark_dead("closed")
+        more than once. Does NOT fire on_dead -- that signal means
+        "died unexpectedly, please recreate me," which an explicit,
+        caller-initiated close() is not (confirmed reachable: a normal
+        Disconnect calls this, and on_dead firing anyway raced the
+        engine's event loop closing on app shutdown -- RuntimeError
+        propagating out of a wx.CallAfter callback)."""
+        self._mark_dead("closed", notify=False)
         self._cleanup_widget_bindings()
 
     # ------------------------------------------------------------------ internal: readiness
@@ -425,11 +430,11 @@ class WxPageAdapter:
                 self._mark_dead(f"script timed out after {SCRIPT_TIMEOUT_S}s")
                 raise BrowserError(f"script timed out after {SCRIPT_TIMEOUT_S}s (adapter marked dead)")
 
-    def _mark_dead(self, reason: str) -> None:
+    def _mark_dead(self, reason: str, notify: bool = True) -> None:
         was_alive = self._alive
         self._alive = False
         self._fail_pending(BrowserError(f"page adapter dead: {reason}"))
-        if was_alive and not self._dead_reported and self._on_dead is not None:
+        if notify and was_alive and not self._dead_reported and self._on_dead is not None:
             self._dead_reported = True
             cb = self._on_dead
             wx.CallAfter(cb, reason)

@@ -316,8 +316,12 @@ class SyncEngine:
         GUI thread; marshal back onto the engine loop before touching any
         engine state."""
         loop = self._loop
-        if loop is not None:
+        if loop is None:
+            return
+        try:
             loop.call_soon_threadsafe(self._handle_page_dead, generation, reason)
+        except RuntimeError:
+            pass  # loop already closed (engine thread already exited) -- same guard as stop_from_other_thread()
 
     def _handle_page_dead(self, generation: int, reason: str) -> None:
         if generation != self._websdr_generation or not self._websdr_active or self.site is None:
