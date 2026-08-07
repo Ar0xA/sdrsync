@@ -6,3 +6,9 @@ venv/
 *.egg-info/
 .vscode/
 .idea/
+
+# PyInstaller build output -- not source, shouldn't be committed; the zip
+# it produces is attached to GitHub Releases instead.
+build/
+dist/
+*.spec
