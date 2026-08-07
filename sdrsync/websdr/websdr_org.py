@@ -369,10 +369,17 @@ class WebsdrOrgDriver:
                 "() => ({freq: window.freq, mode: window.mode, "
                 "audio: document.ct ? document.ct.state === 'running' : null})"
             )
+            # Displayed mode is normalized to its base (non-narrow) form --
+            # window.mode can legitimately be e.g. "USBN" for a
+            # narrow-filter USB selection, which reads as a different mode
+            # than the hamlib USB it actually corresponds to if shown raw
+            # (mirrors set_mode()'s own self._current_mode stripping above).
+            raw_mode = data.get("mode")
+            mode = raw_mode[:-1] if isinstance(raw_mode, str) and raw_mode.endswith("N") else raw_mode
             return WebSDRStatus(
                 connected=True,
                 freq_hz=int(round(float(data["freq"]) * 1000)) if data.get("freq") is not None else None,
-                mode=data.get("mode"),
+                mode=mode,
                 audio_active=data.get("audio"),
                 last_error=self._combined_error(),
             )

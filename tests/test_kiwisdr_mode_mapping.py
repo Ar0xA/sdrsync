@@ -1,4 +1,4 @@
-from sdrsync.websdr.kiwisdr import map_hamlib_mode_kiwi
+from sdrsync.websdr.kiwisdr import _base_mode_of, map_hamlib_mode_kiwi
 
 
 def test_usb_wide_passband_stays_wide():
@@ -64,3 +64,22 @@ def test_cw_u_and_cw_l_map_to_plain_cw():
     assert map_hamlib_mode_kiwi("CW-L", 500) == "cwn"
     assert map_hamlib_mode_kiwi("CW-U", 2700) == "cw"
     assert map_hamlib_mode_kiwi("CW-L", 2700) == "cw"
+
+
+def test_base_mode_of_strips_narrow_variants():
+    # This is what get_status() relies on to display "USB"/"LSB" instead
+    # of the raw KiwiSDR-internal "usn"/"lsn" narrow-filter mode strings
+    # ext_get_mode() returns verbatim.
+    assert _base_mode_of("usn") == "usb"
+    assert _base_mode_of("lsn") == "lsb"
+    assert _base_mode_of("cwn") == "cw"
+    assert _base_mode_of("amn") == "am"
+    assert _base_mode_of("nnfm") == "nbfm"
+
+
+def test_base_mode_of_leaves_base_modes_and_unknowns_unchanged():
+    assert _base_mode_of("usb") == "usb"
+    assert _base_mode_of("lsb") == "lsb"
+    assert _base_mode_of("amw") == "amw"
+    assert _base_mode_of("sam") == "sam"
+    assert _base_mode_of("iq") == "iq"

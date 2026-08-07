@@ -240,6 +240,18 @@ class MainFrame(wx.Frame):
         self.websdr_connect_btn = wx.Button(parent, label="Connect")
         self.websdr_connect_btn.Bind(wx.EVT_BUTTON, self._on_websdr_connect_clicked)
         _Tooltip(self.websdr_connect_btn, self._websdr_connect_tooltip_text)
+        # Reserve room for the widest label this button is ever relabeled to
+        # at runtime ("Switch WebSDR", see _update_websdr_controls) -- the
+        # GridBagSizer column's width is computed once, at Fit() time in
+        # _build_widgets, from whatever label is showing then ("Connect");
+        # relabeling later doesn't retrigger that sizing, so the wider text
+        # was getting clipped. A few px of margin on top of the exact text
+        # width so it doesn't look pixel-tight either.
+        widest_label = "Switch WebSDR"
+        self.websdr_connect_btn.SetLabel(widest_label)
+        min_size = self.websdr_connect_btn.GetBestSize()
+        self.websdr_connect_btn.SetMinSize(wx.Size(min_size.width + 12, min_size.height))
+        self.websdr_connect_btn.SetLabel("Connect")
         grid.Add(self.websdr_connect_btn, pos=(row, 3), flag=wx.EXPAND)
 
         self.delete_site_btn = wx.Button(parent, label="Delete")
