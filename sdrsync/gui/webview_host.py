@@ -30,32 +30,67 @@ logger = logging.getLogger("sdrsync.gui.webview_host")
 # headless mode, which has no audio output at all -- see the removed
 # _describe_browser_launch_error/engine.py comment history for why).
 OFF_SCREEN_POS = wx.Point(-32000, -32000)
-# Used only briefly, during the audio-unlock click -- wx.UIActionSimulator
-# needs a real on-screen position for the OS to deliver input to.
-ON_SCREEN_POS = wx.Point(0, 0)
+# Also doubles as the "visible mode" resting position -- any genuine
+# on-screen position works equally well for both the audio-unlock click
+# (wx.UIActionSimulator needs real on-screen delivery) and for a user who
+# wants to actually see the WebSDR page.
+ON_SCREEN_POS = wx.Point(50, 50)
+VISIBLE_SIZE = wx.Size(1000, 700)
 
 
 class WebViewHost:
-    """Owns the persistent offscreen host frame. Construct once, in the
-    wx App's OnInit(), before the SyncEngine's background thread starts."""
+    """Owns the persistent host frame. Construct once, in the wx App's
+    OnInit(), before the SyncEngine's background thread starts.
 
-    def __init__(self) -> None:
+    "headless" here means the same thing AppSettings.headless always has:
+    off-screen-but-shown (for real audio -- see OFF_SCREEN_POS above), not
+    an actually-hidden window. present(False) restores whichever of
+    on-screen/off-screen the current headless setting calls "resting" --
+    it must NOT hardcode off-screen, since it's also called after every
+    audio-unlock click (see WxPageAdapter._simulate_click's finally
+    block), which would otherwise silently undo a user's "show the
+    window" choice on every single connection."""
+
+    def __init__(self, headless: bool = False) -> None:
         self.frame = wx.Frame(
-            None, title="SDRSync (hidden WebSDR host)",
+            None, title="SDRSync WebSDR",
             style=wx.DEFAULT_FRAME_STYLE | wx.FRAME_NO_TASKBAR,
         )
-        self.frame.SetPosition(OFF_SCREEN_POS)
+        self.frame.SetSize(VISIBLE_SIZE)
+        self._headless = headless
+        self.frame.SetPosition(self._rest_pos())
+        # Since headless=False now genuinely shows this frame on-screen
+        # (not just briefly, for the audio-unlock click), it has a normal
+        # close box -- but nothing else in this app expects it to be
+        # user-closable (WxPageAdapter/create_page/present all assume
+        # self.frame stays alive for the whole app session). Veto a
+        # user-initiated close; MainFrame._on_close() tears this frame
+        # down via frame.Destroy() directly, which doesn't fire EVT_CLOSE,
+        # so that shutdown path is unaffected.
+        self.frame.Bind(wx.EVT_CLOSE, lambda evt: evt.Veto())
         # Real, shown (not Show(False)/Iconize()) -- WebView2 suspends/
         # throttles rendering and timers for genuinely hidden windows;
         # positioning off-screen while still "shown" is what keeps audio
         # and JS timers running reliably (confirmed during Block A/B).
         self.frame.Show(True)
 
+    def _rest_pos(self) -> wx.Point:
+        return OFF_SCREEN_POS if self._headless else ON_SCREEN_POS
+
+    def set_headless(self, headless: bool) -> None:
+        """GUI-thread only. Call before starting a WebSDR connection to
+        pick up the current AppSettings.headless value -- picked up fresh
+        per-connect, not live-toggled while already connected (out of
+        scope for now)."""
+        assert wx.IsMainThread()
+        self._headless = headless
+        self.frame.SetPosition(self._rest_pos())
+
     def present(self, on_screen: bool) -> None:
         """GUI-thread only. Passed to WxPageAdapter as its
         on_screen_presenter -- called around the audio-unlock click."""
         assert wx.IsMainThread()
-        self.frame.SetPosition(ON_SCREEN_POS if on_screen else OFF_SCREEN_POS)
+        self.frame.SetPosition(ON_SCREEN_POS if on_screen else self._rest_pos())
 
     async def create_page(
         self,

@@ -46,7 +46,7 @@ from sdrsync.websdr.registry import DRIVERS
 
 logger = logging.getLogger("sdrsync.engine")
 
-POLL_INTERVAL_S = 0.2
+DEFAULT_POLL_INTERVAL_S = 0.2  # see AppSettings.poll_interval_s -- now user-configurable, this is just the fallback
 FREQ_DEBOUNCE_S = 0.2          # candidate frequency must be stable this long before pushing
 FREQ_CHANGE_THRESHOLD_HZ = 10  # ignore rig jitter smaller than this
 ATTACH_RETRY_BASE_DELAY_S = 2.0
@@ -463,7 +463,7 @@ class SyncEngine:
             except Exception:
                 logger.exception("Unexpected error in sync loop tick")
             try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=POLL_INTERVAL_S)
+                await asyncio.wait_for(self.stop_event.wait(), timeout=self.settings.poll_interval_s)
             except asyncio.TimeoutError:
                 pass
 

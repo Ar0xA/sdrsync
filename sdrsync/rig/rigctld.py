@@ -1,9 +1,8 @@
 """Async TCP client for hamlib's rigctld (network CAT control, not Omnirig).
 
-Ported from the proven connect/reconnect-backoff/send-command logic in the
-prior websdrSync.1.2.py prototype. Read-only: this app only ever reads the
-transceiver's state (frequency/mode/PTT) — sync is one-way, rig -> WebSDR,
-so no "set frequency on rig" command is needed here.
+Read-only: this app only ever reads the transceiver's state
+(frequency/mode/PTT) — sync is one-way, rig -> WebSDR, so no "set
+frequency on rig" command is needed here.
 """
 from __future__ import annotations
 
@@ -38,6 +37,17 @@ def parse_mode_response(mode_line: str, passband_line: str) -> Optional[tuple[st
     if not mode or not pb_str.lstrip("-").isdigit():
         return None
     return mode, int(pb_str)
+
+
+def is_rprt_error(line: str) -> bool:
+    """True if a rigctld response line is an 'RPRT <code>' error reply.
+
+    On error, rigctld sends a single RPRT line instead of the normal
+    response — for 'm' that means only one line comes back, not two.
+    Reading a second line in that case blocks until cmd_timeout and forces
+    a disconnect, so callers must check this after the first readline.
+    """
+    return line.strip().startswith("RPRT")
 
 
 def parse_ptt_response(resp: Optional[str]) -> Optional[bool]:
@@ -156,19 +166,26 @@ class RigctldClient:
         return parse_freq_response(resp)
 
     async def get_mode(self) -> Optional[tuple[str, int]]:
-        """rigctld's 'm' command replies with two lines: mode name, then passband in Hz."""
+        """rigctld's 'm' command normally replies with two lines: mode name,
+        then passband in Hz. On error it replies with a single 'RPRT <code>'
+        line instead -- reading a second line in that case would block until
+        cmd_timeout, so that's checked for before attempting it."""
         if not self._writer or not self._reader:
             return None
         try:
             self._writer.write(b"m\n")
             await self._writer.drain()
             mode_line = await asyncio.wait_for(self._reader.readline(), timeout=self.cmd_timeout)
+            mode_line_str = mode_line.decode(errors="replace")
+            if is_rprt_error(mode_line_str):
+                logger.debug("rigctld returned an error for 'm': %r", mode_line_str.strip())
+                return None
             pb_line = await asyncio.wait_for(self._reader.readline(), timeout=self.cmd_timeout)
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
             logger.warning("Lost connection to rigctld while sending 'm'")
             await self.close()
             return None
-        return parse_mode_response(mode_line.decode(errors="replace"), pb_line.decode(errors="replace"))
+        return parse_mode_response(mode_line_str, pb_line.decode(errors="replace"))
 
     async def get_ptt(self) -> Optional[bool]:
         resp = await self._send_raw("t")

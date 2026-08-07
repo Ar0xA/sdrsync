@@ -20,6 +20,10 @@ class FakeRigState:
         self.mode = "USB"
         self.passband_hz = 2400
         self.ptt = "0"
+        # When set, 'm' replies with a single RPRT error line instead of the
+        # normal two-line mode/passband response -- lets tests exercise
+        # RigctldClient.get_mode()'s handling of that case without a real rig.
+        self.mode_error = False
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: FakeRigState) -> None:
@@ -34,7 +38,10 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             if cmd == "f":
                 writer.write(f"{state.freq_hz}\n".encode())
             elif cmd == "m":
-                writer.write(f"{state.mode}\n{state.passband_hz}\n".encode())
+                if state.mode_error:
+                    writer.write(b"RPRT -11\n")
+                else:
+                    writer.write(f"{state.mode}\n{state.passband_hz}\n".encode())
             elif cmd == "t":
                 writer.write(f"{state.ptt}\n".encode())
             elif cmd == "v":

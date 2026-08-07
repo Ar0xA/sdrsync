@@ -34,8 +34,9 @@ from typing import Callable, Optional
 
 import wx
 
+from sdrsync import __version__
 from sdrsync.browser.backend import EdgeBackendUnavailable, assert_edge_available, ensure_webview_backend
-from sdrsync.config import AppSettings, KNOWN_SITES, WebSDRSite
+from sdrsync.config import MAX_POLL_INTERVAL_S, MIN_POLL_INTERVAL_S, AppSettings, KNOWN_SITES, WebSDRSite
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui.webview_host import WebViewHost
 from sdrsync.preflight import (
@@ -252,6 +253,17 @@ class MainFrame(wx.Frame):
                  flag=wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
         self.port_entry = wx.TextCtrl(parent, value=str(self.settings.rigctld_port), size=(80, -1))
         grid.Add(self.port_entry, pos=(row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        row += 1
+
+        grid.Add(wx.StaticText(parent, label="Poll interval (s):"), pos=(row, 0),
+                 flag=wx.ALIGN_CENTER_VERTICAL)
+        self.poll_interval_ctrl = wx.SpinCtrlDouble(
+            parent, min=MIN_POLL_INTERVAL_S, max=MAX_POLL_INTERVAL_S, inc=0.05,
+            initial=self.settings.poll_interval_s, size=(80, -1),
+        )
+        self.poll_interval_ctrl.SetDigits(2)
+        self.poll_interval_ctrl.Bind(wx.EVT_SPINCTRLDOUBLE, self._on_poll_interval_changed)
+        grid.Add(self.poll_interval_ctrl, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         self.mock_rig_check = wx.CheckBox(parent, label="Use mock rig (embedded, for testing)")
@@ -598,6 +610,7 @@ class MainFrame(wx.Frame):
         self.settings.last_site_driver_type = site.driver_type if self._find_any_site_by_url(site.url) is None else ""
         self.settings.headless = self.headless_check.GetValue()
         self.settings.save()
+        self._webview_host.set_headless(self.settings.headless)
 
         self._websdr_ever_connected = False
         self._active_websdr_site = site
@@ -615,6 +628,13 @@ class MainFrame(wx.Frame):
     def _on_mock_rig_toggled(self, _event=None) -> None:
         is_mock = self.mock_rig_check.GetValue()
         self.host_entry.Enable(not is_mock)
+
+    def _on_poll_interval_changed(self, _event=None) -> None:
+        # SyncEngine reads self.settings.poll_interval_s live on every tick
+        # (sync/engine.py's _poll_loop), so this applies immediately --
+        # including mid-session -- with no reconnect needed.
+        self.settings.poll_interval_s = self.poll_interval_ctrl.GetValue()
+        self.settings.save()
 
     def _update_mock_rig_panel_visibility(self) -> None:
         # Gate on the *running rig session's* mode, not the live checkbox
@@ -822,6 +842,7 @@ class SDRSyncApp(wx.App):
         from sdrsync.logging_setup import setup_logging
 
         setup_logging()
+        logger.info("SDRSync %s starting", __version__)
         ensure_webview_backend()
         try:
             assert_edge_available()
@@ -830,7 +851,7 @@ class SDRSyncApp(wx.App):
             return False
 
         settings = AppSettings.load()
-        host = WebViewHost()
+        host = WebViewHost(headless=settings.headless)
         frame = MainFrame(settings, host)
         self.SetTopWindow(frame)
         frame.Show(True)
