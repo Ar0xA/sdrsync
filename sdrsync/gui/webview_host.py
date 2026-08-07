@@ -21,6 +21,7 @@ from typing import Callable, Optional
 import wx
 import wx.html2
 
+from sdrsync.browser.backend import target_backend
 from sdrsync.resources import ICON_PATH
 from sdrsync.websdr.browser_shim import WxPageAdapter
 
@@ -30,6 +31,12 @@ logger = logging.getLogger("sdrsync.gui.webview_host")
 # for "headless" mode (a real, positioned window, not Chromium's actual
 # headless mode, which has no audio output at all -- see the removed
 # _describe_browser_launch_error/engine.py comment history for why).
+# Confirmed to still work (audio survives the move, via SetPosition())
+# under WSLg's XWayland bridge on Linux -- see project_brief.md's
+# 2026-08-07 Linux spike. Known, unsolved limitation: a native (non-
+# XWayland) Wayland compositor may restrict a client's ability to
+# reposition its own window this way; not something that can be tested
+# in this environment, so it's documented here rather than "fixed".
 OFF_SCREEN_POS = wx.Point(-32000, -32000)
 # Also doubles as the "visible mode" resting position -- any genuine
 # on-screen position works equally well for both the audio-unlock click
@@ -115,7 +122,7 @@ class WebViewHost:
 
         def do_create():
             try:
-                webview = wx.html2.WebView.New(self.frame, backend=wx.html2.WebViewBackendEdge)
+                webview = wx.html2.WebView.New(self.frame, backend=target_backend())
                 adapter = WxPageAdapter(
                     webview, loop=loop, on_screen_presenter=self.present, on_dead=on_dead,
                 )

@@ -14,9 +14,17 @@ classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
-    "wxPython>=4.2",
+    # PyPI ships no manylinux wheels for wxPython -- a bare `pip install`
+    # on Linux falls back to a slow source build that needs GTK/WebKit dev
+    # headers and typically fails. Linux installs must use the distro's own
+    # wxPython package instead (see assert_backend_available()'s Linux
+    # error message in sdrsync/browser/backend.py for the exact apt
+    # package names) -- this marker keeps pip from even attempting it.
+    "wxPython>=4.2; sys_platform != 'linux'",
 ]
 
 [project.optional-dependencies]

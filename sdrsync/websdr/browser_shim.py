@@ -30,10 +30,18 @@ Load-bearing facts this module relies on (verified live, not assumed):
       generation marker on the GUI thread (immediately before LoadURL)
       and cross-checks the LOADED event's URL against
       WebView.GetCurrentURL(), neither of which depend on that flag.
-    - WebView.New() returns before the underlying CoreWebView2 actually
-      exists -- every public method awaits an explicit "ready" future
-      resolved from wxEVT_WEBVIEW_CREATED (no EVT_ binder for this one,
-      needs wx.PyEventBinder) before touching the widget.
+    - On Windows, WebView.New() returns before the underlying CoreWebView2
+      actually exists -- every public method awaits an explicit "ready"
+      future resolved from wxEVT_WEBVIEW_CREATED (no EVT_ binder for this
+      one, needs wx.PyEventBinder) before touching the widget. This is
+      Windows-specific, not a universal wx.html2 fact: on GTK (Linux/
+      macOS), wxEVT_WEBVIEW_CREATED doesn't exist at all, and WebView.New()
+      IS synchronously ready (confirmed live via the 2026-08-07 WSL2
+      spike) -- __init__ does the ready-setup inline there instead of
+      waiting for any event. GTK also has no pre-bound
+      EVT_WEBVIEW_SCRIPT_RESULT shortcut constant (only the raw
+      wxEVT_WEBVIEW_SCRIPT_RESULT value), needing the same
+      wx.PyEventBinder treatment.
 """
 from __future__ import annotations
 
@@ -41,6 +49,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional, Protocol
@@ -60,7 +69,23 @@ READY_TIMEOUT_S = 20.0
 POLL_INTERVAL_S = 0.1
 CONSOLE_MESSAGE_HANDLER_NAME = "sdrsyncConsole"
 
-_EVT_WEBVIEW_CREATED = wx.PyEventBinder(wx.html2.wxEVT_WEBVIEW_CREATED)
+# wxEVT_WEBVIEW_CREATED and the EVT_WEBVIEW_SCRIPT_RESULT shortcut
+# constant both do not exist on GTK wx builds (confirmed via a live
+# hasattr() check during the 2026-08-07 WSL2 Linux spike) -- referencing
+# either unconditionally would raise AttributeError at import time on
+# Linux/macOS, before any object is even constructed. Guarded here so the
+# module is importable on every platform; see WxPageAdapter.__init__ for
+# how the missing readiness event is worked around on non-Windows.
+if sys.platform == "win32":
+    _EVT_WEBVIEW_CREATED = wx.PyEventBinder(wx.html2.wxEVT_WEBVIEW_CREATED)
+    _EVT_WEBVIEW_SCRIPT_RESULT = wx.html2.EVT_WEBVIEW_SCRIPT_RESULT
+else:
+    _EVT_WEBVIEW_CREATED = None
+    # expectedIDs=1 matches wx's own EVT_WEBVIEW_SCRIPT_RESULT definition
+    # exactly (wx/html2.py: wx.PyEventBinder(wxEVT_WEBVIEW_SCRIPT_RESULT, 1)) --
+    # harmless either way since Bind() below passes no source/id, but no
+    # reason to diverge from wx's own binder when it's free to match.
+    _EVT_WEBVIEW_SCRIPT_RESULT = wx.PyEventBinder(wx.html2.wxEVT_WEBVIEW_SCRIPT_RESULT, 1)
 
 # Matches a Playwright-style function-source string ("() => ...",
 # "(x) => ...", "async (x) => ...", "function(x) {...}"). Used only by
@@ -243,19 +268,27 @@ class WxPageAdapter:
 
         self._ready: "asyncio.Future" = loop.create_future()
 
-        self.webview.Bind(wx.html2.EVT_WEBVIEW_SCRIPT_RESULT, self._on_script_result)
+        self.webview.Bind(_EVT_WEBVIEW_SCRIPT_RESULT, self._on_script_result)
         self.webview.Bind(wx.html2.EVT_WEBVIEW_LOADED, self._on_loaded)
         self.webview.Bind(wx.html2.EVT_WEBVIEW_ERROR, self._on_webview_error)
         self.webview.Bind(wx.html2.EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, self._on_script_message)
         self.webview.Bind(wx.EVT_WINDOW_DESTROY, self._on_window_destroy)
-        self.webview.Bind(_EVT_WEBVIEW_CREATED, self._on_webview_created)
+        if sys.platform == "win32":
+            self.webview.Bind(_EVT_WEBVIEW_CREATED, self._on_webview_created)
 
-        if already_created:
-            # CoreWebView2 already exists (e.g. this adapter is replacing
-            # a prior one on a WebView that's already initialized) --
-            # __init__ itself runs on the GUI thread (per the threading
-            # contract above), so it's safe to do the ready-setup inline
-            # rather than waiting for an event that will never fire again.
+        if already_created or sys.platform != "win32":
+            # Windows: CoreWebView2 already exists (e.g. this adapter is
+            # replacing a prior one on a WebView that's already
+            # initialized) -- __init__ itself runs on the GUI thread (per
+            # the threading contract above), so it's safe to do the
+            # ready-setup inline rather than waiting for an event that
+            # will never fire again.
+            # Non-Windows (Linux/macOS): there is no wxEVT_WEBVIEW_CREATED
+            # to wait for at all -- WebKitGTK's underlying GtkWidget is
+            # created synchronously inside WebView.New() (confirmed via
+            # the 2026-08-07 WSL2 spike: LoadURL() called immediately
+            # after New() with no wait worked every time), so the page is
+            # always effectively "already created" there.
             self._do_ready_setup()
 
     # ------------------------------------------------------------------ public API
@@ -457,8 +490,12 @@ class WxPageAdapter:
         .click()/dispatchEvent() -- Chromium/WebView2 explicitly treats
         JS-dispatched events as untrusted and excludes them from
         satisfying the autoplay-gesture requirement (confirmed during
-        Block A's spike). Requires the host frame to be at a genuine
-        on-screen position for the OS to deliver the input at all."""
+        Block A's spike). WebKitGTK/Cocoa WebKit enforce the identical
+        trusted-gesture requirement (confirmed working via the 2026-08-07
+        WSL2 Linux spike using this same wx.UIActionSimulator call, no
+        platform-specific code needed here). Requires the host frame to
+        be at a genuine on-screen position for the OS to deliver the
+        input at all."""
         _require_background_thread("mouse.click")
         if not self._alive:
             return
@@ -545,6 +582,19 @@ class WxPageAdapter:
 
     def _on_loaded(self, evt: "wx.html2.WebViewEvent") -> None:
         assert wx.IsMainThread()
+        if sys.platform != "win32" and evt.GetURL() == "about:blank":
+            # GTK's own internal initial navigation fires a spurious
+            # LOADED for about:blank before the caller's real goto()
+            # target loads (confirmed live, 2026-08-07 WSL2 spike --
+            # Windows' equivalent quirk instead manifests as a spurious
+            # ERROR/CONNECTION_ABORTED, handled separately below in
+            # _on_webview_error, which needs no change). Explicit skip
+            # here rather than trusting the generation/URL check below
+            # alone, since dispatch ordering between WebView.New()'s
+            # internal navigation and our own first LoadURL() isn't
+            # guaranteed.
+            logger.debug("Ignoring spurious about:blank LOADED event (GTK first-navigation quirk)")
+            return
         goto = self._pending_goto
         if goto is None:
             return

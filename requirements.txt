@@ -1,2 +1,6 @@
-wxPython>=4.2
+# On Linux, use your distro's wxPython package (e.g. apt install
+# python3-wxgtk4.0 python3-wxgtk-webview4.0) instead of pip -- PyPI ships
+# no manylinux wheels, so pip falls back to a slow, often-failing source
+# build. See sdrsync/browser/backend.py's Linux error message for details.
+wxPython>=4.2; sys_platform != 'linux'
 pytest>=7.0
