@@ -52,10 +52,14 @@ WIDE_AM_THRESHOLD_HZ = 8000
 _MODE_MAP: dict[str, tuple[str, Optional[str]]] = {
     "USB": ("usb", "usn"),
     "PKTUSB": ("usb", "usn"),
+    "DATA-U": ("usb", "usn"),
     "LSB": ("lsb", "lsn"),
     "PKTLSB": ("lsb", "lsn"),
+    "DATA-L": ("lsb", "lsn"),
     "CW": ("cw", "cwn"),
     "CWR": ("cw", "cwn"),
+    "CW-U": ("cw", "cwn"),
+    "CW-L": ("cw", "cwn"),
     "AM": ("am", "amn"),
     "SAM": ("sam", None),
     "FM": ("nbfm", "nnfm"),
@@ -119,6 +123,12 @@ class KiwiSDRDriver:
         self._last_page_error: Optional[str] = None
         self._last_tune_error: Optional[str] = None
         self._last_mode_error: Optional[str] = None
+        # Tracks the last hamlib mode that had no KiwiSDR equivalent, so the
+        # "no equivalent" warning logs once per new occurrence instead of
+        # every poll tick the engine retries set_mode() -- mirrors
+        # openwebrx.py's _last_out_of_range_key rate-limiting for the same
+        # class of problem (repeated per-tick log spam).
+        self._last_unmapped_mode: Optional[str] = None
 
     @property
     def attached(self) -> bool:
@@ -163,6 +173,7 @@ class KiwiSDRDriver:
         self._last_page_error = None
         self._last_tune_error = None
         self._last_mode_error = None
+        self._last_unmapped_mode = None
 
     # ------------------------------------------------------------------
     async def tune_hz(self, freq_hz: int) -> bool:
@@ -226,7 +237,11 @@ class KiwiSDRDriver:
             self._last_mode_error = (
                 f"hamlib mode {hamlib_mode!r} has no KiwiSDR equivalent; frequency sync continues"
             )
-            logger.warning(self._last_mode_error)
+            if hamlib_mode != self._last_unmapped_mode:
+                self._last_unmapped_mode = hamlib_mode
+                logger.warning(self._last_mode_error)
+            else:
+                logger.debug(self._last_mode_error)
             return False
 
         try:
@@ -259,6 +274,7 @@ class KiwiSDRDriver:
 
         self._current_mode = kiwi_mode
         self._last_mode_error = None
+        self._last_unmapped_mode = None
         return True
 
     async def _read_mode(self) -> Optional[str]:

@@ -26,3 +26,13 @@ def test_packet_modes_map_to_their_sideband():
 
 def test_unknown_mode_returns_none():
     assert map_hamlib_mode_openwebrx("DSTAR") is None
+
+
+def test_data_modes_map_to_their_sideband():
+    assert map_hamlib_mode_openwebrx("DATA-U") == "usb"
+    assert map_hamlib_mode_openwebrx("DATA-L") == "lsb"
+
+
+def test_cw_u_and_cw_l_map_to_plain_cw():
+    assert map_hamlib_mode_openwebrx("CW-U") == "cw"
+    assert map_hamlib_mode_openwebrx("CW-L") == "cw"

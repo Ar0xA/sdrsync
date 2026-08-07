@@ -35,3 +35,15 @@ def test_no_passband_defaults_to_wide():
 
 def test_unknown_mode_returns_none():
     assert map_hamlib_mode("DSTAR", 2700) is None
+
+
+def test_data_modes_map_to_their_sideband():
+    assert map_hamlib_mode("DATA-U", 2700) == "USB"
+    assert map_hamlib_mode("DATA-U", 1800) == "USBN"
+    assert map_hamlib_mode("DATA-L", 2700) == "LSB"
+    assert map_hamlib_mode("DATA-L", 1800) == "LSBN"
+
+
+def test_cw_u_and_cw_l_map_to_plain_cw_no_narrow_variant():
+    assert map_hamlib_mode("CW-U", 500) == "CW"
+    assert map_hamlib_mode("CW-L", 500) == "CW"

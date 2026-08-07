@@ -56,6 +56,12 @@ FREQ_CHANGE_THRESHOLD_HZ = 10  # ignore rig jitter smaller than this
 ATTACH_RETRY_BASE_DELAY_S = 2.0
 ATTACH_RETRY_MAX_DELAY_S = 30.0
 ATTACH_CHECK_INTERVAL_S = 1.0  # how often to notice the driver dropped attachment
+# How long to keep retrying an initial rig connection before giving up and
+# surfacing a real error instead of leaving the GUI stuck at "connecting..."
+# forever. Applies to the time-to-FIRST-connect only -- cleared once
+# ensure_connected() succeeds once, so a later transient drop-and-reconnect
+# isn't bound by this same budget (see _tick()/_start_rig()).
+RIG_CONNECT_TIMEOUT_S = 30.0
 
 
 class WebViewHost(Protocol):
@@ -129,6 +135,15 @@ class SyncEngine:
         self._mock_state: "Optional[FakeRigState | FakeFlrigState]" = None
         self._rig_active = False
         self._rig_error: Optional[str] = None
+        # Remembered from _start_rig()'s params, purely for the give-up
+        # error message below -- RigClient itself doesn't expose these
+        # uniformly enough to read back out.
+        self._rig_backend: Optional[str] = None
+        self._rig_host: Optional[str] = None
+        self._rig_port: Optional[int] = None
+        # Set in _start_rig(), cleared on the first successful
+        # ensure_connected() -- see RIG_CONNECT_TIMEOUT_S above.
+        self._rig_connect_deadline: Optional[float] = None
 
         # WebSDR subsystem (independent lifecycle).
         self._page: Optional[Page] = None
@@ -281,10 +296,24 @@ class SyncEngine:
         self._rig_active = True
         self._rig_error = None
         self._last_ptt = None
+        self._rig_backend, self._rig_host, self._rig_port = backend, host, port
+        self._rig_connect_deadline = time.monotonic() + RIG_CONNECT_TIMEOUT_S
         logger.info("Rig session started (%s, %s:%d, mock=%s)", backend, host, port, use_mock)
         self._publish()
 
-    async def _stop_rig(self) -> None:
+    async def _stop_rig(self, error: Optional[str] = None) -> None:
+        # A WebSDR session with no rig behind it has nothing driving its
+        # sync -- stopping the rig (whether by explicit user Disconnect or
+        # the connect-timeout give-up above) always stops WebSDR too. This
+        # is a deliberate, one-directional exception to the rig/WebSDR
+        # "independent lifecycles" principle (see module docstring/v3.6
+        # history): that principle is about not killing rig when
+        # *switching WebSDR sites*, not about this -- WebSDR already can't
+        # even start without rig active (gui/app.py's Connect button is
+        # gated on it), so it stopping when rig stops is consistent with,
+        # not a regression of, that existing design.
+        if self._websdr_active:
+            await self._stop_websdr()
         if self._rig is not None:
             await self._rig.close()
             self._rig = None
@@ -297,8 +326,9 @@ class SyncEngine:
             self._mock_state = None
         was_active = self._rig_active
         self._rig_active = False
-        self._rig_error = None
-        if was_active:
+        self._rig_error = error
+        self._rig_connect_deadline = None
+        if was_active and error is None:
             logger.info("Rig session stopped")
         self._publish()
 
@@ -512,9 +542,23 @@ class SyncEngine:
             return
 
         if not await self._rig.ensure_connected():
+            if self._rig_connect_deadline is not None and time.monotonic() > self._rig_connect_deadline:
+                give_up_message = (
+                    f"Could not connect to {self._rig_backend} at {self._rig_host}:{self._rig_port} "
+                    f"within {RIG_CONNECT_TIMEOUT_S:.0f}s, giving up"
+                )
+                logger.warning(give_up_message)
+                # _stop_rig() publishes its own fresh snapshot (reflecting
+                # rig_active=False and, via its cascade, websdr_active=False
+                # too) -- don't also publish the stale websdr_status
+                # computed above, which describes a session that's about
+                # to be torn down.
+                await self._stop_rig(error=give_up_message)
+                return
             self._publish(rig_connected=False, websdr=websdr_status)
             return
 
+        self._rig_connect_deadline = None
         state = await self._rig.get_state()
 
         if self._websdr_active and self._driver is not None:
