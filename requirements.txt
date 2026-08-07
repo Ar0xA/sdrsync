@@ -1,3 +1,2 @@
-playwright>=1.40
 wxPython>=4.2
 pytest>=7.0
