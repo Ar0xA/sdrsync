@@ -1557,14 +1557,15 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
      pre-fix code to confirm the new test actually catches the
      regression; `cw_offset_hz` now persists on edit without requiring
      Connect first.
-     **Still open, explicitly out of scope for this environment**: the
-     real end-to-end "Update from GitHub" check needs `sites/websdr_sites.json`
-     actually pushed to `github.com/Ar0xA/sdrsync` on `master` -- a real
-     fetch right now correctly 404s (proving the fetch mechanism itself
-     works) but can't complete the full round-trip until pushed; this
-     project's practice is to only push when the user explicitly asks, so
-     it's deferred to that point rather than done unprompted here. No
-     other manual GUI click-through was possible in this environment (no
+     **Update, after the user approved a commit+push (2026-08-07,
+     `github.com/Ar0xA/sdrsync` commit `8eab952`)**: the final deferred
+     verification is now done too. A real `fetch_site_list(CURATED_LIST_URL, ...)`
+     call against the live, pushed `sites/websdr_sites.json` returns a
+     genuine HTTP 200 and correctly reports `([], "...has an empty site
+     list")` -- confirming both the fetch mechanism end-to-end and the
+     Blocker-2 empty-vs-error distinction against production GitHub, not
+     just against local fixtures. No other manual GUI click-through was
+     possible in this environment (no
      display automation for a native desktop app) -- consistent with
      every prior wx-heavy round in this project, verification here is
      standalone-script-against-the-real-API plus full pytest, not an
@@ -1578,8 +1579,12 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
    "Manage sites..." dialog. Full suite: 125/125 passing (was 101 at the
    start of this round; +24 new tests across `test_logging_setup.py`,
    `test_config.py`, `test_sitesource.py`, and `test_engine_mute_on_tx.py`).
-   Not yet committed/pushed -- awaiting the user's explicit go-ahead per
-   this project's established practice.
+   **Committed and pushed** (2026-08-07, `github.com/Ar0xA/sdrsync` commit
+   `8eab952`), with explicit user approval. The end-to-end "Update from
+   GitHub" fetch was verified live against the pushed
+   `sites/websdr_sites.json` afterward (real HTTP 200, correctly parsed
+   as a valid empty list) -- see the implementation-review entry above
+   for details.
 
 ## Next steps after restart
 
