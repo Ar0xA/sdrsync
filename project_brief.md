@@ -1675,14 +1675,163 @@ call used here, but a native Wayland compositor might not). Spike
 scripts (throwaway, not committed) live in this session's scratchpad:
 `wsl_spike_01_basic.py`, `wsl_spike_02_audio.py`.
 
-**Not yet done, explicitly out of scope for this spike**: window
-close/recreate cycling (the Windows spike's third sub-test), a real
-macOS spike (no macOS environment available in this session at all,
-unlike Linux via WSL), and any actual porting code -- per this project's
-established practice, a spike result isn't authorization to start
-implementing; that needs its own plan -> review -> implement -> review
-cycle, decided with the user when there's appetite for a real
-cross-platform round.
+**Update (2026-08-07, later session): window close/recreate cycling
+closed out, plus a latency measurement.** Resumed the spike -- system
+packages (wx, WebKitGTK, pulseaudio-utils) turned out to already be
+installed in the Debian WSL distro from the earlier session, no sudo
+blocker this time. Ran a single combined script exercising all of the
+Block-A go/no-go questions end to end in one live process against the
+real Twente WebSDR site:
+- **4/4 WebView destroy/recreate cycles succeeded** (mirrors "Switch
+  WebSDR") -- the one sub-test explicitly deferred from the first pass.
+- **Cross-process JS eval latency: ~20ms average** (15-call sample, 11-25ms
+  range) round-trip through `RunScriptAsync` + the script-result event.
+  Slower than Windows/WebView2's ~1ms (expected -- WebKitGTK's renderer
+  is a genuinely separate OS process, plus WSL2's virtualization adds
+  overhead), but nowhere near a problem at this app's 200ms poll tick --
+  roughly 10x headroom.
+- Re-confirmed the audio-gate-click and off-screen-audio-survives
+  findings above, this time end-to-end in the same script rather than
+  two separate spikes, with the same objective PulseAudio evidence
+  (`pactl list sink-inputs` showing `Corked: no`, `media.role =
+  "webaudio"`).
+- **Two new gotchas found while writing a single script that exercises
+  the whole flow** (neither is a go/no-go blocker, both are
+  implementation-time notes for whenever a real port is scoped):
+  (a) `RunScriptAsync` evaluates a bare expression, not a function call --
+  `"() => 42"` comes back as the stringified function *source*, not `42`,
+  on GTK too (confirmed already known/handled in `browser_shim.py`'s
+  Windows implementation via IIFE + `JSON.stringify()` wrapping -- this
+  just reconfirms the same fix is required on Linux, not a new problem);
+  (b) this spike's test site must use `http://`, not `https://` --
+  `websdr.ewi.utwente.nl:8901` over TLS timed out from this WSL network
+  (plain HTTP on the same port worked immediately, and matches
+  `config.py`'s actual `KNOWN_SITES` entry for Twente, which is
+  `http://`) -- a network/environment quirk of this spike, not a finding
+  about the app itself.
+
+Spike script (throwaway, not committed) lived in this session's
+scratchpad as `linux_webview_spike.py`.
+
+**Still not done, explicitly out of scope for this spike**: a real macOS
+spike (no macOS environment available in this session at all, unlike
+Linux via WSL), a bare-metal (non-WSLg) Linux desktop spike to settle the
+Wayland-window-positioning caveat above, and any actual porting code --
+per this project's established practice, a spike result isn't
+authorization to start implementing; that needs its own plan -> review ->
+implement -> review cycle, decided with the user when there's appetite
+for a real cross-platform round. With this update, every one of the
+original Windows Block-A spike's sub-tests (hidden-window audio,
+cross-thread eval, autoplay gate, close/recreate cycling) has now been
+re-run and held on Linux/WebKitGTK -- the Linux feasibility spike is
+functionally complete, modulo the WSLg-vs-bare-metal and no-macOS
+caveats above.
+
+## v10 -- Linux port (source-run) + best-effort macOS code -- DONE
+
+Following the spike above, the user said "yeah lets port, but make sure
+we dont break windows builds, eh" -- explicit go-ahead, with an explicit
+non-negotiable constraint. Scope confirmed via AskUserQuestion: macOS
+gets best-effort UNTESTED code (no Mac available at all, not even a
+spike); Linux is source-run only this round (`python -m sdrsync.main`
+works, verified live in WSL2 -- no packaged Linux build yet).
+
+**Design principle**: `wx.html2.WebViewBackendWebKit` is the ONE
+non-Windows backend constant (covers both WebKitGTK/Linux and
+Cocoa-WKWebView/macOS), so almost every platform branch is a two-way
+`win32` vs. everything-else split, not three-way.
+
+**Changes**:
+- `sdrsync/browser/backend.py`: new `target_backend()` helper (win32 ->
+  Edge, else -> WebKit) -- single source of truth, used by both this
+  module and `webview_host.py`. `EdgeBackendUnavailable`/
+  `assert_edge_available()` renamed to `WebViewBackendUnavailable`/
+  `assert_backend_available()`, now raises per-platform error messages
+  (Windows unchanged; Linux cites the exact `libwebkit2gtk-4.1-0
+  python3-wxgtk-webview4.0` apt packages this project's own WSL session
+  confirmed working; macOS labeled UNVERIFIED in the message text
+  itself, not just a code comment). `ensure_webview_backend()`'s
+  non-Windows path now logs instead of silently no-op'ing.
+- `sdrsync/gui/webview_host.py`: `create_page()` uses `target_backend()`
+  instead of a hardcoded Edge constant.
+- `sdrsync/websdr/browser_shim.py` (highest-risk file): two real
+  import-time-crash risks fixed -- `wxEVT_WEBVIEW_CREATED` and the
+  `EVT_WEBVIEW_SCRIPT_RESULT` shortcut constant don't exist on GTK wx
+  builds at all, so the old unconditional module-level binder
+  construction would `AttributeError` on Linux/macOS before any object
+  is even built. Both are now platform-guarded. On non-Windows, the
+  page's "ready" setup runs synchronously inline in `__init__` (no
+  `wxEVT_WEBVIEW_CREATED` to wait for -- confirmed via the spike that
+  WebKitGTK's underlying widget is ready synchronously). `_on_loaded()`
+  gained an explicit `about:blank` skip for GTK's own spurious
+  first-navigation LOADED event (Windows' equivalent quirk is a spurious
+  ERROR/CONNECTION_ABORTED, already handled separately, unchanged).
+- `sdrsync/gui/app.py`: `os.startfile` (Windows-only, not even an
+  `OSError` on POSIX) replaced with a 3-way branch for "open log
+  folder" (`os.startfile`/`open`/`xdg-open`), with a widened except
+  clause (`subprocess.CalledProcessError` is a `SubprocessError`, not an
+  `OSError`).
+- New `tests/test_backend_platform_selection.py` -- pure `target_backend()`
+  branch coverage via `monkeypatch.setattr(sys, "platform", ...)`.
+- `pyproject.toml`/`requirements.txt`: `wxPython` dependency gained a
+  `sys_platform != 'linux'` marker -- PyPI has no manylinux wheels, a
+  bare `pip install` on Linux was falling back to a slow, often-failing
+  source build; Linux installs must use the distro's own wxPython
+  package instead (documented in both files and in the new Linux error
+  message above).
+
+**Implementation review (independent Opus pass)**: no Windows regression
+found in any platform-guarded branch (each was traced to confirm the
+`win32` path reduces to byte-identical behavior). 5 real-but-minor
+findings, all fixed: the dependency-marker issue above, a stale OS
+classifier in `pyproject.toml`, `target_backend()`'s return type
+annotated `int` when wx's backend constants are actually `bytes`, the
+non-Windows `EVT_WEBVIEW_SCRIPT_RESULT` binder missing wx's own
+`expectedIDs=1` (harmless but now matches exactly), and the new win32
+test potentially `AttributeError`-ing on a Linux box if
+`WebViewBackendEdge` weren't defined there (hardened with a
+`hasattr`-guarded skip -- turned out to be a non-issue on the actual
+WSL wx build, which does define it, but the guard is real hardening for
+other GTK builds that might not).
+
+**Verification -- all per the plan's hard bar, nothing assumed**:
+- `pytest`: 149/149 passing on Windows, both before and after the
+  review's fixes.
+- **Live Windows exe rebuild-and-run**: rebuilt via the documented
+  PyInstaller command, ran it, `sdrsync.log` shows `"WebView2 (Edge)
+  backend available"` -- identical to pre-port output, confirming the
+  rename/target_backend() didn't silently change Windows behavior.
+- **Live Linux run inside WSL2/Debian, through the real app (not the
+  earlier throwaway spike script)**: confirmed no import-time crash
+  (the single highest-severity risk in this round) by importing
+  `backend`/`browser_shim`/`webview_host` directly first; confirmed all
+  `EVT_WEBVIEW_*` events except `SCRIPT_RESULT`/`CREATED` exist on GTK
+  (matches the plan's expectation exactly, no further guards needed);
+  icon spot-check passed (`wx.Icon(...).IsOk() == True`, no `.png`
+  fallback needed); ran `python -m sdrsync.main` for real, drove it
+  through the actual GUI (screenshot-verified at every step, mouse
+  clicks at real screen coordinates since this WSLg-bridged window
+  exposes no UI Automation tree): enabled mock rig, connected it,
+  connected to `http://websdr.ewi.utwente.nl:8901/`, and watched the
+  full engine sync end-to-end -- WebSDR panel showed `connected /
+  14074.000 kHz / USB / streaming`, matching the mock rig's own state
+  exactly. Confirmed audio was genuinely playing via `pactl list
+  sink-inputs` (`Corked: no`, `media.role="webaudio"`), the same
+  objective-evidence standard the original spike used. Exercised
+  Disconnect WebSDR then reconnect (WebView destroy/recreate, mirrors
+  "Switch WebSDR") through the real UI -- clean both ways, no crash, no
+  stuck state, confirming the readiness-gate and about:blank-filter
+  fixes hold under the app's actual call sequencing, not just the
+  narrow spike script's.
+- **macOS**: no verification attempted or possible -- stated here
+  plainly, matching every `darwin`-branch code comment and error
+  message, which all say UNVERIFIED explicitly rather than implying
+  otherwise.
+
+**Not done, explicitly out of scope this round**: a packaged Linux
+PyInstaller build (deferred per the user's confirmed scope choice), a
+bare-metal (non-WSLg) Linux desktop run, and anything macOS beyond the
+untested code itself.
 
 ## v9 punch list -- from live user testing (2026-08-07) -- DONE
 

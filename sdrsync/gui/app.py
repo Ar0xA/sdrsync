@@ -30,13 +30,15 @@ import asyncio
 import logging
 import os
 import queue
+import subprocess
+import sys
 import threading
 from typing import Callable, Optional
 
 import wx
 
 from sdrsync import __version__
-from sdrsync.browser.backend import EdgeBackendUnavailable, assert_edge_available, ensure_webview_backend
+from sdrsync.browser.backend import WebViewBackendUnavailable, assert_backend_available, ensure_webview_backend
 from sdrsync.config import (
     MAX_POLL_INTERVAL_S,
     MIN_POLL_INTERVAL_S,
@@ -1082,9 +1084,19 @@ class MainFrame(wx.Frame):
         self._update_websdr_controls()
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:
+        folder = LOG_FILE.parent
         try:
-            os.startfile(LOG_FILE.parent)  # noqa: S606 -- Windows-only app, no external input involved
-        except OSError as e:
+            if sys.platform == "win32":
+                os.startfile(folder)  # noqa: S606 -- no external input involved
+            elif sys.platform == "darwin":
+                # UNVERIFIED -- no Mac was available to test this path.
+                subprocess.run(["open", str(folder)], check=True)
+            else:
+                subprocess.run(["xdg-open", str(folder)], check=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            # subprocess.CalledProcessError (nonzero exit) is a
+            # SubprocessError, not an OSError -- both must be caught here,
+            # unlike os.startfile's single OSError-only failure mode.
             wx.MessageBox(f"Could not open the log folder ({e}).", "SDRSync", wx.OK | wx.ICON_ERROR)
 
     # ------------------------------------------------------------------
@@ -1115,8 +1127,8 @@ class SDRSyncApp(wx.App):
         logger.info("SDRSync %s starting", __version__)
         ensure_webview_backend()
         try:
-            assert_edge_available()
-        except EdgeBackendUnavailable as e:
+            assert_backend_available()
+        except WebViewBackendUnavailable as e:
             wx.MessageBox(str(e), "SDRSync cannot start", wx.OK | wx.ICON_ERROR)
             return False
 
