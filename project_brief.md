@@ -1828,10 +1828,50 @@ other GTK builds that might not).
   message, which all say UNVERIFIED explicitly rather than implying
   otherwise.
 
-**Not done, explicitly out of scope this round**: a packaged Linux
-PyInstaller build (deferred per the user's confirmed scope choice), a
-bare-metal (non-WSLg) Linux desktop run, and anything macOS beyond the
-untested code itself.
+**Not done, explicitly out of scope this round**: a bare-metal
+(non-WSLg) Linux desktop run, and anything macOS beyond the untested
+code itself.
+
+**v1.1.0 -- DONE, published** (2026-08-07,
+`github.com/Ar0xA/sdrsync/releases/tag/v1.1.0`). Windows zip rebuilt at
+the bumped version (minor bump, not patch, since this is a real feature
+-- a genuinely new platform -- not a bug fix) and re-verified clean.
+
+**Packaged Linux build -- also done same day, right after this round's
+main deliverable landed**, when the user asked for one explicitly
+(originally deferred per this round's confirmed scope). Built inside the
+same WSL2/Debian environment: `pip install --user --break-system-packages
+pyinstaller` (no sudo needed -- pip user installs don't touch
+system-managed packages, sidesteps Debian's PEP 668 externally-managed-
+environment guard that blocked earlier `apt`-only installs), then
+`pyinstaller --onedir --name SDRSync --collect-all wx --add-data
+"sdrsync/icon.ico:sdrsync" --windowed sdrsync/main.py` (note the `:`
+`--add-data` separator, not Windows' `;`). **Verified for real, not just
+"it compiled"**: ran the frozen binary directly (not source) inside the
+build dir first, then extracted the tarball into a completely separate
+directory and ran it from there too (rules out any accidental reliance
+on files left over in the build tree) -- both confirmed `sdrsync.log`
+shows `SDRSync 1.1.0 starting` / `WebKit backend available` / engine
+started, and the icon spot-check (`wx.Icon(...).IsOk()`) passed against
+the frozen build's actual `_MEIPASS`-relative path, not just the
+source-run path already checked earlier in this round.
+
+**Real, disclosed tradeoff**: the packaged tarball is ~147MB (`du -sh`
+breakdown: `libwebkit2gtk-4.0.so.37` 88M, `wx` 43M,
+`libjavascriptcoregtk-4.0.so.18` 31M, `libicudata.so.72` 30M, plus
+smaller GTK/codec libs) -- `--collect-all wx` bundles wx's own copies of
+the entire WebKitGTK/GTK/ICU stack, which is a genuine duplication with
+the system WebKitGTK the user must already have installed per this same
+release's own from-source instructions. This is architecturally
+different from the Windows build, which stays small (~42MB) because it
+relies on the OS-provided WebView2 runtime rather than bundling a
+browser engine. Asked the user explicitly (AskUserQuestion) whether to
+attempt a slimmer build excluding system-provided libs first, or ship as
+verified; user chose ship-as-is, deferring the size question to a later
+round if it turns out to matter. Released as an additional asset on the
+existing v1.1.0 tag (not a new release) via `gh release upload`, with
+release notes updated to explain the size and the two Linux install
+options (packaged vs. from-source) side by side.
 
 ## v9 punch list -- from live user testing (2026-08-07) -- DONE
 
