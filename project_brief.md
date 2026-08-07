@@ -630,6 +630,38 @@ If audio is heard with no sdrsync/python/Playwright-Chromium process
 running, it's not this app — check Windows' Volume Mixer for the real
 source (likely a separate, manually-opened browser tab to the WebSDR site).
 
+## Roadmap (requested, not yet started)
+
+Two follow-up requests from the user, explicitly ordered -- browser work
+first, flrig support after:
+
+1. **Replace Playwright/Chromium with pywebview (v5).** Plan scoped and
+   approved, saved at
+   `C:\Users\ABEL75\.claude\plans\rippling-roaming-forest.md`, but
+   implementation has **not started** -- user said to wait. Goal: swap
+   the current Playwright-driven standalone Chromium (requires a separate
+   `playwright install chromium` download) for pywebview, which wraps the
+   OS's native webview control (WebView2 on Windows, WebKitGTK on Linux,
+   Cocoa/WebKit on macOS) for a lighter, easier-to-distribute browser
+   backend. User confirmed the goal is genuinely cross-platform (not
+   Windows-only) once this came up mid-discussion -- pywebview's
+   non-Windows backends need the same de-risking treatment the plan's
+   Block A spike already calls for on Windows, before considering this
+   done on any platform. A full rewrite to C#/.NET for multi-platform was
+   considered and explicitly rejected in favor of staying in Python,
+   since rigctld/hamlib/Tkinter are already cross-platform and WebView2
+   is the only actually-Windows-specific piece today.
+2. **Add flrig as a second rig backend, alongside rigctld.** Requested by
+   the user, explicitly *after* the browser migration above -- not
+   scoped or researched yet. `rig/rigctld.py`'s `RigctldClient` is the
+   existing pattern to mirror (or generalize behind a shared interface,
+   TBD during scoping) for a new `FlrigClient` -- flrig exposes its own
+   XML-RPC control interface (distinct wire protocol from hamlib's
+   rigctld line protocol), so this is a new client from scratch, not a
+   config option on the existing one. Needs its own research pass (like
+   every WebSDR driver in this project got) before planning, not
+   assumed from memory.
+
 ## Next steps after restart
 
 1. `cd` into the project, confirm `pip install -r requirements.txt` deps
