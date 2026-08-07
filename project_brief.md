@@ -1800,6 +1800,63 @@ Explorer); `--add-data` separately bundles the raw file so `wx.Icon()`
 can load it at runtime via `resources.ICON_PATH` -- confirmed during v9
 that `--icon` alone does not also satisfy the second need.
 
+**v1.0.1 -- DONE, published** (2026-08-07,
+`github.com/Ar0xA/sdrsync/releases/tag/v1.0.1`). Straight repackage of
+the v9 punch-list fixes above -- no code changes beyond the version bump,
+same build command.
+
+## v9.1 -- two more user-reported issues (2026-08-07) -- DONE, released as v1.0.2
+
+1. **`websdr_connect_btn` label clipped ("...witch WebSDR")**. Root cause,
+   confirmed by reading the actual `GridBagSizer` layout in
+   `_build_websdr_panel`: the button's column width is computed once, at
+   `SetSizerAndFit()` time in `_build_widgets`, from whatever label is
+   showing then (`"Connect"`) -- relabeling to `"Switch WebSDR"` later
+   (`_update_websdr_controls`) doesn't retrigger that sizing, so the wider
+   text got clipped. **First attempted fix was wrong and reverted**: simply
+   padding the whole frame's width after `Fit()` doesn't help, since only
+   column 1 (the site dropdown) is growable (`AddGrowableCol(1)`) -- extra
+   frame width flows there, not into the button's non-growable column 3.
+   **Real fix**: at button-creation time, temporarily set the label to the
+   widest string it's ever relabeled to at runtime (`"Switch WebSDR"`),
+   read `GetBestSize()`, `SetMinSize()` to that plus 12px margin, then
+   restore the initial `"Connect"` label -- this makes the column reserve
+   the right width from the very first `Fit()`, regardless of which label
+   happens to be showing. Verified two ways: a standalone `GridBagSizer`
+   script confirming the button's rect is wider than the text extent, and
+   a full live run (mock rig + mock WebSDR connect, then switching the
+   site dropdown) with a real screenshot showing "Switch WebSDR" fully
+   rendered with clean padding on both sides.
+2. **KiwiSDR-family sites show "USN"/"LSN" instead of "USB"/"LSB"** (user
+   confirmed reproducible on ON1AFF's KiwiSDR instance, not on Twente/
+   websdr.org). Root cause, confirmed by reading `kiwisdr.py`'s
+   `get_status()`: it returns `window.ext_get_mode()`'s raw KiwiSDR
+   internal string verbatim (uppercased) -- when the driver had picked the
+   narrow-filter variant for a sub-2kHz passband (`map_hamlib_mode_kiwi`'s
+   existing, correct, and unchanged narrow-mode logic from v9), that raw
+   string is `"usn"`/`"lsn"`, which reads as a different mode than the
+   hamlib USB/LSB it actually corresponds to. Fixed by normalizing
+   `get_status()`'s displayed mode through the already-existing
+   `_base_mode_of()` helper (previously only used internally for CW-offset
+   detection) before uppercasing. **Also fixed the same latent bug in
+   `websdr_org.py`'s `get_status()`** for consistency/future-proofing --
+   `window.mode` can equally legitimately read back `"USBN"`/`"LSBN"` for
+   a narrow passband there, it just happened not to reproduce for this
+   user's specific session; stripped the trailing `"N"` the same way
+   `set_mode()`'s own `self._current_mode` tracking already does.
+   `openwebrx.py` has no narrow-suffix convention at all, so it was
+   already unaffected and needed no change. New regression tests:
+   `tests/test_kiwisdr_status_mode.py`, `tests/test_websdr_org_status_mode.py`
+   (stub-page `get_status()` round trips), plus pure-function coverage for
+   `_base_mode_of()` added to `tests/test_kiwisdr_mode_mapping.py`.
+
+`pytest` -- 146/146 passing (11 new tests). No independent review pass for
+this small, two-item round (unlike the full v9 punch list) -- both fixes
+were traced to a confirmed root cause in the actual code before being
+made, and both were verified live (screenshot for #1, unit tests +
+manual reasoning for #2, no real KiwiSDR/flrig hardware available in this
+environment to re-confirm #2's exact symptom end-to-end).
+
 ## Next steps after restart
 
 1. `cd` into the project, confirm `pip install -r requirements.txt` deps

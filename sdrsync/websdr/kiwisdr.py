@@ -327,7 +327,12 @@ class KiwiSDRDriver:
             return WebSDRStatus(
                 connected=True,
                 freq_hz=freq_hz,
-                mode=mode_str.upper() if mode_str else None,
+                # Displayed mode is normalized to its base (non-narrow) form
+                # -- ext_get_mode() returns KiwiSDR's own internal string
+                # verbatim (e.g. "usn"/"lsn" for a narrow-filter USB/LSB
+                # selection), which reads as a different mode than the
+                # hamlib USB/LSB it actually corresponds to if shown raw.
+                mode=_base_mode_of(mode_str).upper() if mode_str else None,
                 # Proxy: "is the sound socket open", not a true audio-is-
                 # actually-playing signal -- no confirmed AudioContext
                 # global for KiwiSDR yet (see project_brief.md).
