@@ -5,15 +5,24 @@ The rig connection and the WebSDR connection are deliberately independent
 subsystems with independent lifecycles -- picking a different WebSDR has
 nothing to do with the transceiver, and (re)connecting the transceiver has
 nothing to do with which WebSDR is loaded. A single SyncEngine instance
-owns both, plus the shared Playwright driver process, for the whole
-lifetime of the GUI session (created once, in run(), when the app starts;
-torn down once, when the app window closes) -- individual "Connect"
-actions from the GUI only start/stop one subsystem at a time via the
-thread-safe *_from_other_thread() methods below, never the whole engine.
+owns both, for the whole lifetime of the GUI session (created once, when
+the app starts; torn down once, when the app window closes) -- individual
+"Connect" actions from the GUI only start/stop one subsystem at a time via
+the thread-safe *_from_other_thread() methods below, never the whole
+engine.
+
+The WebSDR subsystem's browser lifecycle is owned by a WebViewHost
+(sdrsync/gui/webview_host.py) supplied by the GUI layer -- SyncEngine
+itself only knows the narrow create_page()/destroy_page() interface below,
+not wx, so engine-level tests can supply a plain stub instead of a real
+wx.App. See the v5 migration plan for why: Playwright's out-of-process
+Chromium (driven via CDP) was replaced with an embedded wx.html2.WebView,
+which must be created/destroyed on the GUI thread -- the host is what
+does that dispatch.
 
 Publishes status snapshots for the GUI over a plain queue.Queue (this runs
-in a background thread; the GUI polls the queue from the Tk main-loop via
-root.after()).
+in a background thread; the GUI polls the queue from the wx main-loop via
+a timer).
 """
 from __future__ import annotations
 
@@ -23,10 +32,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
-
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page, async_playwright
+from typing import Callable, Optional, Protocol
 
 from sdrsync.config import AppSettings, WebSDRSite
 from sdrsync.gui_messages import GuiMessage
@@ -34,6 +40,8 @@ from sdrsync.rig.fake_rigctld import FakeRigState
 from sdrsync.rig.fake_rigctld import start_server as start_mock_rigctld
 from sdrsync.rig.rigctld import RigctldClient
 from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
+from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
+from sdrsync.websdr.browser_shim import PageLike as Page
 from sdrsync.websdr.registry import DRIVERS
 
 logger = logging.getLogger("sdrsync.engine")
@@ -44,6 +52,20 @@ FREQ_CHANGE_THRESHOLD_HZ = 10  # ignore rig jitter smaller than this
 ATTACH_RETRY_BASE_DELAY_S = 2.0
 ATTACH_RETRY_MAX_DELAY_S = 30.0
 ATTACH_CHECK_INTERVAL_S = 1.0  # how often to notice the driver dropped attachment
+
+
+class WebViewHost(Protocol):
+    """The narrow interface SyncEngine needs from whatever manages the
+    actual browser widget -- deliberately NOT importing wx or
+    gui/webview_host.py here, so this module (and tests against it) never
+    need a real wx.App. gui/webview_host.py's WebViewHost class satisfies
+    this structurally; engine-level tests can supply any stub that does."""
+
+    async def create_page(
+        self, loop: "asyncio.AbstractEventLoop", on_dead: Optional[Callable[[str], None]] = None
+    ) -> Page: ...
+
+    async def destroy_page(self, page: Page) -> None: ...
 
 
 @dataclass
@@ -71,9 +93,12 @@ class SyncEngine:
     construction, since a whole SyncEngine is no longer recreated per
     Connect click."""
 
-    def __init__(self, settings: AppSettings, status_queue: "queue.Queue[GuiMessage]") -> None:
+    def __init__(
+        self, settings: AppSettings, status_queue: "queue.Queue[GuiMessage]", webview_host: WebViewHost
+    ) -> None:
         self.settings = settings
         self.status_queue = status_queue
+        self._webview_host = webview_host
         self.stop_event = asyncio.Event()  # whole-app shutdown (window close), not per-subsystem
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_requested = threading.Event()
@@ -86,13 +111,16 @@ class SyncEngine:
         self._rig_error: Optional[str] = None
 
         # WebSDR subsystem (independent lifecycle).
-        self._pw = None  # the entered async_playwright() context, for the whole app session
-        self._browser = None
         self._page: Optional[Page] = None
         self._driver = None
         self.site: Optional[WebSDRSite] = None
         self._attach_task: Optional[asyncio.Task] = None
         self._websdr_active = False
+        # Bumped on every _start_websdr()/_stop_websdr() -- a WebView's
+        # on_dead callback captures the generation it was created under,
+        # so a stale dead-notification from an already-replaced/torn-down
+        # page can't trigger a spurious recreation of whatever's active now.
+        self._websdr_generation = 0
 
         # Sync dedupe latches -- reset whenever either subsystem
         # (re)starts, since "already sent to X" is meaningless once X has
@@ -104,7 +132,7 @@ class SyncEngine:
         self._last_ptt: Optional[bool] = None
 
     # ------------------------------------------------------------------
-    # Thread-safe entry points -- call these from the Tk (GUI) thread.
+    # Thread-safe entry points -- call these from the GUI thread.
     def stop_from_other_thread(self) -> None:
         """Ends the whole session (app window closing), tearing down both
         subsystems. Individual subsystems are stopped via
@@ -175,9 +203,8 @@ class SyncEngine:
     def publish_fatal_error(self, message: str) -> None:
         """Thread-safe: status_queue is a plain queue.Queue, safe to call
         from whichever thread is running (or failed to start) the engine.
-        Reserved for the whole background thread dying unexpectedly (e.g.
-        the Playwright driver process itself crashing) -- a WebSDR/rig
-        subsystem failing to start is reported through their own
+        Reserved for the whole background thread dying unexpectedly -- a
+        WebSDR/rig subsystem failing to start is reported through their own
         _start_*()'s error fields instead, not this."""
         try:
             self.status_queue.put_nowait(StatusSnapshot(fatal_error=message))
@@ -194,14 +221,11 @@ class SyncEngine:
             logger.info("Stop was requested before the engine started; exiting immediately")
             return
 
-        async with async_playwright() as pw:
-            self._pw = pw
-            try:
-                await self._poll_loop()
-            finally:
-                await self._stop_websdr()
-                await self._stop_rig()
-                self._pw = None
+        try:
+            await self._poll_loop()
+        finally:
+            await self._stop_websdr()
+            await self._stop_rig()
 
     # ------------------------------------------------------------------ rig
     async def _start_rig(self, host: str, port: int, use_mock: bool) -> None:
@@ -258,35 +282,19 @@ class SyncEngine:
         if self._websdr_active:
             await self._stop_websdr()
 
-        if self._pw is None:
-            # Shouldn't be reachable from the GUI (buttons wired to a
-            # running engine), but guards against a call racing app
-            # shutdown.
-            logger.warning("start_websdr called with no Playwright session; ignoring")
-            return
+        self._websdr_generation += 1
+        my_generation = self._websdr_generation
 
         try:
-            launch_args = ["--autoplay-policy=no-user-gesture-required"]
-            if self.settings.headless:
-                # Chromium's real --headless mode has NO audio output at
-                # all -- confirmed by testing both the lightweight
-                # "headless shell" binary and the full Chromium binary's
-                # own built-in headless mode (channel="chromium"); this is
-                # a hardcoded internal limitation of headless mode itself,
-                # not something a flag or binary choice fixes. So
-                # "headless" here actually means: a normal, fully headed
-                # browser (real audio pipeline intact) positioned far off
-                # any screen, rather than Playwright's headless mode at all.
-                launch_args.append("--window-position=-32000,-32000")
-            self._browser = await self._pw.chromium.launch(headless=False, channel="chromium", args=launch_args)
-            self._page = await self._browser.new_page()
+            page = await self._webview_host.create_page(
+                self._loop, on_dead=lambda reason: self._on_page_dead(my_generation, reason)
+            )
         except Exception as e:
-            logger.exception("Failed to launch browser for WebSDR session")
-            self._publish(websdr=WebSDRStatus(connected=False, last_error=_describe_browser_launch_error(e)))
-            self._browser = None
-            self._page = None
+            logger.exception("Failed to create WebView for WebSDR session")
+            self._publish(websdr=WebSDRStatus(connected=False, last_error=_describe_webview_create_error(e)))
             return
 
+        self._page = page
         self.site = site
         self._driver = driver_cls(site.url, cw_offset_hz=self.settings.cw_offset_hz)
         self._websdr_active = True
@@ -298,7 +306,30 @@ class SyncEngine:
         logger.info("WebSDR session started: %s (%s)", site.name, site.url)
         self._publish()
 
+    def _on_page_dead(self, generation: int, reason: str) -> None:
+        """Called by WxPageAdapter (via wx.CallAfter) when a script timeout
+        or other unrecoverable failure marks it permanently dead -- without
+        this, a dead adapter fails every subsequent call cleanly but
+        nothing ever replaces it (a real gap the Block B implementation
+        review found: the WebView shim itself cannot recover on its own,
+        since a stuck RunScriptAsync can never be cancelled). Runs on the
+        GUI thread; marshal back onto the engine loop before touching any
+        engine state."""
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._handle_page_dead, generation, reason)
+
+    def _handle_page_dead(self, generation: int, reason: str) -> None:
+        if generation != self._websdr_generation or not self._websdr_active or self.site is None:
+            # Stale notification from a page that's already been replaced
+            # or torn down since -- ignore it, don't recreate something
+            # that isn't the current session anymore.
+            return
+        logger.warning("WebView for %s died (%s) -- recreating", self.site.name, reason)
+        asyncio.ensure_future(self._start_websdr(self.site))
+
     async def _stop_websdr(self) -> None:
+        self._websdr_generation += 1  # invalidates any in-flight on_dead notification
         if self._attach_task is not None:
             self._attach_task.cancel()
             try:
@@ -314,14 +345,12 @@ class SyncEngine:
             except Exception:
                 logger.exception("Error closing WebSDR driver")
             self._driver = None
-        if self._browser is not None:
+        if self._page is not None:
             try:
-                if self._browser.is_connected():
-                    await self._browser.close()
+                await self._webview_host.destroy_page(self._page)
             except Exception as e:
-                logger.warning("Non-fatal error closing browser: %s", e)
-            self._browser = None
-        self._page = None
+                logger.warning("Non-fatal error destroying WebView: %s", e)
+            self._page = None
         was_active = self._websdr_active
         self.site = None
         self._websdr_active = False
@@ -499,11 +528,5 @@ class SyncEngine:
         )
 
 
-def _describe_browser_launch_error(e: Exception) -> str:
-    text = str(e)
-    if "Executable doesn't exist" in text or "playwright install" in text:
-        return (
-            "Chromium isn't installed for Playwright yet. Open a terminal and run: "
-            "playwright install chromium -- then try again."
-        )
-    return f"Could not start the browser: {e}"
+def _describe_webview_create_error(e: Exception) -> str:
+    return f"Could not create the WebSDR browser view: {e}"

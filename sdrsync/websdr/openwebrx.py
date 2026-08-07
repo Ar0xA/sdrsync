@@ -46,8 +46,8 @@ import logging
 import math
 from typing import Optional
 
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page
+from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
+from sdrsync.websdr.browser_shim import PageLike as Page
 
 from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
 

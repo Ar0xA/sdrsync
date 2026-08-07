@@ -60,9 +60,21 @@ class StubDriver:
         pass
 
 
+class _UnusedWebViewHost:
+    """These tests drive engine._tick() directly against stub rig/driver
+    objects and never touch WebView creation/teardown -- satisfies
+    SyncEngine's WebViewHost Protocol without needing a real one."""
+
+    async def create_page(self, loop, on_dead=None):
+        raise AssertionError("not expected to be called in these tests")
+
+    async def destroy_page(self, page) -> None:
+        raise AssertionError("not expected to be called in these tests")
+
+
 def make_engine() -> SyncEngine:
     settings = AppSettings()
-    return SyncEngine(settings, status_queue=queue.Queue())
+    return SyncEngine(settings, status_queue=queue.Queue(), webview_host=_UnusedWebViewHost())
 
 
 def test_unsupported_mode_does_not_block_frequency_sync():
