@@ -11,15 +11,20 @@ WebSDR to move your radio) is not implemented.
 ## How it works
 
 Rather than reimplementing a given WebSDR site's custom binary
-websocket/audio protocol, sdrsync launches a real Chromium browser tab (via
-Playwright) pointed at the actual WebSDR page and drives it by calling the
-site's own JavaScript control functions. This means:
+websocket/audio protocol, sdrsync embeds a real browser view (your OS's
+native web engine — Edge WebView2 on Windows, via wxPython) pointed at the
+actual WebSDR page and drives it by calling the site's own JavaScript
+control functions. This means:
 
-- **Audio just works** — it's genuine audio from a genuine browser tab
+- **Audio just works** — it's genuine audio from a genuine browser engine
   through your normal audio output device, not a reimplemented codec. This
   is true even with the browser window hidden (see "Hidden window mode"
-  below); Chromium's actual `--headless` mode has no audio output at all
-  (confirmed by testing), so sdrsync never uses it.
+  below).
+- **No separate browser install step** — unlike an earlier version of this
+  project (which used Playwright/Chromium, requiring a
+  `playwright install chromium` download), the embedded WebView2 engine
+  ships with Windows 10/11 already, so `pip install -r requirements.txt`
+  is the whole setup.
 - Each WebSDR *software family* (websdr.org's classic "WebSDR", KiwiSDR,
   OpenWebRX, ...) has its own unrelated control API, so each gets its own
   driver module implementing `sdrsync.websdr.base.WebSDRDriver`. Three
@@ -70,7 +75,6 @@ site's own JavaScript control functions. This means:
 
 ```bash
 pip install -r requirements.txt
-playwright install chromium
 ```
 
 ## Run
@@ -101,14 +105,11 @@ playwright install chromium
 ### Hidden window mode
 
 Check **Hide browser window (audio still plays)** before connecting to run
-without a visible Chromium window on screen. Despite the setting's internal
-name (`headless` in `config.py`), this does **not** use Chromium's real
-`--headless` flag — that mode has no audio output at all, full stop,
-regardless of which Chromium binary or launch flags are used (tested both
-the lightweight "headless shell" and the full binary's own headless mode).
-Instead, sdrsync launches a normal, fully headed browser and positions its
-window far off any screen (`--window-position=-32000,-32000`), which keeps
-the real audio pipeline intact while showing nothing on screen.
+without a visible browser window on screen. sdrsync keeps its WebView
+window positioned far off any screen while genuinely shown (not
+minimized/hidden, which suspends WebView2's rendering and audio) —
+this keeps the real audio pipeline intact while showing nothing on
+screen.
 
 ### Testing without real hardware
 

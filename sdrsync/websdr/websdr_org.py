@@ -27,8 +27,8 @@ import logging
 import re
 from typing import Optional
 
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page
+from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
+from sdrsync.websdr.browser_shim import PageLike as Page
 
 # TargetClosedError (browser/tab closed) is a subclass of playwright's base
 # Error in the versions we support, so catching PlaywrightError alone covers
