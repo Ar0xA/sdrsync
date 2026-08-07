@@ -191,7 +191,7 @@ def test_thread_safe_entry_points_are_noop_before_run():
 
     engine.start_websdr_from_other_thread(site)  # must not raise
     engine.stop_websdr_from_other_thread()
-    engine.start_rig_from_other_thread("127.0.0.1", 4532, True)
+    engine.start_rig_from_other_thread("rigctld", "127.0.0.1", 4532, True)
     engine.stop_rig_from_other_thread()
 
 

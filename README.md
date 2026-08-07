@@ -2,7 +2,8 @@
 
 An open-source, Python alternative to CatSyncSDR: keeps a WebSDR (a
 shortwave receiver you tune through a website) in sync with a real
-transceiver over the network via hamlib's `rigctld` — **not** Omnirig.
+transceiver over the network, via either hamlib's `rigctld` or `flrig`'s
+own XML-RPC interface — **not** Omnirig.
 
 **Sync direction is one-way only: transceiver → WebSDR.** Turning the dial
 or changing mode on your radio retunes the WebSDR; the reverse (tuning the
@@ -85,20 +86,26 @@ pip install -e .
 
 ## Run
 
-1. Point hamlib's `rigctld` at your radio, e.g.:
-   ```bash
-   rigctld -m <hamlib-model-number> -r <serial-port> -t 4532
-   ```
+1. Point a rig-control backend at your radio — the Transceiver panel's
+   **Backend** dropdown picks which one:
+   - **rigctld** (hamlib): `rigctld -m <hamlib-model-number> -r <serial-port> -t 4532`
+   - **flrig**: start flrig normally and enable its XML-RPC server
+     (`Config > Setup > Transceiver > Server`, default port 12345 --
+     see [flrig's docs](http://www.w1hkj.com/flrig-help/xmlrpc_server.html)).
+   Each backend keeps its own host/port, so switching the dropdown back
+   and forth doesn't lose either one's settings.
    (Or check **Use mock rig** in the Transceiver panel instead — see below
-   — if you just want to try it out without a radio.)
+   — if you just want to try it out without a radio; works with either
+   backend.)
 2. Start sdrsync:
    ```bash
    python -m sdrsync.main
    ```
 3. The **Transceiver** panel and the **WebSDR** panel each have their own
    independent **Connect**/**Test** buttons — use them in either order.
-   **Test** checks reachability (rigctld TCP connect, or an HTTP GET to the
-   WebSDR URL) without actually connecting/launching a browser.
+   **Test** checks reachability (a rigctld TCP connect or a flrig XML-RPC
+   probe, depending on the selected backend; an HTTP GET for the WebSDR
+   URL) without actually connecting/launching a browser.
 4. In the WebSDR panel, pick a site from the dropdown (or **Custom URL...**
    + **Detect**) and click **Connect**. To switch to a different WebSDR
    later, just pick a new site and click the same button again — it's now
@@ -129,14 +136,15 @@ traffic. Takes effect immediately, no reconnect needed.
 ### Testing without real hardware
 
 Check **Use mock rig (embedded, for testing)** before connecting: sdrsync
-starts its own tiny rigctld-compatible server in-process (bound to the
-host/port you'd otherwise point at a real rigctld — the host field is
-forced to `127.0.0.1` and locked while this is checked) and a **Mock Rig
-Control** panel appears once connected, letting you set frequency, mode +
-passband, and PTT directly from the app and watch the (real, headed)
-WebSDR tab follow — no separate terminal or real radio needed. The panel
-only ever appears in mock mode, so a real-rig run never shows controls
-that look like they drive a real radio.
+starts its own tiny in-process server speaking whichever backend is
+selected (rigctld's line protocol, or flrig's XML-RPC interface) --
+bound to the host/port you'd otherwise point at the real thing, host
+field forced to `127.0.0.1` and locked while this is checked -- and a
+**Mock Rig Control** panel appears once connected, letting you set
+frequency, mode + passband, and PTT directly from the app and watch the
+(real, headed) WebSDR tab follow — no separate terminal or real radio
+needed. The panel only ever appears in mock mode, so a real-rig run
+never shows controls that look like they drive a real radio.
 
 `sdrsync/rig/fake_rigctld.py` also still works standalone, if you'd rather
 drive it from a terminal instead of the GUI panel:

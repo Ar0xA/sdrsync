@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from typing import Optional
+
+from sdrsync.rig.base import RigState
 
 logger = logging.getLogger("sdrsync.rigctld")
 
@@ -60,14 +61,6 @@ def parse_ptt_response(resp: Optional[str]) -> Optional[bool]:
     if resp == "0":
         return False
     return None
-
-
-@dataclass
-class RigState:
-    freq_hz: Optional[int]
-    mode: Optional[str]
-    passband_hz: Optional[int]
-    ptt: Optional[bool]
 
 
 class RigctldClient:

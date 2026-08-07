@@ -36,13 +36,20 @@ import wx
 
 from sdrsync import __version__
 from sdrsync.browser.backend import EdgeBackendUnavailable, assert_edge_available, ensure_webview_backend
-from sdrsync.config import MAX_POLL_INTERVAL_S, MIN_POLL_INTERVAL_S, AppSettings, KNOWN_SITES, WebSDRSite
+from sdrsync.config import (
+    MAX_POLL_INTERVAL_S,
+    MIN_POLL_INTERVAL_S,
+    AppSettings,
+    KNOWN_SITES,
+    WebSDRSite,
+)
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui.webview_host import WebViewHost
 from sdrsync.preflight import (
     DetectResult,
     RigPreflightResult,
     WebsdrPreflightResult,
+    check_flrig,
     check_rigctld,
     check_websdr_url,
     detect_websdr_type,
@@ -56,6 +63,10 @@ SHUTDOWN_TIMEOUT_S = 5.0
 CUSTOM_URL_SENTINEL = "Custom URL..."
 LABEL_WRAP_PX = 380
 ERROR_COLOUR = wx.Colour(200, 0, 0)
+# Fixed display order for the Backend dropdown -- config.RIG_BACKENDS is
+# a set (used for validation membership checks), which has no defined
+# order.
+RIG_BACKEND_CHOICES = ["rigctld", "flrig"]
 
 
 def _set_wrapped(static_text: wx.StaticText, text: str, width: int = LABEL_WRAP_PX) -> None:
@@ -162,7 +173,7 @@ class MainFrame(wx.Frame):
         self._build_websdr_panel(websdr_box, websdr_sizer)
         main_sizer.Add(websdr_sizer, flag=wx.EXPAND | wx.ALL, border=6)
 
-        rig_box = wx.StaticBox(panel, label="Transceiver (rigctld)")
+        rig_box = wx.StaticBox(panel, label="Transceiver")
         rig_sizer = wx.StaticBoxSizer(rig_box, wx.VERTICAL)
         self._build_rig_panel(rig_box, rig_sizer)
         main_sizer.Add(rig_sizer, flag=wx.EXPAND | wx.ALL, border=6)
@@ -246,13 +257,22 @@ class MainFrame(wx.Frame):
         grid = wx.GridBagSizer(vgap=4, hgap=6)
         row = 0
 
-        grid.Add(wx.StaticText(parent, label="rigctld host:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        self.host_entry = wx.TextCtrl(parent, value=self.settings.rigctld_host, size=(140, -1))
+        grid.Add(wx.StaticText(parent, label="Backend:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.rig_backend_combo = wx.ComboBox(
+            parent, value=self.settings.rig_backend, choices=RIG_BACKEND_CHOICES, style=wx.CB_READONLY,
+        )
+        self.rig_backend_combo.Bind(wx.EVT_COMBOBOX, self._on_rig_backend_selected)
+        grid.Add(self.rig_backend_combo, pos=(row, 1), span=(1, 3), flag=wx.EXPAND)
+        row += 1
+
+        grid.Add(wx.StaticText(parent, label="host:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.host_entry = wx.TextCtrl(parent, size=(140, -1))
         grid.Add(self.host_entry, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         grid.Add(wx.StaticText(parent, label="port:"), pos=(row, 2),
                  flag=wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
-        self.port_entry = wx.TextCtrl(parent, value=str(self.settings.rigctld_port), size=(80, -1))
+        self.port_entry = wx.TextCtrl(parent, size=(80, -1))
         grid.Add(self.port_entry, pos=(row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        self._populate_host_port_for_backend(self.settings.rig_backend)
         row += 1
 
         grid.Add(wx.StaticText(parent, label="Poll interval (s):"), pos=(row, 0),
@@ -629,6 +649,37 @@ class MainFrame(wx.Frame):
         is_mock = self.mock_rig_check.GetValue()
         self.host_entry.Enable(not is_mock)
 
+    def _populate_host_port_for_backend(self, backend: str) -> None:
+        if backend == "flrig":
+            self.host_entry.SetValue(self.settings.flrig_host)
+            self.port_entry.SetValue(str(self.settings.flrig_port))
+        else:
+            self.host_entry.SetValue(self.settings.rigctld_host)
+            self.port_entry.SetValue(str(self.settings.rigctld_port))
+
+    def _save_current_backend_host_port(self) -> None:
+        """Persists whatever's currently typed into host_entry/port_entry
+        back into the *currently selected* backend's own settings fields
+        -- call this before switching self.settings.rig_backend to a new
+        value, so each backend keeps its own host/port across switches
+        instead of one clobbering the other."""
+        host = self.host_entry.GetValue().strip() or "127.0.0.1"
+        try:
+            port = int(self.port_entry.GetValue())
+        except ValueError:
+            return  # don't clobber a saved port with garbage; leave it as-is
+        if self.settings.rig_backend == "flrig":
+            self.settings.flrig_host, self.settings.flrig_port = host, port
+        else:
+            self.settings.rigctld_host, self.settings.rigctld_port = host, port
+
+    def _on_rig_backend_selected(self, _event=None) -> None:
+        self._save_current_backend_host_port()
+        new_backend = self.rig_backend_combo.GetValue()
+        self.settings.rig_backend = new_backend
+        self.settings.save()
+        self._populate_host_port_for_backend(new_backend)
+
     def _on_poll_interval_changed(self, _event=None) -> None:
         # SyncEngine reads self.settings.poll_interval_s live on every tick
         # (sync/engine.py's _poll_loop), so this applies immediately --
@@ -675,21 +726,23 @@ class MainFrame(wx.Frame):
         try:
             port = int(self.port_entry.GetValue())
         except ValueError:
-            self.rig_preflight_text.SetLabel("Invalid rigctld port")
+            self.rig_preflight_text.SetLabel("Invalid port")
             return
         host = self.host_entry.GetValue().strip() or "127.0.0.1"
+        backend = self.rig_backend_combo.GetValue()
         self.rig_test_btn.Enable(False)
         self.rig_test_btn.SetLabel("Testing...")
-        self.rig_preflight_text.SetLabel("Checking rigctld reachability...")
+        self.rig_preflight_text.SetLabel(f"Checking {backend} reachability...")
         self.rig_test_thread = threading.Thread(
-            target=self._run_rig_test, args=(host, port, self.status_queue), daemon=True
+            target=self._run_rig_test, args=(backend, host, port, self.status_queue), daemon=True
         )
         self.rig_test_thread.start()
 
     @staticmethod
-    def _run_rig_test(host: str, port: int, status_queue: "queue.Queue") -> None:
+    def _run_rig_test(backend: str, host: str, port: int, status_queue: "queue.Queue") -> None:
         try:
-            ok, message = asyncio.run(check_rigctld(host, port))
+            check = check_flrig if backend == "flrig" else check_rigctld
+            ok, message = asyncio.run(check(host, port))
         except Exception as e:
             logger.exception("Rig preflight check crashed")
             ok, message = False, f"Check failed: {e}"
@@ -713,17 +766,23 @@ class MainFrame(wx.Frame):
         try:
             port = int(self.port_entry.GetValue())
         except ValueError:
-            self.rig_err_text.SetLabel("Invalid rigctld port")
+            self.rig_err_text.SetLabel("Invalid port")
             return
 
+        backend = self.rig_backend_combo.GetValue()
         use_mock = self.mock_rig_check.GetValue()
         # A mock rig only ever exists on loopback -- ignore whatever's typed
         # in the host field rather than silently trying to bind a mock
         # server to some other address.
         host = "127.0.0.1" if use_mock else (self.host_entry.GetValue().strip() or "127.0.0.1")
 
-        self.settings.rigctld_host = host
-        self.settings.rigctld_port = port
+        if backend == "flrig":
+            self.settings.flrig_host = host
+            self.settings.flrig_port = port
+        else:
+            self.settings.rigctld_host = host
+            self.settings.rigctld_port = port
+        self.settings.rig_backend = backend
         self.settings.use_mock_rig = use_mock
         self.settings.save()
 
@@ -734,7 +793,8 @@ class MainFrame(wx.Frame):
         self.rig_connect_btn.SetLabel("Connecting...")
         self.mock_rig_check.Enable(False)
         self.host_entry.Enable(False)
-        self.engine.start_rig_from_other_thread(host, port, use_mock)
+        self.rig_backend_combo.Enable(False)
+        self.engine.start_rig_from_other_thread(backend, host, port, use_mock)
 
     # ------------------------------------------------------------------
     def _poll_status_queue(self, _event=None) -> None:
@@ -786,6 +846,7 @@ class MainFrame(wx.Frame):
             self.rig_connect_btn.SetLabel("Connect")
             self.host_entry.Enable(not self.mock_rig_check.GetValue())
             self.mock_rig_check.Enable(True)
+            self.rig_backend_combo.Enable(True)
         _set_wrapped(self.rig_err_text, snap.rig_error or "")
         self._update_mock_rig_panel_visibility()
 

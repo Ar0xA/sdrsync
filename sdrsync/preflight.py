@@ -7,28 +7,34 @@ launching a browser.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import logging
 import urllib.error
 import urllib.request
+import xmlrpc.client
 from dataclasses import dataclass
 from typing import Optional
+from xml.parsers.expat import ExpatError
 
 from sdrsync.gui_messages import GuiMessage
+from sdrsync.rig.flrig import TimeoutTransport
 from sdrsync.websdr import registry
 
 logger = logging.getLogger("sdrsync.preflight")
 
 RIGCTLD_CHECK_TIMEOUT_S = 2.0
+FLRIG_CHECK_TIMEOUT_S = 2.0
 WEBSDR_CHECK_TIMEOUT_S = 5.0
 
 
 @dataclass
 class RigPreflightResult(GuiMessage):
     """Published on the same status_queue as StatusSnapshot, from the
-    Transceiver panel's own Test button. Scoped to rigctld only -- the rig
-    and WebSDR connections are independent subsystems (see SyncEngine), so
-    their preflight checks are independent too, not a single combined
-    result."""
+    Transceiver panel's own Test button. Shared by both rig backends
+    (rigctld and flrig) -- it's just ok/message, nothing backend-specific
+    -- but scoped to the rig side only: the rig and WebSDR connections
+    are independent subsystems (see SyncEngine), so their preflight
+    checks are independent too, not a single combined result."""
     ok: bool
     message: str
 
@@ -79,6 +85,34 @@ async def check_rigctld(host: str, port: int, timeout: float = RIGCTLD_CHECK_TIM
             await writer.wait_closed()
         except Exception:
             pass
+
+
+def _flrig_probe_sync(host: str, port: int, timeout: float) -> str:
+    with xmlrpc.client.ServerProxy(
+        f"http://{host}:{port}/RPC2", transport=TimeoutTransport(timeout)
+    ) as proxy:
+        return proxy.main.get_version()
+
+
+async def check_flrig(host: str, port: int, timeout: float = FLRIG_CHECK_TIMEOUT_S) -> tuple[bool, str]:
+    """XML-RPC main.get_version() probe, same role as check_rigctld() but
+    for flrig's XML-RPC interface -- standalone (no FlrigClient instance
+    needed) so it doesn't require an engine, matching check_rigctld()'s
+    independence. main.get_version is flrig's one precondition-free call
+    (confirmed via source), the right choice for a reachability probe."""
+    loop = asyncio.get_running_loop()
+    try:
+        # The outer wait_for gets a small buffer over the inner socket
+        # timeout so the inner one reliably fires first with a real error
+        # message, instead of racing to produce asyncio.TimeoutError's
+        # empty one -- same reasoning as FlrigClient.connect()'s
+        # connect_timeout > cmd_timeout relationship.
+        version = await asyncio.wait_for(
+            loop.run_in_executor(None, _flrig_probe_sync, host, port, timeout), timeout=timeout + 1.0
+        )
+        return True, f"flrig reachable at {host}:{port}" + (f" ({version})" if version else "")
+    except (OSError, xmlrpc.client.Error, http.client.HTTPException, ExpatError, asyncio.TimeoutError) as e:
+        return False, f"Could not reach flrig at {host}:{port} ({e})"
 
 
 def _http_get_sync(url: str, timeout: float) -> tuple[bool, str]:

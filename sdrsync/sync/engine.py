@@ -1,5 +1,5 @@
-"""One-directional sync engine: transceiver (rigctld) -> WebSDR, and nothing
-in the other direction.
+"""One-directional sync engine: transceiver (rigctld or flrig) -> WebSDR,
+and nothing in the other direction.
 
 The rig connection and the WebSDR connection are deliberately independent
 subsystems with independent lifecycles -- picking a different WebSDR has
@@ -36,8 +36,12 @@ from typing import Callable, Optional, Protocol
 
 from sdrsync.config import AppSettings, WebSDRSite
 from sdrsync.gui_messages import GuiMessage
+from sdrsync.rig.base import RigState
+from sdrsync.rig.fake_flrig import FakeFlrigState
+from sdrsync.rig.fake_flrig import start_server as start_mock_flrig
 from sdrsync.rig.fake_rigctld import FakeRigState
 from sdrsync.rig.fake_rigctld import start_server as start_mock_rigctld
+from sdrsync.rig.flrig import FlrigClient
 from sdrsync.rig.rigctld import RigctldClient
 from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
@@ -68,6 +72,19 @@ class WebViewHost(Protocol):
     async def destroy_page(self, page: Page) -> None: ...
 
 
+class RigClient(Protocol):
+    """The narrow interface SyncEngine needs from either rig backend --
+    deliberately just the 3 methods _tick()/_stop_rig() actually call.
+    reconnect_delay() exists on both RigctldClient and FlrigClient but has
+    no call site here for either, so it's intentionally excluded."""
+
+    async def ensure_connected(self) -> bool: ...
+
+    async def get_state(self) -> RigState: ...
+
+    async def close(self) -> None: ...
+
+
 @dataclass
 class StatusSnapshot(GuiMessage):
     # "_active" means "a session has been requested/started" (may still be
@@ -87,11 +104,11 @@ class StatusSnapshot(GuiMessage):
 
 class SyncEngine:
     """One instance per GUI session (created once at app startup, lives
-    until the window closes). settings.rigctld_host/port/use_mock_rig are
-    read fresh each time start_rig_from_other_thread() is called (its
-    caller passes the current values explicitly), not cached at
-    construction, since a whole SyncEngine is no longer recreated per
-    Connect click."""
+    until the window closes). settings.rigctld_host/port/flrig_host/
+    flrig_port/use_mock_rig/rig_backend are read fresh each time
+    start_rig_from_other_thread() is called (its caller passes the
+    current values explicitly), not cached at construction, since a
+    whole SyncEngine is no longer recreated per Connect click."""
 
     def __init__(
         self, settings: AppSettings, status_queue: "queue.Queue[GuiMessage]", webview_host: WebViewHost
@@ -104,9 +121,12 @@ class SyncEngine:
         self._stop_requested = threading.Event()
 
         # Rig subsystem (independent lifecycle -- see module docstring).
-        self._rig: Optional[RigctldClient] = None
-        self._mock_server: Optional[asyncio.AbstractServer] = None
-        self._mock_state: Optional[FakeRigState] = None
+        self._rig: Optional[RigClient] = None
+        # asyncio.AbstractServer (rigctld mock) or FlrigMockServerHandle
+        # (flrig mock) -- no common base class, both duck-type close() +
+        # await wait_closed(), which is all _stop_rig() needs.
+        self._mock_server = None
+        self._mock_state: "Optional[FakeRigState | FakeFlrigState]" = None
         self._rig_active = False
         self._rig_error: Optional[str] = None
 
@@ -146,10 +166,10 @@ class SyncEngine:
             except RuntimeError:
                 pass  # loop already closed (engine thread already exited)
 
-    def start_rig_from_other_thread(self, host: str, port: int, use_mock: bool) -> None:
+    def start_rig_from_other_thread(self, backend: str, host: str, port: int, use_mock: bool) -> None:
         if self._loop is None:
             return
-        self._run_coro_threadsafe(self._start_rig(host, port, use_mock))
+        self._run_coro_threadsafe(self._start_rig(backend, host, port, use_mock))
 
     def stop_rig_from_other_thread(self) -> None:
         if self._loop is None:
@@ -228,27 +248,40 @@ class SyncEngine:
             await self._stop_rig()
 
     # ------------------------------------------------------------------ rig
-    async def _start_rig(self, host: str, port: int, use_mock: bool) -> None:
+    async def _start_rig(self, backend: str, host: str, port: int, use_mock: bool) -> None:
+        """backend is "rigctld" or "flrig" -- a simple if/else branch below,
+        not a registry, since there are only ever exactly 2 (unlike the
+        WebSDR side's DRIVERS dict, which has room to grow via
+        fingerprinting). Mock mode is always server-side only: even in
+        mock mode, self._rig is the real client class for the selected
+        backend, pointed at the just-started embedded mock server -- never
+        a separate fake client."""
         if self._rig_active:
             await self._stop_rig()
 
         if use_mock:
             try:
-                self._mock_server, self._mock_state = await start_mock_rigctld(host, port)
+                if backend == "flrig":
+                    self._mock_server, self._mock_state = await start_mock_flrig(host, port)
+                else:
+                    self._mock_server, self._mock_state = await start_mock_rigctld(host, port)
             except OSError as e:
                 self._rig_error = (
                     f"Could not start the embedded mock rig on {host}:{port} ({e}). "
-                    "Is a real rigctld already running on that port?"
+                    f"Is a real {backend} already running on that port?"
                 )
                 logger.error(self._rig_error)
                 self._publish()
                 return
 
-        self._rig = RigctldClient(host, port)
+        if backend == "flrig":
+            self._rig = FlrigClient(host, port)
+        else:
+            self._rig = RigctldClient(host, port)
         self._rig_active = True
         self._rig_error = None
         self._last_ptt = None
-        logger.info("Rig session started (%s:%d, mock=%s)", host, port, use_mock)
+        logger.info("Rig session started (%s, %s:%d, mock=%s)", backend, host, port, use_mock)
         self._publish()
 
     async def _stop_rig(self) -> None:
