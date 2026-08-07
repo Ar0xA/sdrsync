@@ -1,1 +1,22 @@
-[]
+[
+  {"name": "ON1AFF (Belgium)", "url": "http://sdr1.on1aff.be/", "driver_type": "kiwisdr"},
+  {"name": "OH6LSL (Finland)", "url": "http://kiwisdr.oh6ai.fi:8073/", "driver_type": "kiwisdr"},
+  {"name": "OK2KYJ (Olomouc, Czech Republic)", "url": "http://sdr.ok2kyj.cz:8073/", "driver_type": "kiwisdr"},
+  {"name": "F5NKP (near Paris, France)", "url": "http://f5nkp.freeboxos.fr:8073/", "driver_type": "kiwisdr"},
+  {"name": "K1VL (Shrewsbury, Vermont, USA)", "url": "http://sdr.k1vl.com:8073/", "driver_type": "kiwisdr"},
+  {"name": "Warszawa (Poland)", "url": "http://warszawa.proxy.kiwisdr.com:8073/", "driver_type": "kiwisdr"},
+  {"name": "OE3GAS (Hollabrunn, Austria)", "url": "https://www.kiwi.egimoto.com/", "driver_type": "kiwisdr"},
+  {"name": "NA5B (Washington DC area, USA)", "url": "http://na5b.com:8901/", "driver_type": "websdr_org"},
+  {"name": "Hackgreen (Cheshire, UK)", "url": "http://hackgreensdr.org:8902/", "driver_type": "websdr_org"},
+  {"name": "22dx.ru (Barnaul, Russia)", "url": "http://sdr.22dx.ru:8901/", "driver_type": "websdr_org"},
+  {"name": "IS0GRB (Italy)", "url": "http://websdr.is0grb.it:8901/", "driver_type": "websdr_org"},
+  {"name": "OH1E (Pori, Finland)", "url": "https://websdr.fi/", "driver_type": "websdr_org"},
+  {"name": "WebSDR Maasbree (Netherlands)", "url": "http://sdr.websdrmaasbree.nl:8901/", "driver_type": "websdr_org"},
+  {"name": "KF5JMD (Gatesville, Texas, USA)", "url": "http://sdr.kf5jmd.com:8901/", "driver_type": "websdr_org"},
+  {"name": "N7RIX (USA)", "url": "https://sdr.n7rix.com/", "driver_type": "openwebrx"},
+  {"name": "DL2RN (Burg Haag, Germany)", "url": "https://openwebrx.rahsmann.de/", "driver_type": "openwebrx"},
+  {"name": "MM3NDH (Central Scotland, UK)", "url": "https://websdr2.scotlandchat.co.uk/", "driver_type": "openwebrx"},
+  {"name": "EA5TB (Valencia, Spain)", "url": "http://sdrvalencia.com/", "driver_type": "openwebrx"},
+  {"name": "ON0LLV (Belgium)", "url": "http://on0llv.on6ll.be:8073/", "driver_type": "openwebrx"},
+  {"name": "Maarssen (Netherlands)", "url": "http://radarmaarssen.nl:8073/", "driver_type": "openwebrx"}
+]
