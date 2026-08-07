@@ -2,6 +2,10 @@
 different WebSDR must never touch the rigctld connection, and vice versa.
 Uses stub objects instead of a real browser/socket, same pattern as
 test_engine_mode_independence.py.
+
+StubWebViewHost stands in for gui/webview_host.py's WebViewHost --
+satisfies SyncEngine's WebViewHost Protocol (create_page/destroy_page)
+without touching wx at all, so these tests stay fast and headless.
 """
 import asyncio
 import queue
@@ -45,33 +49,27 @@ class StubRig:
         self.closed = True
 
 
-class StubBrowser:
-    def __init__(self) -> None:
-        self.closed = False
-        self._connected = True
-
-    async def new_page(self):
-        return object()  # sentinel page; nothing in these tests touches it
-
-    def is_connected(self) -> bool:
-        return self._connected
-
-    async def close(self) -> None:
-        self.closed = True
-        self._connected = False
+class StubPage:
+    """Sentinel page -- nothing in these tests touches its content, only
+    identity (via StubWebViewHost's created/destroyed lists)."""
 
 
-class StubChromium:
-    async def launch(self, **kwargs):
-        return StubBrowser()
-
-
-class StubPlaywright:
-    """Stands in for the object async_playwright() yields -- only
-    .chromium.launch() is exercised by _start_websdr()."""
+class StubWebViewHost:
+    """Satisfies SyncEngine's WebViewHost Protocol. Tracks created/
+    destroyed pages so tests can assert on WebView lifecycle without a
+    real wx.App/WebView existing."""
 
     def __init__(self) -> None:
-        self.chromium = StubChromium()
+        self.created: list[StubPage] = []
+        self.destroyed: list[StubPage] = []
+
+    async def create_page(self, loop, on_dead=None):
+        page = StubPage()
+        self.created.append(page)
+        return page
+
+    async def destroy_page(self, page) -> None:
+        self.destroyed.append(page)
 
 
 async def _noop_attach_supervisor(page) -> None:
@@ -81,12 +79,8 @@ async def _noop_attach_supervisor(page) -> None:
 
 
 def make_engine() -> SyncEngine:
-    """An engine with a stubbed-in Playwright session, as if run() had
-    already entered async_playwright() -- _start_websdr() needs this to do
-    anything at all."""
     settings = AppSettings()
-    engine = SyncEngine(settings, status_queue=queue.Queue())
-    engine._pw = StubPlaywright()
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=StubWebViewHost())
     engine._attach_supervisor = _noop_attach_supervisor
     return engine
 
@@ -131,6 +125,9 @@ def test_switching_site_swaps_driver_and_resets_latches_without_touching_rig(mon
         assert engine._last_sent_mode_key is None
         assert engine._last_ptt is None
         assert engine._rig is original_rig  # still untouched
+        # Switching sites must tear down the first WebView, not leak it.
+        assert len(engine._webview_host.created) == 2
+        assert len(engine._webview_host.destroyed) == 1
 
     asyncio.run(run())
 
@@ -150,6 +147,7 @@ def test_stop_websdr_does_not_touch_rig(monkeypatch):
         await engine._stop_websdr()
         assert engine._websdr_active is False
         assert engine.site is None
+        assert len(engine._webview_host.destroyed) == 1
         # The whole point: stopping WebSDR never touches the rig.
         assert engine._rig is rig_stub
         assert rig_stub.closed is False
@@ -188,10 +186,62 @@ def test_thread_safe_entry_points_are_noop_before_run():
     point before that (or after a full stop) must not raise, and must not
     schedule work that's never awaited."""
     settings = AppSettings()
-    engine = SyncEngine(settings, status_queue=queue.Queue())
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=StubWebViewHost())
     site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
 
     engine.start_websdr_from_other_thread(site)  # must not raise
     engine.stop_websdr_from_other_thread()
     engine.start_rig_from_other_thread("127.0.0.1", 4532, True)
     engine.stop_rig_from_other_thread()
+
+
+def test_page_death_recreates_the_websdr_session(monkeypatch):
+    """A WebView dying (script timeout with no way to cancel it -- see
+    WxPageAdapter's on_dead) must trigger a fresh _start_websdr(), the
+    same recovery path an explicit reconnect takes -- this was a real gap
+    the Block B implementation review found (nothing previously called
+    the callback at all)."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    engine = make_engine()
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        await engine._start_websdr(site)
+        assert len(engine._webview_host.created) == 1
+        generation = engine._websdr_generation
+
+        engine._on_page_dead(generation, "test-induced death")
+        # _on_page_dead schedules _handle_page_dead via call_soon_threadsafe
+        # -- let the loop process it.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert len(engine._webview_host.created) == 2
+        assert engine._websdr_active is True
+
+    asyncio.run(run())
+
+
+def test_stale_page_death_notification_is_ignored(monkeypatch):
+    """A dead-notification tagged with an old generation (from a page
+    that's already been replaced/torn down) must not trigger a spurious
+    recreation of whatever's active now."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    engine = make_engine()
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        await engine._start_websdr(site)
+        stale_generation = engine._websdr_generation
+        await engine._stop_websdr()
+
+        engine._on_page_dead(stale_generation, "stale")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert engine._websdr_active is False
+        assert len(engine._webview_host.created) == 1  # no spurious recreation
+
+    asyncio.run(run())

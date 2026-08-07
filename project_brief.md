@@ -630,6 +630,47 @@ If audio is heard with no sdrsync/python/Playwright-Chromium process
 running, it's not this app — check Windows' Volume Mixer for the real
 source (likely a separate, manually-opened browser tab to the WebSDR site).
 
+## Roadmap
+
+1. **Replace Playwright/Chromium with an embedded browser (v5) -- DONE,
+   merged to master.** Plan at
+   `C:\Users\ABEL75\.claude\plans\rippling-roaming-forest.md` (full
+   history: why pywebview was tried and rejected -- it unconditionally
+   requires the process main thread, conflicting with the GUI already
+   owning it -- the pivot to embedding `wx.html2.WebView` as a widget
+   inside a full wxPython rewrite instead, the Block A/B/C spikes, and
+   two independent review passes that each found and fixed real
+   load-bearing bugs before/after implementation). Final shape: Tkinter
+   replaced entirely by wxPython; `sdrsync/browser/backend.py` (WebView2
+   backend startup hardening), `sdrsync/websdr/browser_shim.py`
+   (`WxPageAdapter`, the Playwright-`Page`-API-compatible shim the three
+   WebSDR drivers use with only an import-line change),
+   `sdrsync/gui/webview_host.py` (the persistent offscreen host frame +
+   per-connection WebView child widget, mirroring Playwright's
+   Browser/Page lifetime split), and a full `sdrsync/gui/app.py` rewrite.
+   Verified via pytest (53 tests), a live engine-only script (mock rig +
+   real websdr.org attach + real frequency sync + clean shutdown), and
+   live multi-cycle manual testing through the actual app (multiple
+   WebSDR connect/switch/disconnect cycles across two KiwiSDR sites, rig
+   reconnects, ~8 minutes, clean exit). One real bug found via that
+   manual testing (a normal WebView close() was also firing the
+   "recreate me" signal meant only for unexpected death, racing the
+   engine's event loop closing on app shutdown) -- fixed. Linux/macOS
+   backends (WebKitGTK, Cocoa/WebKit) were NOT touched or verified --
+   this round only covered the Windows/WebView2 backend, since that's
+   the only OS available in this dev environment; treat cross-platform
+   as still open, not assumed working.
+2. **Add flrig as a second rig backend, alongside rigctld.** Requested by
+   the user, explicitly *after* the browser migration above, which is now
+   done -- this is next. Not scoped or researched yet. `rig/rigctld.py`'s
+   `RigctldClient` is the existing pattern to mirror (or generalize
+   behind a shared interface, TBD during scoping) for a new
+   `FlrigClient` -- flrig exposes its own XML-RPC control interface
+   (distinct wire protocol from hamlib's rigctld line protocol), so this
+   is a new client from scratch, not a config option on the existing
+   one. Needs its own research pass (like every WebSDR driver in this
+   project got) before planning, not assumed from memory.
+
 ## Next steps after restart
 
 1. `cd` into the project, confirm `pip install -r requirements.txt` deps
