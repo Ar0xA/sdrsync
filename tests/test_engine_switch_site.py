@@ -1,7 +1,10 @@
 """The rig and WebSDR subsystems have independent lifecycles: picking a
-different WebSDR must never touch the rigctld connection, and vice versa.
-Uses stub objects instead of a real browser/socket, same pattern as
-test_engine_mode_independence.py.
+different WebSDR must never touch the rigctld connection. The reverse is
+NOT symmetric (deliberately, since v9): stopping the rig also stops an
+active WebSDR session, since WebSDR has nothing driving its sync without
+a rig (it can't even be started without one -- see gui/app.py's Connect
+gating). Uses stub objects instead of a real browser/socket, same pattern
+as test_engine_mode_independence.py.
 
 StubWebViewHost stands in for gui/webview_host.py's WebViewHost --
 satisfies SyncEngine's WebViewHost Protocol (create_page/destroy_page)
@@ -156,7 +159,9 @@ def test_stop_websdr_does_not_touch_rig(monkeypatch):
     asyncio.run(run())
 
 
-def test_stop_rig_does_not_touch_websdr(monkeypatch):
+def test_stop_rig_also_stops_an_active_websdr_session(monkeypatch):
+    """v9: deliberate one-directional exception to the independent-
+    lifecycles principle -- see the module docstring above."""
     monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
     engine = make_engine()
     site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
@@ -173,10 +178,28 @@ def test_stop_rig_does_not_touch_websdr(monkeypatch):
         assert engine._rig_active is False
         assert engine._rig is None
         assert rig_stub.closed is True
-        # The whole point: stopping the rig never touches WebSDR.
-        assert engine._websdr_active is True
-        assert engine._driver is driver
-        assert driver.closed is False
+        assert engine._websdr_active is False
+        assert engine._driver is None
+        assert driver.closed is True
+
+    asyncio.run(run())
+
+
+def test_stop_rig_leaves_an_inactive_websdr_session_alone(monkeypatch):
+    """The cascade only fires when WebSDR is actually active -- confirms
+    _stop_rig() doesn't unconditionally call _stop_websdr() in a way that
+    would raise/misbehave when there's nothing to stop."""
+    engine = make_engine()
+
+    async def run():
+        engine._rig_active = True
+        rig_stub = StubRig()
+        engine._rig = rig_stub
+
+        await engine._stop_rig()  # must not raise
+
+        assert engine._rig_active is False
+        assert engine._websdr_active is False
 
     asyncio.run(run())
 

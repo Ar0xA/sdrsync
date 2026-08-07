@@ -1604,6 +1604,202 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
    as a valid empty list) -- see the implementation-review entry above
    for details.
 
+## Linux port feasibility spike (WSL, 2026-08-07) -- promising, not a go/no-go decision yet
+
+Per the user's question about macOS/Linux support, ran a Block-A-style
+spike against a real (if not bare-metal) Linux environment: WSL2's
+Debian 12 distro, using WSLg (Windows 11's built-in Wayland/XWayland +
+PulseAudio bridge to the host) for display and audio. System packages
+installed by the user (`sudo apt install python3-wxgtk4.0
+python3-wxgtk-webview4.0 libwebkit2gtk-4.1-0 pulseaudio-utils`) --
+Debian ships wxPython as a prebuilt system package (wx **4.2.0**, vs.
+4.3.1 on Windows), no source build needed.
+
+**Both of the original Windows spike's load-bearing go/no-go questions
+were re-tested against a real live WebSDR site (`websdr.ewi.utwente.nl:8901`)
+and both held on Linux too:**
+- **Autoplay gate is real and needs the same two-step unlock** already
+  implemented in `websdr_org.py`'s `_satisfy_audio_gate()` (a genuine
+  `wx.UIActionSimulator` corner click, then an explicit
+  `document.ct.resume()` if still `'suspended'`) -- confirmed `ct.state`
+  stayed `'suspended'` after the click alone, only reached `'running'`
+  after the resume() call, exactly mirroring the Windows finding.
+- **A hidden/off-screen window does not kill audio.** Verified with
+  *objective* evidence this time, not just the JS side's own
+  self-reported state: `pactl list sink-inputs` showed a real
+  PulseAudio stream (`media.role = "webaudio"`, `Corked: no`, owned by
+  the `WebKitWebProcess`) appear once unlocked, and it **stayed
+  `Corked: no`** (i.e. still actively playing) after moving the host
+  frame to `(-32000, -32000)` via `SetPosition()` -- the exact off-screen
+  trick `gui/webview_host.py` already uses on Windows.
+
+**Two real platform differences found, would need designing around
+before any actual porting:**
+- **No `wxEVT_WEBVIEW_CREATED` event exists on this GTK wx build**
+  (confirmed via `hasattr` on `wx.html2`, not just absent from a docs
+  page) -- `browser_shim.py`'s Windows readiness-gate (wait for this
+  event before trusting `CoreWebView2` exists) has no direct GTK
+  equivalent; would need an alternate readiness signal (e.g. trusting
+  `WebView.New()` is synchronously ready on GTK, or gating on the first
+  real `LOADED`).
+- **The WebView's own internal initial `about:blank` navigation fires
+  `LOADED` before the caller's real requested URL's own load completes**
+  -- confirmed live: called `LoadURL(real_url)` immediately after
+  creation, but the first `EVT_WEBVIEW_LOADED` received was for
+  `about:blank`, not the real URL. This is the same *class* of
+  first-navigation quirk the Windows implementation review already found
+  and fixed once (there it was a spurious `ERROR` with
+  `CONNECTION_ABORTED`; here it's a spurious `LOADED`) -- the existing
+  generation-counter + URL-cross-check fix in `browser_shim.py`'s
+  `_on_loaded` would need re-verifying (not assumed working) against
+  this GTK-specific manifestation before relying on it.
+
+**Also confirmed working, not just assumed:** `wx.html2.WebView.IsBackendAvailable(WebViewBackendWebKit)`
+returns `True`; `WebView.New(backend=WebViewBackendWebKit)` succeeds;
+`RunScriptAsync` + the raw `wxEVT_WEBVIEW_SCRIPT_RESULT` event (needs
+`wx.PyEventBinder(wx.html2.wxEVT_WEBVIEW_SCRIPT_RESULT)` since, unlike
+Windows, there's no `EVT_WEBVIEW_SCRIPT_RESULT` shortcut constant
+pre-bound in `wx.html2`'s namespace on this build) correctly round-trips
+a JS result string; `wx.UIActionSimulator` constructs and its
+`MouseMove`/`MouseClick` calls work under XWayland.
+
+**Caveat, stated plainly**: this was WSLg specifically -- a Wayland
+compositor bridging through to the Windows host, not a bare-metal Linux
+desktop (X11, or native Wayland on GNOME/KDE/Sway). The result is
+genuinely encouraging and not just guessed-at, but it doesn't
+automatically generalize to every Linux desktop environment,
+particularly around window positioning (Wayland proper is known to
+restrict a client's ability to move its own windows in ways X11
+doesn't -- WSLg's XWayland layer happens to permit the `SetPosition()`
+call used here, but a native Wayland compositor might not). Spike
+scripts (throwaway, not committed) live in this session's scratchpad:
+`wsl_spike_01_basic.py`, `wsl_spike_02_audio.py`.
+
+**Not yet done, explicitly out of scope for this spike**: window
+close/recreate cycling (the Windows spike's third sub-test), a real
+macOS spike (no macOS environment available in this session at all,
+unlike Linux via WSL), and any actual porting code -- per this project's
+established practice, a spike result isn't authorization to start
+implementing; that needs its own plan -> review -> implement -> review
+cycle, decided with the user when there's appetite for a real
+cross-platform round.
+
+## v9 punch list -- from live user testing (2026-08-07) -- DONE
+
+The user tested the freshly-built Windows exe (see "Packaged Windows
+release" below) and reported 8 real issues from actual use, not code
+reading. Each was re-traced against the actual current code before
+fixing (per this project's established practice), then implemented,
+independently reviewed (Opus pass), fixed, and re-verified.
+
+1. **App icon** -- generated a simple antenna/radio-wave `.ico`
+   (`sdrsync/icon.ico`, Pillow, 16-256px), wired via new
+   `sdrsync/resources.py` (`ICON_PATH`, `sys._MEIPASS`-aware for frozen
+   builds) into both `gui/app.py`'s `MainFrame` and
+   `gui/webview_host.py`'s `WebViewHost`. **Review caught a real
+   blocker**: the frozen-build path resolved to `_MEIPASS/icon.ico` but
+   `--add-data "sdrsync/icon.ico;sdrsync"` places it at
+   `_MEIPASS/sdrsync/icon.ico` -- fixed the path, and hardened both
+   `SetIcon()` call sites to check `ICON_PATH.exists()`/`icon.IsOk()`
+   before calling `SetIcon` (a missing/bad path doesn't raise, it can
+   pop a blocking wx modal error dialog with no log output -- confirmed
+   by reproducing the hang). Re-verified via a real PyInstaller rebuild:
+   `dist/SDRSync/_internal/sdrsync/icon.ico` exists at the expected path
+   and the running frozen exe's log shows no icon-related warning.
+2. **Rig disconnect now also stops an active WebSDR session** --
+   `SyncEngine._stop_rig()` gained an `if self._websdr_active: await
+   self._stop_websdr()` cascade, hit by every path that ends a rig
+   session (manual disconnect, the new 30s give-up timeout below, and
+   whole-session shutdown). Deliberate, one-directional exception to the
+   v3.6 "independent lifecycles" principle -- documented in the code as
+   intentional, not a regression of that principle (which was about not
+   killing rig when switching WebSDR sites).
+3/4. **New, always-available "Disconnect WebSDR" button** -- root cause
+   was that the old single Connect/Switch/Disconnect button's Disconnect
+   behavior only worked if the dropdown selection still matched the
+   active site; once it drifted, there was no way to disconnect (which
+   also explained #4 -- `headless_check` stays correctly disabled while
+   active, but the user couldn't ever get back to a disconnectable
+   state). Fixed with a genuinely separate button, decoupled from
+   dropdown state, enabled only while active.
+5. **flrig mode-mapping gaps + log-spam fix** -- `DATA-U`/`DATA-L` ->
+   USB/LSB and `CW-U`/`CW-L` -> plain CW added to all three drivers'
+   `_MODE_MAP` tables (`kiwisdr.py`, `websdr_org.py`, `openwebrx.py`).
+   Root cause of "whole program gets slow": `set_mode()`'s "no
+   equivalent" warning logged unconditionally on every failed retry (5x/
+   sec at default poll interval) -- now rate-limited (log once, then
+   downgrade repeats to debug), mirroring `openwebrx.py`'s existing
+   out-of-range-frequency precedent. **Caveat still stands**: the actual
+   "slow to respond" symptom can't be re-confirmed without real flrig
+   hardware, only that this is a real, now-bounded root cause.
+6. **Rig connect timeout** -- new `RIG_CONNECT_TIMEOUT_S = 30.0`;
+   `_tick()` now gives up and calls `_stop_rig(error=...)` with an
+   explanatory message if the deadline passes before first connect,
+   instead of retrying forever at "connecting...". Deadline clears on
+   first successful connect so a later transient reconnect doesn't
+   inherit a stale budget.
+7. **Rig-connected fields locked down** -- `port_entry` now disabled
+   alongside `mock_rig_check`/`host_entry`/`rig_backend_combo` while
+   connected. **`poll_interval_ctrl` deliberately NOT locked** (a
+   correction to the original punch-list item, caught by the
+   implementation review): unlike the other 4 fields, poll interval is
+   read live every tick by `_poll_loop`, so it's a genuinely safe,
+   already-working mid-session live-tunable knob -- locking it would
+   have been a real regression, not hardening.
+8. **Curated site list auto-fetches on first run** -- per the user's
+   explicit choice (over a bundled-snapshot alternative), `MainFrame.
+   __init__` now kicks off one background "Update from GitHub" fetch if
+   `settings.curated_sites` is empty, reusing `SiteManagerDialog.
+   _run_fetch`. Silent on failure (no error dialog -- this is an
+   unrequested convenience fetch, unlike the dialog's own button-
+   triggered fetches).
+
+**Implementation review (independent Opus pass)** found 2 more real
+issues beyond the icon-path blocker above, both fixed and re-verified:
+the new Disconnect button's label could flicker back to "Disconnecting..."
+after being re-enabled (a queued stale snapshot landing before the
+engine's stop actually completed) -- fixed by explicitly resetting the
+label in the active branch of `_update_websdr_controls`, same as the
+connect button already does. Full details of what was checked and
+cleared (the stop-cascade's every call site, the timeout deadline's
+reset lifecycle, the mode-map rate-limiting reset parity, the auto-fetch
+thread's timing against the dispatch table, the button-split's leftover
+references) are in this session's transcript, not reproduced here.
+
+`pytest` -- 135/135 passing after all fixes. GUI-heavy items (3/4/7/8)
+verified via standalone wx-API checks and manual click-through, per this
+project's established practice for GUI-wiring rounds with no headless-wx
+test harness.
+
+## Packaged Windows release
+
+**v1.0.0 Windows build -- DONE, published** (2026-08-07,
+`github.com/Ar0xA/sdrsync/releases/tag/v1.0.0`). PyInstaller `--onedir`
+build (`--collect-all wx` to pull in `WebView2Loader.dll` and the rest of
+wx's runtime DLLs, which aren't found by default module-graph analysis),
+zipped as `SDRSync-v1.0.0-win64.zip` (~37MB), attached as a GitHub
+Release asset -- no installer, extract and run `SDRSync.exe`. Verified
+for real, not just "it compiled": ran the frozen exe and confirmed via
+`sdrsync.log` that it actually starts (`SDRSync 1.0.0 starting`),
+detects the WebView2 backend, and starts the sync engine, before killing
+the test process. `build/`, `dist/`, `*.spec` added to `.gitignore` (were
+previously untracked but not excluded) since these are machine-generated
+packaging output, not source -- release zips are attached to GitHub
+Releases instead of committed.
+
+**Build command (as of v9's app-icon addition)** -- the icon flags are
+required, not optional, since `sdrsync/resources.py` expects
+`icon.ico` at `_MEIPASS/sdrsync/icon.ico` in a frozen build:
+```
+pyinstaller --onedir --name SDRSync --collect-all wx \
+  --icon sdrsync/icon.ico --add-data "sdrsync/icon.ico;sdrsync" \
+  --windowed sdrsync/main.py
+```
+`--icon` embeds the exe's own shell-visible resource icon (taskbar/
+Explorer); `--add-data` separately bundles the raw file so `wx.Icon()`
+can load it at runtime via `resources.ICON_PATH` -- confirmed during v9
+that `--icon` alone does not also satisfy the second need.
+
 ## Next steps after restart
 
 1. `cd` into the project, confirm `pip install -r requirements.txt` deps

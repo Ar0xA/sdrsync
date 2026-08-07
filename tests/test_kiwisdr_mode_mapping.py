@@ -50,3 +50,17 @@ def test_no_passband_defaults_to_wide():
 
 def test_unknown_mode_returns_none():
     assert map_hamlib_mode_kiwi("DSTAR", 2700) is None
+
+
+def test_data_modes_map_to_their_sideband():
+    assert map_hamlib_mode_kiwi("DATA-U", 2700) == "usb"
+    assert map_hamlib_mode_kiwi("DATA-U", 1800) == "usn"
+    assert map_hamlib_mode_kiwi("DATA-L", 2700) == "lsb"
+    assert map_hamlib_mode_kiwi("DATA-L", 1800) == "lsn"
+
+
+def test_cw_u_and_cw_l_map_to_plain_cw():
+    assert map_hamlib_mode_kiwi("CW-U", 500) == "cwn"
+    assert map_hamlib_mode_kiwi("CW-L", 500) == "cwn"
+    assert map_hamlib_mode_kiwi("CW-U", 2700) == "cw"
+    assert map_hamlib_mode_kiwi("CW-L", 2700) == "cw"

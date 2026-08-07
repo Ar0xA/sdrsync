@@ -48,6 +48,7 @@ from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
 from sdrsync.gui.webview_host import WebViewHost
 from sdrsync.logging_setup import LOG_FILE
+from sdrsync.resources import ICON_PATH
 from sdrsync.preflight import (
     DetectResult,
     RigPreflightResult,
@@ -57,6 +58,7 @@ from sdrsync.preflight import (
     check_websdr_url,
     detect_websdr_type,
 )
+from sdrsync.sitesource import CURATED_LIST_URL, SiteListFetchResult
 from sdrsync.sync.engine import StatusSnapshot, SyncEngine
 
 logger = logging.getLogger("sdrsync.gui")
@@ -98,6 +100,17 @@ class _Tooltip:
 class MainFrame(wx.Frame):
     def __init__(self, settings: AppSettings, webview_host: WebViewHost) -> None:
         super().__init__(None, title="SDRSync - rigctld -> WebSDR")
+        if ICON_PATH.exists():
+            try:
+                icon = wx.Icon(str(ICON_PATH), wx.BITMAP_TYPE_ICO)
+                if icon.IsOk():
+                    self.SetIcon(icon)
+                else:
+                    logger.warning("App icon at %s failed to load (not IsOk())", ICON_PATH)
+            except Exception as e:
+                logger.warning("Could not load app icon from %s (%s)", ICON_PATH, e)
+        else:
+            logger.warning("App icon not found at %s", ICON_PATH)
         self.settings = settings
         self._webview_host = webview_host
 
@@ -159,12 +172,14 @@ class MainFrame(wx.Frame):
             RigPreflightResult: self._apply_rig_preflight,
             WebsdrPreflightResult: self._apply_websdr_preflight,
             DetectResult: self._apply_detect_result,
+            SiteListFetchResult: self._apply_curated_autofetch_result,
         }
 
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
         self._build_widgets()
         self._restore_custom_site_if_needed()
+        self._maybe_auto_update_curated_sites()
 
         # One engine, one background thread, for the whole app session --
         # NOT recreated per Connect click. The rig/WebSDR subsystems it
@@ -237,6 +252,11 @@ class MainFrame(wx.Frame):
         manage_sites_btn = wx.Button(parent, label="Manage sites...")
         manage_sites_btn.Bind(wx.EVT_BUTTON, self._on_manage_sites_clicked)
         grid.Add(manage_sites_btn, pos=(row, 0), flag=wx.ALIGN_LEFT)
+
+        self.websdr_disconnect_btn = wx.Button(parent, label="Disconnect WebSDR")
+        self.websdr_disconnect_btn.Bind(wx.EVT_BUTTON, self._on_websdr_disconnect_clicked)
+        _Tooltip(self.websdr_disconnect_btn, self._websdr_disconnect_tooltip_text)
+        grid.Add(self.websdr_disconnect_btn, pos=(row, 1), flag=wx.ALIGN_LEFT)
         row += 1
 
         grid.Add(wx.StaticText(parent, label="Custom URL:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -459,22 +479,41 @@ class MainFrame(wx.Frame):
             # cover") -- require the rig connected first.
             self.websdr_connect_btn.SetLabel("Connect")
             self.websdr_connect_btn.Enable(self._rig_active)
+            self.websdr_disconnect_btn.SetLabel("Disconnect WebSDR")
+            self.websdr_disconnect_btn.Enable(False)
             self.headless_check.Enable(True)
             self.cw_offset_ctrl.Enable(True)
             return
 
         self.headless_check.Enable(False)
         self.cw_offset_ctrl.Enable(False)
+        self.websdr_disconnect_btn.SetLabel("Disconnect WebSDR")
+        self.websdr_disconnect_btn.Enable(True)
         selected = self._resolve_selected_site()
         active = self._active_websdr_site
-        if (
+        same_as_active = (
             selected is not None and active is not None
             and selected.url == active.url and selected.driver_type == active.driver_type
-        ):
-            self.websdr_connect_btn.SetLabel("Disconnect")
-        else:
-            self.websdr_connect_btn.SetLabel("Switch WebSDR")
-        self.websdr_connect_btn.Enable(True)
+        )
+        # Disconnecting is exclusively websdr_disconnect_btn's job now (see
+        # its own always-available handler below) -- this button only ever
+        # means "connect to whatever's selected," so it's disabled rather
+        # than relabeled to "Disconnect" when the selection already matches
+        # what's active, since there'd be nothing to switch to.
+        self.websdr_connect_btn.SetLabel("Switch WebSDR")
+        self.websdr_connect_btn.Enable(not same_as_active)
+
+    def _websdr_disconnect_tooltip_text(self) -> Optional[str]:
+        if not self.websdr_disconnect_btn.IsEnabled():
+            return "No active WebSDR session to disconnect"
+        return None
+
+    def _on_websdr_disconnect_clicked(self, _event=None) -> None:
+        if not self._websdr_active:
+            return  # belt-and-suspenders -- button is disabled in this state too
+        self.websdr_disconnect_btn.Enable(False)
+        self.websdr_disconnect_btn.SetLabel("Disconnecting...")
+        self.engine.stop_websdr_from_other_thread()
 
     def _websdr_connect_tooltip_text(self) -> Optional[str]:
         # The only reason Connect is ever disabled (as opposed to clickable
@@ -598,6 +637,38 @@ class MainFrame(wx.Frame):
         self._refresh_site_dropdown_values()
         self._update_websdr_controls()
 
+    def _maybe_auto_update_curated_sites(self) -> None:
+        # Fresh installs (or a curated bucket the user emptied entirely via
+        # "Remove selected") otherwise stay at just the 3 built-in
+        # KNOWN_SITES until someone opens "Manage sites..." and clicks
+        # Update -- do that once automatically instead, reusing the exact
+        # same background-fetch machinery the dialog's own button uses
+        # (SiteManagerDialog._run_fetch is a plain staticmethod with no
+        # `self` dependency). Silent-if-offline: this is a background
+        # convenience fetch the user didn't explicitly ask for, unlike the
+        # dialog's own button click, which does show its failure message.
+        if self.settings.curated_sites:
+            return
+        thread = threading.Thread(
+            target=SiteManagerDialog._run_fetch,
+            args=("curated", CURATED_LIST_URL, KNOWN_SITES + self._user_sites, self.status_queue),
+            daemon=True,
+        )
+        thread.start()
+
+    def _apply_curated_autofetch_result(self, result: SiteListFetchResult) -> None:
+        if result.sites is None:
+            logger.info("Background curated-site auto-fetch did not complete: %s", result.message)
+            return
+        self.settings.curated_sites = result.sites
+        self.settings.save()
+        self._curated_sites = [
+            WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
+            for d in self.settings.curated_sites
+        ]
+        self._refresh_site_dropdown_values()
+        logger.info("Background curated-site auto-fetch populated %d site(s)", len(result.sites))
+
     def _restore_custom_site_if_needed(self) -> None:
         if self._find_any_site_by_url(self.settings.last_site_url) is not None:
             return
@@ -708,9 +779,10 @@ class MainFrame(wx.Frame):
             return
 
         if self._websdr_active and active is not None and site.url == active.url and site.driver_type == active.driver_type:
-            self.websdr_connect_btn.Enable(False)
-            self.websdr_connect_btn.SetLabel("Disconnecting...")
-            self.engine.stop_websdr_from_other_thread()
+            # Nothing to switch to -- the button is disabled in this state
+            # (see _update_websdr_controls()); disconnecting is
+            # websdr_disconnect_btn's job now. Guard the handler too in
+            # case of a race between a click and a state-changing snapshot.
             return
 
         # Connect (not active) or Switch (active, different site) -- same
@@ -900,6 +972,7 @@ class MainFrame(wx.Frame):
         self.rig_connect_btn.SetLabel("Connecting...")
         self.mock_rig_check.Enable(False)
         self.host_entry.Enable(False)
+        self.port_entry.Enable(False)
         self.rig_backend_combo.Enable(False)
         self.engine.start_rig_from_other_thread(backend, host, port, use_mock)
 
@@ -959,8 +1032,10 @@ class MainFrame(wx.Frame):
             self.rig_connect_btn.Enable(True)
             self.rig_connect_btn.SetLabel("Connect")
             self.host_entry.Enable(not self.mock_rig_check.GetValue())
+            self.port_entry.Enable(True)
             self.mock_rig_check.Enable(True)
             self.rig_backend_combo.Enable(True)
+            self.poll_interval_ctrl.Enable(True)
         _set_wrapped(self.rig_err_text, snap.rig_error or "")
         self._update_mock_rig_panel_visibility()
 

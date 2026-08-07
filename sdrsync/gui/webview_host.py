@@ -21,6 +21,7 @@ from typing import Callable, Optional
 import wx
 import wx.html2
 
+from sdrsync.resources import ICON_PATH
 from sdrsync.websdr.browser_shim import WxPageAdapter
 
 logger = logging.getLogger("sdrsync.gui.webview_host")
@@ -56,6 +57,17 @@ class WebViewHost:
             None, title="SDRSync WebSDR",
             style=wx.DEFAULT_FRAME_STYLE | wx.FRAME_NO_TASKBAR,
         )
+        if ICON_PATH.exists():
+            try:
+                icon = wx.Icon(str(ICON_PATH), wx.BITMAP_TYPE_ICO)
+                if icon.IsOk():
+                    self.frame.SetIcon(icon)
+                else:
+                    logger.warning("App icon at %s failed to load (not IsOk())", ICON_PATH)
+            except Exception as e:
+                logger.warning("Could not load app icon from %s (%s)", ICON_PATH, e)
+        else:
+            logger.warning("App icon not found at %s", ICON_PATH)
         self.frame.SetSize(VISIBLE_SIZE)
         self._headless = headless
         self.frame.SetPosition(self._rest_pos())

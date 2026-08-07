@@ -63,10 +63,14 @@ FREQ_VERIFY_TOLERANCE_HZ = 10
 _MODE_MAP: dict[str, str] = {
     "USB": "usb",
     "PKTUSB": "usb",
+    "DATA-U": "usb",
     "LSB": "lsb",
     "PKTLSB": "lsb",
+    "DATA-L": "lsb",
     "CW": "cw",
     "CWR": "cw",
+    "CW-U": "cw",
+    "CW-L": "cw",
     "AM": "am",
     "FM": "nfm",
     "WFM": "wfm",
@@ -147,6 +151,11 @@ class OpenWebRXDriver:
         self._center_freq: Optional[int] = None
         self._bandwidth: Optional[int] = None
         self._last_out_of_range_key: Optional[tuple[int, int, int]] = None
+        # Tracks the last hamlib mode that had no OpenWebRX equivalent, so
+        # the "no equivalent" warning logs once per new occurrence instead
+        # of every poll tick the engine retries set_mode() -- same
+        # rate-limiting pattern as _last_out_of_range_key above.
+        self._last_unmapped_mode: Optional[str] = None
 
     @property
     def attached(self) -> bool:
@@ -191,6 +200,7 @@ class OpenWebRXDriver:
         self._last_page_error = None
         self._last_tune_error = None
         self._last_mode_error = None
+        self._last_unmapped_mode = None
 
     # ------------------------------------------------------------------
     async def tune_hz(self, freq_hz: int) -> bool:
@@ -302,7 +312,11 @@ class OpenWebRXDriver:
             self._last_mode_error = (
                 f"hamlib mode {hamlib_mode!r} has no OpenWebRX equivalent; frequency sync continues"
             )
-            logger.warning(self._last_mode_error)
+            if hamlib_mode != self._last_unmapped_mode:
+                self._last_unmapped_mode = hamlib_mode
+                logger.warning(self._last_mode_error)
+            else:
+                logger.debug(self._last_mode_error)
             return False
 
         try:
@@ -335,6 +349,7 @@ class OpenWebRXDriver:
 
         self._current_mode = mode
         self._last_mode_error = None
+        self._last_unmapped_mode = None
         return True
 
     async def _read_mode(self) -> Optional[str]:

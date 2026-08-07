@@ -51,10 +51,14 @@ _NUMERIC_RE = re.compile(r"[-+]?\d*\.\d+|\d+")
 _MODE_MAP: dict[str, tuple[str, bool]] = {
     "USB": ("USB", True),
     "PKTUSB": ("USB", True),
+    "DATA-U": ("USB", True),
     "LSB": ("LSB", True),
     "PKTLSB": ("LSB", True),
+    "DATA-L": ("LSB", True),
     "CW": ("CW", False),
     "CWR": ("CW", False),
+    "CW-U": ("CW", False),
+    "CW-L": ("CW", False),
     "AM": ("AM", True),
     "SAM": ("AMSYNC", False),
     "FM": ("FM", False),
@@ -111,6 +115,11 @@ class WebsdrOrgDriver:
         self._last_page_error: Optional[str] = None
         self._last_attach_error: Optional[str] = None
         self._verify_task: Optional[asyncio.Task] = None
+        # Tracks the last hamlib mode that had no WebSDR equivalent, so the
+        # "no equivalent" warning logs once per new occurrence instead of
+        # every poll tick the engine retries set_mode() (rate-limiting,
+        # same pattern as openwebrx.py's _last_out_of_range_key).
+        self._last_unmapped_mode: Optional[str] = None
 
     @property
     def attached(self) -> bool:
@@ -170,6 +179,7 @@ class WebsdrOrgDriver:
         self._last_page_error = None
         self._last_tune_error = None
         self._last_mode_error = None
+        self._last_unmapped_mode = None
 
     async def _load_band_table(self) -> None:
         try:
@@ -312,7 +322,11 @@ class WebsdrOrgDriver:
             self._last_mode_error = (
                 f"hamlib mode {hamlib_mode!r} has no WebSDR equivalent; frequency sync continues"
             )
-            logger.warning(self._last_mode_error)
+            if hamlib_mode != self._last_unmapped_mode:
+                self._last_unmapped_mode = hamlib_mode
+                logger.warning(self._last_mode_error)
+            else:
+                logger.debug(self._last_mode_error)
             return False
 
         try:
@@ -320,6 +334,7 @@ class WebsdrOrgDriver:
             # base mode without the "N" (narrow) suffix, used e.g. to detect CW for cw_offset_hz
             self._current_mode = web_mode[:-1] if web_mode.endswith("N") else web_mode
             self._last_mode_error = None
+            self._last_unmapped_mode = None
             return True
         except PlaywrightError as e:
             self._last_mode_error = f"set_mode() failed: {e}"
