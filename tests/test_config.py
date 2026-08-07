@@ -161,3 +161,65 @@ def test_save_then_load_round_trips_flrig_settings(monkeypatch, tmp_path):
     assert reloaded.rig_backend == "flrig"
     assert reloaded.flrig_host == "192.168.1.50"
     assert reloaded.flrig_port == 12346
+
+
+def test_load_defaults_imported_and_curated_sites_to_empty_list(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    settings = AppSettings.load()
+    assert settings.imported_sites == []
+    assert settings.curated_sites == []
+
+
+def test_load_skips_malformed_imported_sites_entries(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "imported_sites": [
+            {"name": "Good", "url": "http://good.example/", "driver_type": "kiwisdr"},
+            {"name": "Missing URL", "driver_type": "kiwisdr"},
+            "not even a dict",
+            {"name": "", "url": "http://empty-name.example/", "driver_type": "kiwisdr"},
+            None,
+        ]
+    }), encoding="utf-8")
+
+    settings = AppSettings.load()
+
+    assert settings.imported_sites == [{"name": "Good", "url": "http://good.example/", "driver_type": "kiwisdr"}]
+
+
+def test_load_skips_malformed_curated_sites_entries(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "curated_sites": [
+            {"name": "Good", "url": "http://good.example/", "driver_type": "websdr_org"},
+            {"name": "Bad", "url": "", "driver_type": "websdr_org"},
+        ]
+    }), encoding="utf-8")
+
+    settings = AppSettings.load()
+
+    assert settings.curated_sites == [{"name": "Good", "url": "http://good.example/", "driver_type": "websdr_org"}]
+
+
+def test_load_ignores_invalid_imported_and_curated_sites_type(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"imported_sites": "not a list", "curated_sites": 5}), encoding="utf-8")
+
+    settings = AppSettings.load()
+
+    assert settings.imported_sites == []
+    assert settings.curated_sites == []
+
+
+def test_save_then_load_round_trips_imported_and_curated_sites(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    original = AppSettings(
+        imported_sites=[{"name": "I", "url": "http://i.example/", "driver_type": "kiwisdr"}],
+        curated_sites=[{"name": "C", "url": "http://c.example/", "driver_type": "openwebrx"}],
+    )
+
+    original.save()
+    reloaded = AppSettings.load()
+
+    assert reloaded.imported_sites == [{"name": "I", "url": "http://i.example/", "driver_type": "kiwisdr"}]
+    assert reloaded.curated_sites == [{"name": "C", "url": "http://c.example/", "driver_type": "openwebrx"}]

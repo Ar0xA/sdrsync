@@ -1195,6 +1195,392 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
    GUI session, not just standalone scripts) is still worth doing before
    calling this "as trustworthy as rigctld," time permitting.
 
+4. **v8: site-list import/curated-update, Save-to-list hardening,
+   CW-offset/mute-on-TX GUI, log rotation -- PLANNED, implementation
+   starting.** Full plan at
+   `C:\Users\ABEL75\.claude\plans\rippling-roaming-forest.md`'s "v8 --
+   site-list import/curated-update, Save-to-list hardening, CW
+   offset/mute-on-TX GUI, log rotation" section (approved 2026-08-07).
+   4 items, scoped via `AskUserQuestion` from a follow-up to the earlier
+   1.0-readiness brainstorm plus two new asks. OpenWebRX's multi-profile
+   gap was raised again and explicitly deferred (still no multi-profile
+   instance to test against). Key decisions confirmed with the user:
+   `imported_sites` (file+URL loads, shared bucket) and `curated_sites`
+   (GitHub auto-update) are separate `AppSettings` list fields, both
+   replace-all semantics; curated list lives at
+   `sites/websdr_sites.json` on `master` in this repo (to be added as
+   part of this work); site-management GUI is a separate "Manage
+   sites..." dialog, not inline buttons; `cw_offset_hz`'s new GUI
+   control is disabled while a WebSDR session is active (mirrors the
+   existing `headless_check` pattern), since it's only read at driver-
+   construction time.
+   - Item 1: site list from file/URL + curated-GitHub update
+     (`config.py` new fields + stricter external-data validation, new
+     `sitesource.py`, new `gui/site_manager_dialog.py`).
+   - Item 2: "Save to list" stays-disabled hardening -- re-traced the
+     full code path and found no bug in the straightforward flow (the
+     "not re-invoked" theory in the original report is contradicted by
+     the code); found one real, narrow inconsistency (the whole-engine-
+     crash branch doesn't update the `_websdr_conn_text` mirror). Being
+     shipped explicitly as hardening against a *suspected* fragility
+     class (a stringly-typed gate with 3 writers, one with a gap), not a
+     confirmed fix for an unreproduced bug -- said plainly, not
+     oversold.
+   - Item 3: `cw_offset_hz`/`mute_on_tx` GUI controls (both fields
+     already exist in `AppSettings`, pure GUI wiring).
+   - Item 4: log rotation (`RotatingFileHandler`, 5MB x 3 backups) +
+     "Open log folder" button (`os.startfile`, Windows-only, matches
+     current app scope).
+
+   **Progress (resume point if this session ends -- update after each
+   block, per established practice from v6/v7):**
+   - [x] Research + plan drafted + user decisions confirmed (4
+     `AskUserQuestion` rounds total across scoping and design) + plan
+     approved.
+   - [x] **Independent plan review (Opus pass) -- DONE.** No true
+     architectural blocker but 3 real bugs found in the *design*, all
+     confirmed against the actual code before accepting them and fixed
+     in the plan: (1) the originally-planned `config.py` -> `websdr.
+     registry` import for stricter external-site validation would have
+     dragged the entire wx/WebView2 driver stack into what's today a
+     dependency-free leaf module (confirmed via the real import chain:
+     `registry.py` -> driver modules -> `browser_shim.py` -> `import
+     wx`) -- moved that stricter validation into `sitesource.py`
+     instead, where it belongs (the actual trust boundary is at fetch
+     time, not every `AppSettings.load()`); (2) the plan's "one combined
+     site-list accessor used everywhere" would have reintroduced a new
+     "Save to list stays disabled" cause in the very round meant to
+     harden against that, plus a silent restart-persistence bug --
+     confirmed both by reading the exact call sites
+     (`_site_already_saved`, `_on_websdr_connect_clicked`'s
+     `last_site_driver_type` persistence) -- fixed by splitting into two
+     accessors, one scoped exactly as today for those two, a new wider
+     one only for dropdown display/name-lookup; (3) item 2's own fix as
+     originally planned would have moved the "Save to list" staleness
+     gap rather than closed it, since the fatal-error branch in
+     `_apply_snapshot` returns early without touching any WebSDR state
+     at all (confirmed by reading the branch) -- fixed by setting the
+     new `_websdr_connected` boolean in every branch, including that
+     one. Also found and fixed: a `logging.basicConfig()` no-op
+     footgun that would have made the planned rotation test flaky
+     (confirmed live: `basicConfig` silently does nothing once the root
+     logger already has handlers, which pytest's own logging plugin can
+     pre-attach) -- fixed with `force=True`; a `mute_on_tx`/`headless_check`
+     precedent citation mix-up (corrected to cite
+     `_on_poll_interval_changed`, the actual immediate-write precedent);
+     an accepted-not-fixed note about `mute_on_tx` only being checked on
+     PTT edges; name/URL collision handling added to the site-list
+     validator (none existed in the original plan); and a "Manage
+     sites..." button placement fix (the site row has no free grid
+     columns left). Full findings and fixes recorded in the plan file's
+     "Plan review" annotations throughout the v8 section.
+   - [x] **Item 4, log rotation + open log folder button -- DONE.**
+     `logging_setup.py`: swapped the plain `FileHandler` for
+     `logging.handlers.RotatingFileHandler` (`LOG_MAX_BYTES = 5_000_000`,
+     `LOG_BACKUP_COUNT = 3`), with `force=True` on `basicConfig()` per the
+     plan review's fix (confirmed live this is load-bearing, not
+     speculative -- without it, a pre-attached root handler, e.g. from
+     pytest's own logging plugin, made `basicConfig()` silently install
+     zero handlers). `gui/app.py`: new "Open log folder" button in
+     `_build_widgets` (below the mock-rig panel, above `panel.SetSizer`),
+     `_on_open_log_folder_clicked()` wraps `os.startfile(LOG_FILE.parent)`
+     in try/except `OSError` with a `wx.MessageBox` on failure; new
+     `import os` and `from sdrsync.logging_setup import LOG_FILE` imports.
+     New `tests/test_logging_setup.py` (2 tests: installs a
+     `RotatingFileHandler` with the expected `maxBytes`/`backupCount`, and
+     `force=True` makes repeated `setup_logging()` calls idempotent rather
+     than accumulating/leaking handlers) -- both manually confirmed
+     non-tautological by reproducing the no-`force=True` failure mode
+     live before accepting the fix. Full suite: 103/103 passing (was 101;
+     +2). Live-verified: full `MainFrame` construction succeeds and
+     `_on_open_log_folder_clicked()` runs without raising against the real
+     wx API (standalone script, not committed).
+   - [x] **Item 3, `cw_offset_hz`/`mute_on_tx` GUI controls -- DONE.**
+     `gui/app.py`'s `_build_websdr_panel`: new row (after the existing
+     headless-check row) with a `wx.SpinCtrl` for `cw_offset_hz`
+     (`min=-2000, max=2000`, a `_Tooltip` explaining "Disconnect and
+     reconnect to apply a new CW offset") and a `wx.CheckBox` for
+     `mute_on_tx` ("Mute WebSDR on TX", a `_Tooltip` documenting the
+     accepted PTT-edge-only limitation). `cw_offset_ctrl` is
+     enabled/disabled in lockstep with `headless_check` in
+     `_update_websdr_controls` (enabled when `_websdr_active` is False,
+     disabled while active -- it's only read once at driver construction,
+     `sync/engine.py`'s `_start_websdr`), and its value is written into
+     `self.settings.cw_offset_hz` at the same point `headless` is
+     (`_on_websdr_connect_clicked`, right before `settings.save()`).
+     `mute_on_tx_check` uses the immediate-write-and-save pattern (new
+     `_on_mute_on_tx_changed` handler, mirroring `_on_poll_interval_changed`
+     per the plan review's precedent correction), since the engine reads
+     `settings.mute_on_tx` live every PTT edge -- no reconnect needed, no
+     enable/disable gating. Both fields already existed in `AppSettings`
+     with `_SCALAR_TYPES` entries, so no `config.py` changes were needed.
+     No new automated test (pure GUI wiring, no headless-wx harness in
+     this project, consistent with items 1/5 from v6 and the backend
+     dropdown from v7) -- verified live via a standalone script against
+     the real wx API (not committed): initial values populate correctly
+     from settings, `cw_offset_ctrl` toggles enabled/disabled correctly
+     across `_websdr_active` True/False, and `_on_mute_on_tx_changed`
+     writes through to `self.settings.mute_on_tx` correctly. Full suite:
+     103/103 passing throughout (no new tests needed).
+   - [x] **Item 2, Save-to-list gating hardening -- DONE.** New
+     `self._websdr_connected: bool` field (init `False` in `__init__`,
+     next to `_websdr_conn_text`), set in every branch of
+     `_apply_snapshot`: `False` in the fatal-error branch (which now also
+     sets `_websdr_active = False`/`_active_websdr_site = None`, calls
+     `_update_websdr_controls()`, then explicitly re-`Enable(False)`s both
+     connect buttons afterward -- needed because `_update_websdr_controls`
+     would otherwise re-enable `websdr_connect_btn` off a stale
+     `_rig_active` flag that this branch doesn't touch); `False` in the
+     not-active branch; `bool(ws and ws.connected)` set **unconditionally**
+     in the active branch (moved above the `if ws is not None:` check per
+     the plan review's fix -- `ws` can be `None` while `websdr_active` is
+     `True`). `can_save`'s gate now checks `self._websdr_connected`
+     instead of `self._websdr_conn_text == "connected"`; `_websdr_conn_text`
+     stays as display-text-only. Shipped as hardening against a suspected
+     fragility class, not a confirmed fix for the unreproduced original
+     report -- said plainly, not oversold. No new automated test (no
+     headless-wx harness in this project); verified live via a standalone
+     script (not committed) simulating both an active+connected snapshot
+     (`_websdr_connected` -> `True`) and a fatal-error snapshot with a
+     stale `_rig_active = True` (`_websdr_connected` -> `False`,
+     `websdr_connect_btn`/`rig_connect_btn`/`save_site_btn` all correctly
+     stay disabled, confirming the button-re-enable edge case the review
+     flagged is actually closed). Full suite: 103/103 passing (no new
+     tests needed, pure GUI-gating logic).
+   - [x] **Item 1a, `config.py` `curated_sites`/`imported_sites` + shared
+     validation -- DONE.** New `AppSettings` fields `imported_sites: list`
+     and `curated_sites: list` (both `field(default_factory=list)`, same
+     dict shape as `user_sites`). Refactored `_validate_user_site`/
+     `_validate_user_sites` into `_validate_site_entry`/
+     `_validate_site_list(filtered, key)` (the latter takes a field-name
+     key instead of being hardcoded to `user_sites`), called three times
+     in `load()` -- once per bucket, all at the same lenient shape-only
+     tier per the plan review's fix (no `registry.DRIVERS` import here;
+     the stricter driver-type-registered + collision check happens once,
+     at fetch time, in the not-yet-written `sitesource.py`). No
+     `_SCALAR_TYPES` entries needed (both are lists). New tests in
+     `tests/test_config.py` (6, mirroring the existing `user_sites`
+     coverage): defaults to `[]`, malformed entries skipped for each
+     bucket independently, wrong-type value falls back for both at once,
+     and a save-then-load round trip of both buckets together. Full
+     suite: 108/108 passing (was 103; +5 -- one test covers both buckets'
+     wrong-type case in one assertion pair).
+   - [x] **Item 1b, `sitesource.py` fetch/load + `sites/websdr_sites.json`
+     starter file -- DONE.** New `sdrsync/sitesource.py`:
+     `validate_site_list(raw, existing_sites)` (strict tier -- rejects
+     unregistered `driver_type`s via `sdrsync.websdr.registry.DRIVERS`,
+     and name/URL collisions against `existing_sites` or an earlier entry
+     in the same batch, per the plan review's fix), `load_site_list_from_file`
+     (sync, GUI-thread-safe -- small local file), `fetch_site_list` (async,
+     `run_in_executor`-wrapped, matching `preflight.py`'s shape --
+     dispatched via `asyncio.run(...)` on a background thread the same way
+     `_on_detect_clicked` already does). Its own `_fetch_body_sync` helper,
+     deliberately not reusing `preflight._http_get_body_sync`: catches
+     `urllib.error.HTTPError` separately (distinguishes "offline" from a
+     real HTTP status) and caps the response at `MAX_RESPONSE_BYTES`
+     (1MB) since the URL is user-supplied. New `SiteListFetchResult`
+     (`GuiMessage` subclass: `bucket`, `sites`, `message`) -- not yet
+     wired into `MainFrame._dispatch` (that's Block G's job). New
+     `sites/websdr_sites.json`: shipped as a documented-empty `[]`, not a
+     mirror of `KNOWN_SITES`' 3 entries as originally sketched --
+     discovered during implementation that mirroring them would make the
+     new collision-rejection logic reject every entry on first fetch
+     (they'd collide with `KNOWN_SITES` itself), which is self-defeating;
+     empty-but-valid was the plan's explicitly allowed fallback option.
+     New `tests/test_sitesource.py` (13 tests): valid entries accepted;
+     unregistered `driver_type` rejected; malformed shapes rejected;
+     name collision, URL collision, and same-batch collision each
+     rejected; non-list top-level handled; file-load success/missing/
+     malformed-JSON/no-valid-entries; fetch rejects non-JSON body and
+     propagates a fetch failure message (both via a monkeypatched
+     `run_in_executor`, no real network needed for these). Full suite:
+     121/121 passing (was 108; +13). **Live-verified**: loading the
+     actual (empty) `sites/websdr_sites.json` correctly reports "No valid
+     sites found"; a real fetch against the not-yet-pushed
+     `CURATED_LIST_URL` correctly returns a distinct `HTTP 404` message
+     (proving the HTTPError-status-code distinction works over a real
+     network call) -- **the full end-to-end curated-fetch check (a real
+     200 + real parsed sites) still needs `sites/websdr_sites.json`
+     actually pushed to `github.com/Ar0xA/sdrsync` on `master`**,
+     deferred to whenever the user next approves a push, per this
+     project's established pattern of not pushing without being asked.
+   - [x] **Item 1c, `SiteManagerDialog` + GUI wiring -- DONE.** New
+     `sdrsync/gui/site_manager_dialog.py` (`SiteManagerDialog(wx.Dialog)`,
+     genuinely new pattern for this codebase): "Load from file..."
+     (`wx.FileDialog`), "Load from URL..." (`wx.TextEntryDialog`),
+     "Update from GitHub" (fixed `CURATED_LIST_URL`), a `wx.ListBox`
+     showing both buckets' entries with a "Remove selected" button. Talks
+     directly to `AppSettings` (reads/writes `settings.imported_sites`/
+     `settings.curated_sites`, `save()`s immediately) rather than
+     duplicating `MainFrame`'s in-memory bookkeeping -- runs its own
+     background fetch thread + its own `queue.Queue`/`wx.Timer`
+     (mirroring `MainFrame`'s status-queue pattern but fully
+     self-contained, not routed through `MainFrame._dispatch`). Shown via
+     `ShowModal()`; confirmed the underlying event loop (and thus
+     `MainFrame`'s own status-queue timer) keeps running while a modal
+     dialog is open, so this doesn't stall the engine's status updates.
+     `gui/app.py`: new "Manage sites..." button on its own grid row
+     (after the site-selection row, per the plan review's placement fix
+     -- that row has no free columns); `_on_manage_sites_clicked` opens
+     the dialog with `existing_sites = KNOWN_SITES + self._user_sites`
+     (matching `_find_any_site_by_url`'s scope, not the wider set), then
+     rebuilds `self._imported_sites`/`self._curated_sites` from settings
+     and refreshes the dropdown once it closes. New
+     `self._all_selectable_sites()` accessor (`KNOWN_SITES + user_sites +
+     curated_sites + imported_sites`) used ONLY by `_refresh_site_dropdown_values`
+     and `_resolve_selected_site`'s name-lookup branch, per the plan
+     review's two-accessor fix -- `_find_any_site_by_url`/
+     `_site_already_saved`/the `last_site_driver_type` persistence check
+     in `_on_websdr_connect_clicked` are UNCHANGED, still scoped to
+     `KNOWN_SITES + self._user_sites` only (a docstring on
+     `_find_any_site_by_url` now explains why, so this doesn't get
+     "fixed" back to the wider set later). `_refresh_site_dropdown_values`
+     now falls back to `KNOWN_SITES[0].name` when the previous selection
+     no longer exists after a replace-all (was previously left unset).
+     `MainFrame.__init__` builds `self._imported_sites`/
+     `self._curated_sites` from settings the same way `self._user_sites`
+     already is. No new automated test (wx-dialog-level GUI logic, no
+     headless-wx harness in this project, consistent with every other wx
+     block) -- **live-verified** via standalone scripts (not committed):
+     the dropdown correctly includes imported/curated site names;
+     `_find_any_site_by_url` correctly excludes them (the exact
+     regression the plan review flagged); a simulated replace-all via
+     `_apply_bucket_result` correctly updates `settings.imported_sites`;
+     selecting a site that a replace-all then removes correctly falls
+     back to `KNOWN_SITES[0].name` in the dropdown (the other flagged
+     regression); the dialog itself constructs successfully with real
+     widgets and closes cleanly. Full suite: 121/121 passing throughout
+     (no new tests needed for this block).
+   - [x] **Implementation review (independent Opus pass) -- DONE, 2
+     blockers + 2 real-but-minor findings, all fixed and re-verified.**
+     Full diff review across all v8 files, tracing actual code paths
+     rather than trusting descriptions:
+     - **Blocker 1 -- re-running "Update from GitHub" (or re-loading the
+       same file) always failed after the first success.**
+       `SiteManagerDialog._current_all_sites()` included BOTH buckets'
+       current entries as collision context, including the very bucket
+       about to be replaced wholesale -- so a second fetch validated the
+       incoming list against its own previous results and rejected every
+       entry as a "collision." Confirmed by reproduction: second update
+       of identical data returned `[]`. Fixed: `_current_all_sites()`
+       now takes an `exclude_bucket` param, passed at both call sites, so
+       a fetch into a bucket is validated against the OTHER bucket +
+       `existing_sites` only, never itself (intra-batch collisions were
+       already handled by `validate_site_list`'s own accumulation, so
+       nothing is lost). Re-verified live: two consecutive curated
+       updates with identical data both succeed identically now.
+     - **Blocker 2 -- empty-list and validation-failure were conflated,
+       so a deliberately-emptied curated list could never actually clear
+       the bucket.** `fetch_site_list`/`load_site_list_from_file` treated
+       `not sites` (covers both "raw was `[]`" and "every entry got
+       rejected") as a hard failure, returning `None` either way. Fixed
+       with a shared `_finalize()` helper distinguishing three outcomes:
+       non-list top-level (real error), a genuinely empty `[]` (valid,
+       returns `([], message)` so the caller can clear the bucket), and
+       all-entries-rejected (real error, message now includes the reject
+       count). `tests/test_sitesource.py`'s `test_load_site_list_from_file_no_valid_entries`
+       (which asserted the old, now-wrong behavior for `[]`) was
+       replaced with `test_load_site_list_from_file_empty_list_is_a_valid_empty_result`
+       plus a new `test_load_site_list_from_file_all_entries_rejected` for
+       the genuinely-invalid case, and a `test_load_site_list_from_file_non_list_top_level`.
+       Also noted (not a code bug, a rollout gap): `sites/websdr_sites.json`
+       is still untracked/unpushed, so "Update from GitHub" 404s until a
+       push happens -- flagged again below.
+     - **Real-but-minor 1 -- unchecking `mute_on_tx` mid-transmission left
+       the WebSDR muted indefinitely, not just until the next PTT edge as
+       documented.** `sync/engine.py`'s PTT-edge handler gated BOTH the
+       mute AND unmute calls behind the *current* `mute_on_tx` value; on
+       the falling edge after the user unchecked the box, the unmute call
+       was skipped entirely, and no future edge could ever fire it again
+       since the gate stayed off. Confirmed via reproduction that this is
+       worse than the documented "not instant" limitation -- it's "stuck
+       until reconnect." Fixed: the falling edge now always unmutes
+       regardless of the current `mute_on_tx` value (only the rising
+       edge's mute stays gated) -- unmuting when not actually muted is a
+       harmless no-op. New `tests/test_engine_mute_on_tx.py` (2 tests,
+       `_tick()`-driven against stub rig/driver objects, mirroring
+       `test_engine_mode_independence.py`'s pattern): confirmed
+       non-tautological by reverting the fix and re-running -- the
+       toggle-mid-transmission test correctly failed (`[True]` instead of
+       `[True, False]`) against the pre-fix code, then re-confirmed
+       passing after restoring the fix.
+     - **Real-but-minor 2 -- `cw_offset_hz` edits were lost if the user
+       never clicked Connect.** The only write of `settings.cw_offset_hz`
+       was inside `_on_websdr_connect_clicked`; an edit made while
+       disconnected sat only in the widget, so any *unrelated*
+       `settings.save()` elsewhere (e.g. changing poll interval) would
+       serialize the whole (stale) dataclass, silently discarding the
+       edit before Connect ever ran. Fixed: new `_on_cw_offset_changed`
+       handler (bound to `EVT_SPINCTRL`) writes-and-saves immediately,
+       mirroring `mute_on_tx`'s pattern -- this only fixes persistence,
+       the documented "must reconnect to apply" behavior for the engine
+       itself is unchanged (still only read once, at driver construction).
+       Verified live: editing the spin ctrl without clicking Connect,
+       then triggering an unrelated save, no longer loses the edit.
+     - Also confirmed clean (checked directly, not just described): the
+       `_websdr_connected` three-way split in `_apply_snapshot` is
+       correct in all branches including the fatal-error branch's
+       `_update_websdr_controls()`-then-explicit-`Enable(False)`
+       ordering; every `_find_any_site_by_url` vs. `_all_selectable_sites()`
+       call site is on its intended (narrow vs. wide) side, with both
+       plan-review-flagged regressions (Save-to-list staleness, restart-
+       persistence) genuinely avoided; `SiteManagerDialog`'s threading has
+       no GUI-thread violations and no post-`Destroy()` timer fire;
+       `logging.basicConfig(force=True)` has no log-loss scenario since
+       `setup_logging()` is only ever called once; `config.py`'s
+       `_validate_site_list` refactor is byte-for-byte equivalent to the
+       old `user_sites`-only validator. A few nitpicks noted but not
+       fixed (cosmetic/low-value): stale Test/Detect text isn't cleared
+       by the new dropdown-fallback path; `sitesource.py`'s URL fetch
+       accepts any `urllib` scheme including `file://` (self-inflicted
+       only, no privilege boundary in a desktop app); a monkeypatch trap
+       in `_on_open_log_folder_clicked` (binds `LOG_FILE` by value) that
+       only matters if someone later writes a test against it.
+     Full suite: 125/125 passing (was 121 after Block F; +2 new
+     `test_engine_mute_on_tx.py` tests, +2 net new `test_sitesource.py`
+     tests from the Blocker 2 fix's test rewrite -- confirmed by direct
+     `pytest` run).
+   - [x] **pytest + live verification + final docs update -- DONE (this
+     entry).** Full suite 125/125 passing. Live-verified end to end via
+     standalone scripts against the real wx API (not committed, per this
+     project's established practice): `MainFrame` construction with
+     imported/curated sites present in settings; the dropdown correctly
+     includes their names; `_find_any_site_by_url` correctly stays scoped
+     to `KNOWN_SITES + user_sites`; a simulated replace-all correctly
+     falls back to `KNOWN_SITES[0].name` when the active selection is
+     dropped; `SiteManagerDialog` constructs and closes cleanly; both
+     implementation-review blockers verified fixed directly (two
+     consecutive identical curated updates both succeed; an empty-list
+     result correctly clears `curated_sites` rather than being treated as
+     a failure); the mute-on-TX unmute fix verified both by a direct
+     logic-level reproduction and by reverting-and-re-testing against the
+     pre-fix code to confirm the new test actually catches the
+     regression; `cw_offset_hz` now persists on edit without requiring
+     Connect first.
+     **Still open, explicitly out of scope for this environment**: the
+     real end-to-end "Update from GitHub" check needs `sites/websdr_sites.json`
+     actually pushed to `github.com/Ar0xA/sdrsync` on `master` -- a real
+     fetch right now correctly 404s (proving the fetch mechanism itself
+     works) but can't complete the full round-trip until pushed; this
+     project's practice is to only push when the user explicitly asks, so
+     it's deferred to that point rather than done unprompted here. No
+     other manual GUI click-through was possible in this environment (no
+     display automation for a native desktop app) -- consistent with
+     every prior wx-heavy round in this project, verification here is
+     standalone-script-against-the-real-API plus full pytest, not an
+     actual mouse-driven session.
+
+   **v8 round is now feature-complete and reviewed** (plan review +
+   implementation review, matching this project's standard two-review
+   pattern). All 4 items shipped: log rotation + open-log-folder,
+   `cw_offset_hz`/`mute_on_tx` GUI controls, Save-to-list gating
+   hardening, and WebSDR site-list import/curated-update via a new
+   "Manage sites..." dialog. Full suite: 125/125 passing (was 101 at the
+   start of this round; +24 new tests across `test_logging_setup.py`,
+   `test_config.py`, `test_sitesource.py`, and `test_engine_mute_on_tx.py`).
+   Not yet committed/pushed -- awaiting the user's explicit go-ahead per
+   this project's established practice.
+
 ## Next steps after restart
 
 1. `cd` into the project, confirm `pip install -r requirements.txt` deps

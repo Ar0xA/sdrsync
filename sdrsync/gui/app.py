@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 from typing import Callable, Optional
@@ -44,7 +45,9 @@ from sdrsync.config import (
     WebSDRSite,
 )
 from sdrsync.gui_messages import GuiMessage
+from sdrsync.gui.site_manager_dialog import SiteManagerDialog
 from sdrsync.gui.webview_host import WebViewHost
+from sdrsync.logging_setup import LOG_FILE
 from sdrsync.preflight import (
     DetectResult,
     RigPreflightResult,
@@ -115,6 +118,21 @@ class MainFrame(wx.Frame):
             for d in self.settings.user_sites
         ]
 
+        # Sites loaded via the "Manage sites..." dialog (file/URL loads
+        # share imported_sites; "Update from GitHub" populates
+        # curated_sites) -- see _all_selectable_sites(). Deliberately kept
+        # OUT of _find_any_site_by_url/_site_already_saved's scope (see
+        # that method's docstring) -- only used for dropdown display and
+        # name-lookup.
+        self._imported_sites: list[WebSDRSite] = [
+            WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
+            for d in self.settings.imported_sites
+        ]
+        self._curated_sites: list[WebSDRSite] = [
+            WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
+            for d in self.settings.curated_sites
+        ]
+
         # Mirrors of the engine's independent subsystem states, updated
         # from each StatusSnapshot -- drive button labels/enabled-state and
         # "connecting.../reconnecting..." status wording (see
@@ -130,6 +148,11 @@ class MainFrame(wx.Frame):
         # Mirrors the panel's current status text -- used the same way the
         # Tkinter version read the conn_var StringVar back for gating logic.
         self._websdr_conn_text = "not connected"
+        # Dedicated gate for "Save to list" (can_save in
+        # _update_websdr_controls), set in every branch of _apply_snapshot
+        # (including the fatal-error branch) -- kept separate from
+        # _websdr_conn_text, which is display text only.
+        self._websdr_connected = False
 
         self._dispatch: dict[type, Callable[[GuiMessage], None]] = {
             StatusSnapshot: self._apply_snapshot,
@@ -180,6 +203,10 @@ class MainFrame(wx.Frame):
 
         self._build_mock_rig_panel(panel, main_sizer)
 
+        open_log_btn = wx.Button(panel, label="Open log folder")
+        open_log_btn.Bind(wx.EVT_BUTTON, self._on_open_log_folder_clicked)
+        main_sizer.Add(open_log_btn, flag=wx.ALIGN_LEFT | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=6)
+
         panel.SetSizer(main_sizer)
         frame_sizer = wx.BoxSizer(wx.VERTICAL)
         frame_sizer.Add(panel, flag=wx.EXPAND)
@@ -207,6 +234,11 @@ class MainFrame(wx.Frame):
         self._refresh_site_dropdown_values()
         row += 1
 
+        manage_sites_btn = wx.Button(parent, label="Manage sites...")
+        manage_sites_btn.Bind(wx.EVT_BUTTON, self._on_manage_sites_clicked)
+        grid.Add(manage_sites_btn, pos=(row, 0), flag=wx.ALIGN_LEFT)
+        row += 1
+
         grid.Add(wx.StaticText(parent, label="Custom URL:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
         self.custom_url_entry = wx.TextCtrl(parent, value="")
         self.custom_url_entry.Bind(wx.EVT_TEXT, self._on_custom_url_edited)
@@ -230,6 +262,18 @@ class MainFrame(wx.Frame):
         self.websdr_test_btn = wx.Button(parent, label="Test")
         self.websdr_test_btn.Bind(wx.EVT_BUTTON, self._on_websdr_test_clicked)
         grid.Add(self.websdr_test_btn, pos=(row, 3), flag=wx.EXPAND)
+        row += 1
+
+        grid.Add(wx.StaticText(parent, label="CW offset (Hz):"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.cw_offset_ctrl = wx.SpinCtrl(parent, min=-2000, max=2000, initial=self.settings.cw_offset_hz, size=(80, -1))
+        self.cw_offset_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_offset_changed)
+        _Tooltip(self.cw_offset_ctrl, lambda: "Disconnect and reconnect to apply a new CW offset.")
+        grid.Add(self.cw_offset_ctrl, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.mute_on_tx_check = wx.CheckBox(parent, label="Mute WebSDR on TX")
+        self.mute_on_tx_check.SetValue(self.settings.mute_on_tx)
+        _Tooltip(self.mute_on_tx_check, lambda: "Takes effect on the next PTT transition, not instantly.")
+        self.mute_on_tx_check.Bind(wx.EVT_CHECKBOX, self._on_mute_on_tx_changed)
+        grid.Add(self.mute_on_tx_check, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         self.websdr_preflight_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
@@ -397,7 +441,7 @@ class MainFrame(wx.Frame):
             and self._active_websdr_site is not None
             and selected is not None
             and selected.url == self._active_websdr_site.url
-            and self._websdr_conn_text == "connected"
+            and self._websdr_connected
             and not self._site_already_saved(selected)
         )
         self.save_site_btn.Enable(can_save)
@@ -416,9 +460,11 @@ class MainFrame(wx.Frame):
             self.websdr_connect_btn.SetLabel("Connect")
             self.websdr_connect_btn.Enable(self._rig_active)
             self.headless_check.Enable(True)
+            self.cw_offset_ctrl.Enable(True)
             return
 
         self.headless_check.Enable(False)
+        self.cw_offset_ctrl.Enable(False)
         selected = self._resolve_selected_site()
         active = self._active_websdr_site
         if (
@@ -450,20 +496,40 @@ class MainFrame(wx.Frame):
             if self._custom_site is not None and self._custom_site.url == self.custom_url_entry.GetValue().strip():
                 return self._custom_site
             return None
-        return next((s for s in KNOWN_SITES + self._user_sites if s.name == name), None)
+        return next((s for s in self._all_selectable_sites() if s.name == name), None)
 
     def _find_any_site_by_url(self, url: str) -> Optional[WebSDRSite]:
+        # Deliberately scoped to KNOWN_SITES + self._user_sites only, NOT
+        # the wider _all_selectable_sites() set -- this drives can_save's
+        # "already saved" check and last_site_driver_type's restart-
+        # persistence decision (_on_websdr_connect_clicked), both of which
+        # manage the user's OWN saved-site bookkeeping. Widening this
+        # would make can_save go permanently False for a Custom URL that
+        # happens to match a curated/imported entry, and would make a
+        # restart-persisted site vanish silently if a later "Update from
+        # GitHub" replace-all removes the matching curated entry.
         return next((s for s in KNOWN_SITES + self._user_sites if s.url == url), None)
 
     def _site_already_saved(self, site: WebSDRSite) -> bool:
         return self._find_any_site_by_url(site.url) is not None
 
+    def _all_selectable_sites(self) -> list[WebSDRSite]:
+        # Wider than _find_any_site_by_url's scope -- used only where the
+        # dropdown/name-lookup genuinely needs to see curated/imported
+        # sites too (_refresh_site_dropdown_values, _resolve_selected_site).
+        return KNOWN_SITES + self._user_sites + self._curated_sites + self._imported_sites
+
     def _refresh_site_dropdown_values(self) -> None:
-        names = [s.name for s in KNOWN_SITES + self._user_sites] + [CUSTOM_URL_SENTINEL]
+        names = [s.name for s in self._all_selectable_sites()] + [CUSTOM_URL_SENTINEL]
         current = self.site_combo.GetValue()
         self.site_combo.Set(names)
         if current in names:
             self.site_combo.SetValue(current)
+        else:
+            # A replace-all (Update from GitHub / re-Load) can drop the
+            # currently-selected/active site out from under the dropdown
+            # -- never leave the combo with no selection at all.
+            self.site_combo.SetValue(KNOWN_SITES[0].name)
 
     def _persist_user_sites(self) -> None:
         self.settings.user_sites = [
@@ -508,6 +574,29 @@ class MainFrame(wx.Frame):
         # The deleted entry can no longer be selected.
         self.site_combo.SetValue(KNOWN_SITES[0].name)
         self._on_site_selected()
+
+    def _on_manage_sites_clicked(self, _event=None) -> None:
+        # existing_sites matches _find_any_site_by_url's scope exactly
+        # (KNOWN_SITES + user_sites), not _all_selectable_sites() -- the
+        # dialog's collision check needs to know about the user's own
+        # saved sites, not the curated/imported buckets it's about to
+        # replace/extend itself.
+        dlg = SiteManagerDialog(self, self.settings, KNOWN_SITES + self._user_sites)
+        dlg.ShowModal()
+        dlg.Destroy()
+        # The dialog writes replace-all results straight into
+        # self.settings' buckets -- rebuild our in-memory mirrors and
+        # refresh the dropdown now that it's closed.
+        self._imported_sites = [
+            WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
+            for d in self.settings.imported_sites
+        ]
+        self._curated_sites = [
+            WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
+            for d in self.settings.curated_sites
+        ]
+        self._refresh_site_dropdown_values()
+        self._update_websdr_controls()
 
     def _restore_custom_site_if_needed(self) -> None:
         if self._find_any_site_by_url(self.settings.last_site_url) is not None:
@@ -629,6 +718,7 @@ class MainFrame(wx.Frame):
         self.settings.last_site_url = site.url
         self.settings.last_site_driver_type = site.driver_type if self._find_any_site_by_url(site.url) is None else ""
         self.settings.headless = self.headless_check.GetValue()
+        self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
         self.settings.save()
         self._webview_host.set_headless(self.settings.headless)
 
@@ -679,6 +769,23 @@ class MainFrame(wx.Frame):
         self.settings.rig_backend = new_backend
         self.settings.save()
         self._populate_host_port_for_backend(new_backend)
+
+    def _on_cw_offset_changed(self, _event=None) -> None:
+        # Persist on every edit, not just at Connect time -- otherwise an
+        # unsaved edit could be silently overwritten by an unrelated
+        # settings.save() elsewhere (e.g. changing poll_interval_s) before
+        # the user ever clicks Connect. Reconnect is still required for
+        # the engine to actually pick up a new offset (only read once, at
+        # driver construction) -- this only fixes persistence, not that.
+        self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
+        self.settings.save()
+
+    def _on_mute_on_tx_changed(self, _event=None) -> None:
+        # sync/engine.py reads self.settings.mute_on_tx live on each PTT
+        # edge (mirrors _on_poll_interval_changed's immediate-write pattern),
+        # so this applies without a reconnect.
+        self.settings.mute_on_tx = self.mute_on_tx_check.GetValue()
+        self.settings.save()
 
     def _on_poll_interval_changed(self, _event=None) -> None:
         # SyncEngine reads self.settings.poll_interval_s live on every tick
@@ -818,10 +925,17 @@ class MainFrame(wx.Frame):
             # own error field further down instead.
             _set_wrapped(self.websdr_err_text, f"Sync engine crashed: {snap.fatal_error}")
             _set_wrapped(self.rig_err_text, f"Sync engine crashed: {snap.fatal_error}")
-            self.websdr_connect_btn.Enable(False)
-            self.rig_connect_btn.Enable(False)
             self.websdr_conn_text.SetLabel("error")
             self.rig_conn_text.SetLabel("error")
+            self._websdr_active = False
+            self._websdr_connected = False
+            self._active_websdr_site = None
+            self._update_websdr_controls()
+            # Override _update_websdr_controls' normal rig-active-based
+            # enabling -- the whole engine thread is dead, so both connect
+            # buttons must stay disabled regardless of stale _rig_active.
+            self.websdr_connect_btn.Enable(False)
+            self.rig_connect_btn.Enable(False)
             return
 
         # --- Transceiver ---
@@ -855,6 +969,7 @@ class MainFrame(wx.Frame):
         if not snap.websdr_active:
             self._active_websdr_site = None
             self._websdr_conn_text = "not connected"
+            self._websdr_connected = False
             self.websdr_conn_text.SetLabel("not connected")
             self.websdr_freq_text.SetLabel("-")
             self.websdr_mode_text.SetLabel("-")
@@ -862,6 +977,7 @@ class MainFrame(wx.Frame):
             _set_wrapped(self.websdr_err_text, snap.websdr.last_error if snap.websdr is not None else "")
         else:
             ws = snap.websdr
+            self._websdr_connected = bool(ws and ws.connected)
             if ws is not None:
                 if ws.connected:
                     self._websdr_ever_connected = True
@@ -877,6 +993,12 @@ class MainFrame(wx.Frame):
                     self.websdr_audio_text.SetLabel("streaming" if ws.audio_active else "silent")
                 _set_wrapped(self.websdr_err_text, ws.last_error or "")
         self._update_websdr_controls()
+
+    def _on_open_log_folder_clicked(self, _event=None) -> None:
+        try:
+            os.startfile(LOG_FILE.parent)  # noqa: S606 -- Windows-only app, no external input involved
+        except OSError as e:
+            wx.MessageBox(f"Could not open the log folder ({e}).", "SDRSync", wx.OK | wx.ICON_ERROR)
 
     # ------------------------------------------------------------------
     def _on_close(self, _event=None) -> None:

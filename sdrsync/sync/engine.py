@@ -520,8 +520,19 @@ class SyncEngine:
         if self._websdr_active and self._driver is not None:
             if state.ptt is not None and state.ptt != self._last_ptt:
                 self._last_ptt = state.ptt
-                if self.settings.mute_on_tx:
-                    await self._driver.set_muted(state.ptt)
+                if state.ptt:
+                    if self.settings.mute_on_tx:
+                        await self._driver.set_muted(True)
+                else:
+                    # Always unmute on the falling edge, regardless of the
+                    # *current* mute_on_tx value -- if the user unchecks
+                    # mute_on_tx while still muted from an earlier TX, the
+                    # old gate-both-directions logic would skip this call
+                    # (since it also checked mute_on_tx here), leaving the
+                    # WebSDR muted indefinitely with no further edge ever
+                    # able to clear it. Unmuting when not actually muted
+                    # is a harmless no-op.
+                    await self._driver.set_muted(False)
 
             transmitting = bool(self._last_ptt)
 

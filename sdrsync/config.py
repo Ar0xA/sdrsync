@@ -86,6 +86,19 @@ class AppSettings:
     # KNOWN_SITES, which are the app's built-in defaults and aren't
     # user-editable.
     user_sites: list = field(default_factory=list)
+    # WebSDR sites loaded via the "Manage sites..." dialog's Load-from-file
+    # or Load-from-URL actions (same dict shape as user_sites). Both share
+    # this one bucket (not split by source) -- a fresh load fully replaces
+    # whatever was here before. Kept separate from user_sites since these
+    # come from outside the app and haven't been proven-working through
+    # Detect/Connect the way a saved user_sites entry has.
+    imported_sites: list = field(default_factory=list)
+    # WebSDR sites loaded via the "Manage sites..." dialog's "Update from
+    # GitHub" action (same dict shape). Separate from imported_sites so a
+    # repeatable auto-refresh never clobbers a manual file/URL load or vice
+    # versa. Replace-all on each Update -- a site the maintainer removes
+    # upstream disappears locally too, since this isn't user-owned data.
+    curated_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
     mute_on_tx: bool = True
     # Despite the name, this does NOT use Chromium's real --headless mode --
@@ -123,7 +136,9 @@ class AppSettings:
             known_fields = {f for f in cls.__dataclass_fields__}
             filtered = {k: v for k, v in data.items() if k in known_fields}
             _validate_scalars(filtered)
-            _validate_user_sites(filtered)
+            _validate_site_list(filtered, "user_sites")
+            _validate_site_list(filtered, "imported_sites")
+            _validate_site_list(filtered, "curated_sites")
             _validate_rig_backend(filtered)
             _clamp_poll_interval(filtered)
             return cls(**filtered)
@@ -232,7 +247,7 @@ def _validate_scalars(filtered: dict[str, Any]) -> None:
             del filtered[key]
 
 
-def _validate_user_site(entry: Any) -> Optional[dict]:
+def _validate_site_entry(entry: Any) -> Optional[dict]:
     if not isinstance(entry, dict):
         return None
     name, url, driver_type = entry.get("name"), entry.get("url"), entry.get("driver_type")
@@ -242,27 +257,35 @@ def _validate_user_site(entry: Any) -> Optional[dict]:
     return {"name": name, "url": url, "driver_type": driver_type}
 
 
-def _validate_user_sites(filtered: dict[str, Any]) -> None:
-    """Drop (in place) any malformed user_sites entry rather than crashing
-    downstream (gui/app.py does unguarded dict access on these). Note:
-    since _persist_user_sites rewrites the whole list from in-memory
-    objects, a skipped entry here is silently dropped on the app's next
-    save -- logged at WARNING, not DEBUG, so that's visible to the user."""
-    if "user_sites" not in filtered:
+def _validate_site_list(filtered: dict[str, Any], key: str) -> None:
+    """Drop (in place) any malformed entry in the given site-list field
+    (user_sites/imported_sites/curated_sites -- all the same dict shape)
+    rather than crashing downstream (gui/app.py does unguarded dict access
+    on these). This is a lenient, shape-only check (non-empty strings),
+    the same tier for all three fields -- the stricter check (driver_type
+    actually registered, name/URL collisions) belongs at fetch/import time
+    in sitesource.py, not here, since re-validating already-persisted data
+    against DRIVERS on every load() could silently delete entries if
+    DRIVERS ever changed shape, and config.py must stay free of the
+    websdr/registry -> browser_shim -> wx import chain. Note: since each
+    bucket is rewritten wholesale from in-memory objects on save, a
+    skipped entry here is silently dropped on the app's next save --
+    logged at WARNING, not DEBUG, so that's visible to the user."""
+    if key not in filtered:
         return
-    raw = filtered["user_sites"]
+    raw = filtered[key]
     if not isinstance(raw, list):
-        logger.warning("Ignoring invalid user_sites value in %s (expected a list): %r", CONFIG_FILE, raw)
-        del filtered["user_sites"]
+        logger.warning("Ignoring invalid %s value in %s (expected a list): %r", key, CONFIG_FILE, raw)
+        del filtered[key]
         return
     valid_sites = []
     for entry in raw:
-        validated = _validate_user_site(entry)
+        validated = _validate_site_entry(entry)
         if validated is None:
-            logger.warning("Skipping malformed user_sites entry in %s: %r", CONFIG_FILE, entry)
+            logger.warning("Skipping malformed %s entry in %s: %r", key, CONFIG_FILE, entry)
         else:
             valid_sites.append(validated)
-    filtered["user_sites"] = valid_sites
+    filtered[key] = valid_sites
 
 
 def find_site_by_url(url: str) -> WebSDRSite | None:
