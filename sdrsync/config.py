@@ -69,6 +69,12 @@ class AppSettings:
     """User-editable settings, persisted as JSON in the user's home dir."""
     rigctld_host: str = "127.0.0.1"
     rigctld_port: int = 4532
+    flrig_host: str = "127.0.0.1"
+    flrig_port: int = 12345
+    # Which rig-control backend is active -- "rigctld" or "flrig". Each
+    # backend keeps its own host/port pair above so switching back and
+    # forth in the GUI never loses either one's settings.
+    rig_backend: str = "rigctld"
     last_site_url: str = field(default_factory=lambda: KNOWN_SITES[0].url)
     # Set alongside last_site_url so a Custom URL site (not present in
     # KNOWN_SITES) can be reconstructed on restart instead of silently
@@ -118,6 +124,7 @@ class AppSettings:
             filtered = {k: v for k, v in data.items() if k in known_fields}
             _validate_scalars(filtered)
             _validate_user_sites(filtered)
+            _validate_rig_backend(filtered)
             _clamp_poll_interval(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
@@ -149,6 +156,9 @@ class AppSettings:
 _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "rigctld_host": str,
     "rigctld_port": int,
+    "flrig_host": str,
+    "flrig_port": int,
+    "rig_backend": str,
     "last_site_url": str,
     "last_site_driver_type": str,
     "cw_offset_hz": int,
@@ -157,6 +167,8 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "use_mock_rig": bool,
     "poll_interval_s": (int, float),
 }
+
+RIG_BACKENDS = {"rigctld", "flrig"}
 
 
 def _type_name(expected_type: "type | tuple[type, ...]") -> str:
@@ -182,6 +194,22 @@ def _clamp_poll_interval(filtered: dict[str, Any]) -> None:
             CONFIG_FILE, value, clamped, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S,
         )
         filtered["poll_interval_s"] = clamped
+
+
+def _validate_rig_backend(filtered: dict[str, Any]) -> None:
+    """Drop an unrecognized rig_backend value back to the default. Runs
+    after _validate_scalars, so by this point the value (if present) is
+    already known to be a str -- this only needs to check set membership,
+    not type, mirroring _clamp_poll_interval's layering."""
+    if "rig_backend" not in filtered:
+        return
+    value = filtered["rig_backend"]
+    if value not in RIG_BACKENDS:
+        logger.warning(
+            "Ignoring invalid rig_backend %r in %s (expected one of %s); using default",
+            value, CONFIG_FILE, sorted(RIG_BACKENDS),
+        )
+        del filtered["rig_backend"]
 
 
 def _validate_scalars(filtered: dict[str, Any]) -> None:

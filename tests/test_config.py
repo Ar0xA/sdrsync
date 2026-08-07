@@ -125,3 +125,39 @@ def test_save_does_not_leave_a_tmp_file_behind(monkeypatch, tmp_path):
 
     assert config_file.exists()
     assert not (tmp_path / "config.json.tmp").exists()
+
+
+def test_load_accepts_valid_rig_backend(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"rig_backend": "flrig"}), encoding="utf-8")
+
+    assert AppSettings.load().rig_backend == "flrig"
+
+
+def test_load_rejects_invalid_rig_backend(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"rig_backend": "omnirig"}), encoding="utf-8")
+
+    assert AppSettings.load().rig_backend == "rigctld"  # falls back to default
+
+
+def test_load_ignores_wrong_type_flrig_fields(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"flrig_host": 12345, "flrig_port": "12345"}), encoding="utf-8")
+
+    settings = AppSettings.load()
+
+    assert settings.flrig_host == "127.0.0.1"
+    assert settings.flrig_port == 12345
+
+
+def test_save_then_load_round_trips_flrig_settings(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    original = AppSettings(rig_backend="flrig", flrig_host="192.168.1.50", flrig_port=12346)
+
+    original.save()
+    reloaded = AppSettings.load()
+
+    assert reloaded.rig_backend == "flrig"
+    assert reloaded.flrig_host == "192.168.1.50"
+    assert reloaded.flrig_port == 12346

@@ -954,16 +954,246 @@ source (likely a separate, manually-opened browser tab to the WebSDR site).
    unreproduced "Save to list stays disabled" bug and the
    URL-string/display-text comparison fragility suspected to underlie
    it, renamable/editable saved sites, and first-run onboarding.
-3. **Add flrig as a second rig backend, alongside rigctld.** Requested by
-   the user, explicitly *after* the browser migration above, which is now
-   done -- this comes after the v6 hardening round above. Not scoped or
-   researched yet. `rig/rigctld.py`'s `RigctldClient` is the existing
-   pattern to mirror (or generalize behind a shared interface, TBD during
-   scoping) for a new `FlrigClient` -- flrig exposes its own XML-RPC
-   control interface (distinct wire protocol from hamlib's rigctld line
-   protocol), so this is a new client from scratch, not a config option
-   on the existing one. Needs its own research pass (like every WebSDR
-   driver in this project got) before planning, not assumed from memory.
+3. **v7: flrig support -- PLANNED, implementation starting.** Full plan
+   at `C:\Users\ABEL75\.claude\plans\rippling-roaming-forest.md`'s "v7 --
+   flrig support" section (approved 2026-08-07). Researched against
+   flrig's actual C++ source (`github.com/w1hkj/flrig`,
+   `src/server/xml_server.cxx`), not just its HTML docs, which turned out
+   to disagree with the source on frequency formatting. Key design:
+   `RigState` moves to a new `rig/base.py` (was in `rigctld.py`); new
+   `rig/flrig.py` (`FlrigClient` wrapping `xmlrpc.client.ServerProxy` via
+   `run_in_executor`, a `TimeoutTransport` subclass since stock
+   `ServerProxy` has no `timeout=`); new `rig/fake_flrig.py` (a threaded
+   `SimpleXMLRPCServer` mock, since XML-RPC has no native asyncio
+   integration -- non-blocking `close()`/`wait_closed()` designed
+   explicitly to avoid the class of shutdown bug the v5 round hit once
+   already); a new `RigClient` Protocol in `sync/engine.py` (mirroring
+   the existing `WebViewHost` Protocol) so `self._rig` isn't concretely
+   typed to `RigctldClient` anymore; `AppSettings.rig_backend`/
+   `flrig_host`/`flrig_port` fields; a GUI "Backend:" dropdown in the
+   Transceiver panel (each backend keeps its own persisted host/port).
+   User decisions made explicitly before planning: build the flrig mock
+   server now (not deferred), dropdown-next-to-existing-fields for
+   backend selection (not a separate panel). **Real flrig software is
+   not available in this dev environment** -- the plan explicitly flags
+   that `rig.get_bw`'s exact shape (which varies by rig model per the
+   source) needs live verification against a real flrig instance before
+   this backend is as trusted as rigctld, same caveat every WebSDR driver
+   got before its own live testing.
+
+   **Progress (resume point if this session ends -- update after each
+   block, per established practice from the v6 round):**
+   - [x] Research (flrig source) + plan drafted + user decisions
+     confirmed + plan approved.
+   - [x] **Independent plan review (Opus pass) -- DONE.** No architectural
+     blocker; 3 real fixes required before coding, all confirmed live on
+     this machine (Python 3.12.10) before accepting them:
+     (1) `SimpleXMLRPCServer.allow_reuse_address` defaults `True` and
+     silently hijacks an already-bound port on Windows (confirmed live --
+     `asyncio.start_server` correctly raises on a taken port,
+     `SimpleXMLRPCServer` does not) -- `fake_flrig.py` must set it
+     `False` explicitly; (2) the RPC-call exception tuple was missing
+     `http.client.HTTPException` (confirmed via MRO: `BadStatusLine`
+     subclasses neither `OSError` nor `xmlrpc.client.Error`) -- reachable
+     if a user points the flrig backend at a real rigctld port by
+     mistake, and would otherwise freeze the GUI's status updates
+     silently; (3) the mock server's handle needs to expose the actual
+     bound port (no `asyncio.Server`-style `.sockets[0].getsockname()`
+     analogue exists for `SimpleXMLRPCServer`) so `port=0`-based tests
+     can connect. Also confirmed: `TimeoutTransport` is load-bearing, not
+     optional -- reproduced a 120s+ hang in `run_in_executor` without it
+     (`asyncio.run()`'s executor shutdown has no timeout in 3.12). Full
+     findings recorded in the plan file's "Plan review" section.
+   - [x] **`rig/base.py` + `rig/flrig.py` (`FlrigClient` + parsers) +
+     `rig/fake_flrig.py` mock server -- DONE, both blocks together
+     (client tests needed the mock server, so implemented in one pass).**
+     `RigState` moved to new `rig/base.py`; `rigctld.py` re-exports it
+     unchanged (`from sdrsync.rig.rigctld import RigState` still works,
+     confirmed via `pytest`). `rig/flrig.py`: `TimeoutTransport`
+     (`xmlrpc.client.Transport` subclass, since stock `ServerProxy` has
+     no `timeout=`), 4 pure parsers
+     (`parse_freq_response`/`parse_mode_response`/
+     `parse_bandwidth_response`/`parse_ptt_response`, each defensive per
+     the source-confirmed wire shapes), `FlrigClient` mirroring
+     `RigctldClient`'s public shape with every real RPC call dispatched
+     via `run_in_executor` + `asyncio.wait_for`, catching
+     `(OSError, xmlrpc.client.Error, http.client.HTTPException,
+     ExpatError)` per the plan review's fix #2. `rig/fake_flrig.py`:
+     `FakeFlrigState` (same attribute names as `FakeRigState`),
+     `_FlrigXMLRPCServer` with `allow_reuse_address = False` explicitly
+     set (plan review's fix #1 -- confirmed live this actually prevents
+     the Windows port-hijack: a second bind on an already-listening port
+     now correctly raises `OSError [WinError 10048]`, matching
+     `asyncio.start_server`'s behavior), threaded `serve_forever`,
+     non-blocking `close()`/`wait_closed()` split (fire `shutdown()` on a
+     throwaway thread, join the real server thread via
+     `run_in_executor`), `FlrigMockServerHandle.port` property (plan
+     review's fix #3, needed since `SimpleXMLRPCServer` has no
+     `asyncio.Server`-style socket list) -- confirmed live: a fast
+     stop-then-restart on the same port works cleanly. New
+     `tests/test_flrig_parsing.py` (18 tests) and
+     `tests/test_flrig_client.py` (4 tests: normal `get_state()` round
+     trip, dual-DSP-shape bandwidth handling, reconnect-after-mock-
+     server-restart, and a direct timeout test proving
+     `TimeoutTransport` actually bounds a connection that accepts TCP
+     but never speaks HTTP -- takes real wall-clock time to run, by
+     design, since it's proving a timeout fires). Full suite: 92/92
+     passing (was 70; +22).
+   - [x] **`sync/engine.py`: `RigClient` Protocol + backend wiring --
+     DONE.** New `RigClient` Protocol (mirrors `WebViewHost`, same file)
+     with exactly `ensure_connected()`/`get_state()`/`close()`;
+     `self._rig: Optional[RigClient]` (was concretely `RigctldClient`);
+     `self._mock_state` type widened to `Optional[FakeRigState |
+     FakeFlrigState]`. `_start_rig`/`start_rig_from_other_thread` gained
+     a `backend: str` parameter (`"rigctld"`/`"flrig"`), simple if/else
+     branch (not a registry, per the plan's explicit anti-over-
+     engineering call) picks the mock-server-start function and the real
+     client class -- mock-mode principle preserved: `self._rig` is
+     always the real client class even in mock mode, pointed at the
+     mock server. `_stop_rig()`/`_tick()` needed zero changes (already
+     backend-agnostic through the new Protocol). Fixed the existing
+     `tests/test_engine_switch_site.py` call site the signature change
+     breaks (confirmed by the plan review as a required fix, not
+     optional). New `tests/test_engine_rig_backend.py` (3 tests):
+     `_start_rig("rigctld"/"flrig", ...)` constructs the right client
+     class, and switching backends mid-session replaces the client
+     cleanly -- exercised directly with no mocking needed, since neither
+     client connects anything at construction time. Full suite: 95/95
+     passing (was 92; +3).
+   - [x] **`config.py`: `flrig_host`/`flrig_port`/`rig_backend` fields +
+     validation -- DONE.** New fields alongside the existing
+     `rigctld_host`/`rigctld_port` (each backend keeps its own pair, per
+     the user's explicit requirement); all three added to
+     `_SCALAR_TYPES`; new `RIG_BACKENDS = {"rigctld", "flrig"}` constant
+     (public, not underscore-prefixed, so `gui/app.py`'s dropdown can
+     reuse it instead of a second hardcoded list) and
+     `_validate_rig_backend()` (mirrors `_clamp_poll_interval`'s
+     layering -- runs after `_validate_scalars`, only checks set
+     membership). `tests/test_config.py` gained 4 tests: valid/invalid
+     `rig_backend` (invalid falls back to `"rigctld"`), wrong-type
+     `flrig_host`/`flrig_port` fall back to defaults, and a full
+     save-then-load round trip of all three new fields. Full suite:
+     99/99 passing (was 95; +4).
+   - [x] **`preflight.py`: `check_flrig` -- DONE.** `main.get_version()`
+     probe via `flrig.py`'s (now non-private) `TimeoutTransport`,
+     standalone like `check_rigctld` (no `FlrigClient` instance needed).
+     `RigPreflightResult`'s docstring updated to note it's shared by both
+     backends now, not rigctld-only (the type itself needed no change --
+     already just `ok`/`message`). Found and fixed one real bug of its
+     own during verification: the outer `asyncio.wait_for` and the inner
+     `TimeoutTransport` socket timeout used the same duration, so on an
+     unreachable host they raced and `asyncio.TimeoutError` sometimes won
+     with its empty message (`"...({})"` -- confirmed live, reproduced
+     the empty-message case before fixing) instead of the inner, more
+     informative `TimeoutError('timed out')`. Fixed by giving the outer
+     wrapper a small buffer over the inner timeout, mirroring
+     `FlrigClient.connect()`'s existing `connect_timeout > cmd_timeout`
+     relationship, which avoids the same race there. Re-verified live
+     (5 consecutive failure-path calls, all with the real message now).
+     New `tests/test_preflight_flrig.py` (2 tests: success against
+     `fake_flrig`, failure against a closed port). Full suite: 101/101
+     passing (was 99; +2).
+   - [x] **`gui/app.py`: Backend dropdown + wiring -- DONE.** New
+     "Backend:" `wx.ComboBox(style=wx.CB_READONLY)` (`RIG_BACKEND_CHOICES`
+     -- a fixed-order list, separate from `config.RIG_BACKENDS`'s
+     unordered validation set) above the host/port row. Static box label
+     "Transceiver (rigctld)" -> generic "Transceiver"; the "rigctld
+     host:"/"Invalid rigctld port" strings genericized to "host:"/
+     "Invalid port" (the plan review's minor finding). Host/port fields
+     are now populated via `_populate_host_port_for_backend()` instead of
+     hardcoded to rigctld's settings; `_save_current_backend_host_port()`
+     + `_on_rig_backend_selected()` persist the currently-displayed
+     values into whichever backend was active *before* reading
+     `self.settings.rig_backend` and switching it -- this is what makes
+     "switching back and forth never loses either backend's settings"
+     actually hold. `_on_rig_connect_clicked` now writes host/port into
+     the correct backend-specific fields (was unconditionally
+     `rigctld_host`/`rigctld_port`), persists `rig_backend`, and calls
+     `engine.start_rig_from_other_thread(backend, host, port, use_mock)`
+     (4 args); disables `rig_backend_combo` alongside the existing
+     `mock_rig_check`/`host_entry` disabling, re-enabled in
+     `_apply_snapshot`'s disconnect branch. `_on_rig_test_clicked`/
+     `_run_rig_test` branch on the selected backend to call `check_flrig`
+     or `check_rigctld`. No committed wx-based test file (consistent
+     with this project's established practice -- wx-level GUI logic
+     needs a real `wx.App`, verified live instead, same as the v6
+     headless-window fix). **Verified live** (standalone script against
+     the real wx API, not committed): full `MainFrame` construction
+     succeeds; switching rigctld -> flrig -> rigctld round-trips
+     correctly; and the exact scenario the user required -- edit a
+     field, switch away, switch back -- preserves both backends'
+     independently-edited host/port values (explicitly asserted, not
+     just eyeballed). Full suite: 101/101 passing throughout (no new
+     tests needed here, per the above).
+   - [x] **Implementation review (independent Opus pass, done
+     2026-08-07) -- DONE, no blockers, 4 real findings fixed.** Full
+     `git diff` review across all new/changed files, plus two live
+     probes (not just reading code) to check whether the plan-review
+     fixes actually hold:
+     - **F1 (medium) -- the `TimeoutTransport` regression test was
+       tautological, confirmed by reproducing it.** The original test
+       asserted `connect() is False`, but that's true regardless of
+       whether `TimeoutTransport` is used -- the *outer*
+       `asyncio.wait_for` around `connect()` returns/raises on schedule
+       either way; cancelling a `run_in_executor` future doesn't stop
+       the underlying thread. Confirmed live: swapping in a stock
+       `xmlrpc.client.Transport` still made the test's own assertion
+       pass, while the *actual* protected behavior --
+       `asyncio.run()`'s own executor-shutdown-on-exit -- hung past 60s
+       with the same swap (reproduced directly). Fixed: the test now
+       measures the wall-clock time of the whole `asyncio.run()` call
+       (not just `connect()`'s return value) and deliberately does NOT
+       tear down the stalling listener/thread until after `asyncio.run()`
+       returns, so a regression can't be masked by external cleanup
+       unblocking the leaked thread. Re-verified both directions: passes
+       in ~4s with the real `TimeoutTransport`, hangs (killed at a 20s
+       cap) when swapped back to a stock transport -- now a genuine
+       regression test, not a tautological one.
+     - **F2 (low) -- `preflight._flrig_probe_sync` never closed its
+       `ServerProxy`**, leaking a cached `HTTPConnection` per Test-button
+       click. Fixed with `with xmlrpc.client.ServerProxy(...) as proxy:`
+       (confirmed `ServerProxy` supports the context manager protocol).
+     - **F3 (low) -- `fake_flrig.py`'s standalone REPL accepted any `t`
+       value unvalidated**, but unlike `fake_rigctld.py`'s equivalent
+       (safe, since rigctld's wire format just echoes PTT as text),
+       `rig.get_ptt`'s handler does `int(state.ptt)` -- a non-numeric
+       value would raise inside the RPC handler on every subsequent
+       poll. Fixed: REPL now only accepts `t 0`/`t 1`, with a comment
+       explaining why this one (unlike rigctld's REPL) needs the check.
+     - **F4 (nit) -- `fake_flrig.py`'s module docstring contradicted
+       itself**, claiming no multi-field invariant needs cross-field
+       atomicity while `push_mock_mode` does write `mode`+`passband_hz`
+       together. Corrected: the actual reason this is still safe is that
+       `rig.get_mode`/`rig.get_bw` are separate RPCs (mirroring real
+       flrig, which has no combined call either), so a torn read here is
+       the same kind of momentarily-stale pairing a client would see
+       against a real instance, not a new failure mode this mock
+       introduces. The GIL-atomicity reliance itself was confirmed
+       accurate -- no path was found where a lock is actually needed.
+     Also explicitly confirmed clean (checked in code, not just
+     description): the exception tuple fix from the plan review
+     (`http.client.HTTPException`) is present at both real RPC-call
+     sites in `flrig.py` plus `check_flrig`'s own tuple; `allow_reuse_address
+     = False` is real and effective; the mock-server `OSError` path is
+     symmetric between backends; `_stop_rig()` needed no rigctld-specific
+     assumptions; no stale 3-arg `start_rig_from_other_thread` signatures
+     remain anywhere; GUI host/port persistence correctly saves the *old*
+     backend's fields before switching; parsers match the confirmed
+     wire format including the PTT bool-vs-int guard (covered by a
+     genuine, non-tautological regression test). Full suite: 101/101
+     passing after all four fixes.
+
+   **v7 flrig support is now feature-complete and reviewed twice** (plan
+   review + implementation review, matching this project's standard
+   pattern). **Not yet done, explicitly out of scope for this
+   environment**: a live click-through against real flrig software (none
+   available here) -- see the "Not yet live-verified" caveat at the top
+   of this v7 section, particularly `rig.get_bw`'s exact shape against a
+   real rig model. Manual verification so far has been mock-mode only
+   (via `fake_flrig.py`) plus the standalone wx-widget scripts described
+   in the GUI block above -- a full live app click-through (mock rig +
+   GUI session, not just standalone scripts) is still worth doing before
+   calling this "as trustworthy as rigctld," time permitting.
 
 ## Next steps after restart
 
