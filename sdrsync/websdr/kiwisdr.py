@@ -203,8 +203,13 @@ class KiwiSDRDriver:
         self._last_unmapped_mode = None
 
     # ------------------------------------------------------------------
-    async def tune_hz(self, freq_hz: int) -> bool:
-        """Returns True only if actually applied and verified via readback."""
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
+        """Returns True only if actually applied and verified via readback.
+
+        verify is accepted for WebSDRDriver Protocol parity but unused
+        here -- this driver's readback verification is synchronous and
+        inline (below), not a delayed background task, so there's nothing
+        for verify=False to skip."""
         if not self._attached:
             return False
         effective_hz = freq_hz

@@ -55,12 +55,24 @@ class WebSDRDriver(Protocol):
         for control (e.g. satisfy the audio autoplay gate)."""
         ...
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         """Set receive frequency, switching band first if necessary.
 
         Returns True only if actually applied to the page (False if not
         attached, unmapped, or the underlying call failed) -- callers must
-        gate any "last sent" bookkeeping on this, not assume success."""
+        gate any "last sent" bookkeeping on this, not assume success.
+
+        verify=False tells a driver that does its own delayed/background
+        readback-and-correct (currently only WebsdrOrgDriver) to skip
+        arming it for this call -- used by sync/engine.py's periodic full
+        resync, which re-pushes an already-unchanged frequency purely as a
+        safety net. Without this, that blind re-push could arm a
+        corrective re-tune 0.6s later that fights a genuine, concurrent
+        reverse-sync push landing in the same window (confirmed via code
+        reading, not yet live-reproduced -- see project_brief.md). Drivers
+        that verify synchronously inline (KiwiSDR, OpenWebRX) accept this
+        param for interface parity but currently ignore it, since they
+        have no separate background task for it to gate."""
         ...
 
     async def set_mode(self, hamlib_mode: str, passband_hz: Optional[int]) -> bool:

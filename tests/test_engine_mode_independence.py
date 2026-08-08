@@ -46,10 +46,12 @@ class StubDriver:
     def __init__(self) -> None:
         self.attached = True
         self.tuned: list[int] = []
+        self.tune_verify_flags: list[bool] = []
         self.modes: list[tuple] = []
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         self.tuned.append(freq_hz)
+        self.tune_verify_flags.append(verify)
         return True
 
     async def set_mode(self, hamlib_mode: str, passband_hz) -> bool:
@@ -119,7 +121,7 @@ class FailingDriver(StubDriver):
     """Returns False (no-op / failed) from tune_hz and set_mode -- e.g. what
     a real driver does while not yet attached, or after a failed page call."""
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         self.tuned.append(freq_hz)
         return False
 
@@ -192,3 +194,78 @@ def test_periodic_full_resync_repushes_even_when_dedupe_latches_already_match():
     asyncio.run(engine._tick())
     assert stub_driver.modes == [("USB", 2700), ("USB", 2700)]
     assert stub_driver.tuned == [14074000, 14074000]
+
+
+def test_periodic_resync_of_unchanged_freq_still_verifies_with_no_reverse_push_in_flight():
+    """v12: tune_hz(verify=...) must be True for a periodic resync of an
+    UNCHANGED frequency as long as no reverse-sync ladder is actively
+    retrying -- verify=False unconditionally for every unchanged-value
+    resync would silently give up the resync's only mechanism for
+    detecting/repairing the WebSDR page's band selection having drifted
+    from this driver's own tracking (see websdr_org.py's
+    _verify_freq_applied), not just the narrow window where an armed
+    corrective re-tune could actually fight a concurrent reverse push."""
+    engine = make_engine()
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig = stub_rig
+    engine._rig_active = True
+    engine._driver = stub_driver
+    engine._websdr_active = True
+
+    async def run_two_ticks():
+        await engine._tick()
+        engine._pending_freq_since -= 1.0
+        await engine._tick()
+
+    asyncio.run(run_two_ticks())
+    assert stub_driver.tuned == [14074000]
+    assert stub_driver.tune_verify_flags == [True]  # a genuine change always verifies
+
+    # The forward MODE re-push on this same resync tick would set
+    # _last_sent_freq = None (see engine.py: "a mode change can change the
+    # effective frequency"), which makes freq_changed True and would let this
+    # test pass even WITHOUT the `or (...)` refinement. Drop the rig's mode
+    # for this tick so the mode branch is skipped and _last_sent_freq
+    # survives -- now freq_changed is genuinely False and only the
+    # refinement can make verify True.
+    stub_rig.state = RigState(freq_hz=14074000, mode=None, passband_hz=None, ptt=False)
+    engine._last_full_resync_at -= FULL_RESYNC_INTERVAL_S + 0.1
+    asyncio.run(engine._tick())
+    assert stub_driver.tuned == [14074000, 14074000]
+    # Unchanged value AND freq_changed is False -- still verifies, because
+    # nothing reverse-sync is in flight.
+    assert stub_driver.tune_verify_flags == [True, True]
+
+
+def test_periodic_resync_of_unchanged_freq_skips_verify_while_reverse_push_in_flight():
+    """v12: the one case tune_hz(verify=False) is actually for -- a
+    reverse-sync mode push is actively retrying when the periodic resync
+    of an UNCHANGED frequency fires. Uses _mode_push (not _freq_push):
+    the forward freq push's own outer gate already requires
+    self._freq_push is None to fire at all, so _freq_push can never be
+    the thing making verify False at this call site -- only a
+    concurrently in-flight _mode_push can."""
+    from sdrsync.sync.engine import _ReversePush
+
+    engine = make_engine()
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig = stub_rig
+    engine._rig_active = True
+    engine._driver = stub_driver
+    engine._websdr_active = True
+
+    async def run_two_ticks():
+        await engine._tick()
+        engine._pending_freq_since -= 1.0
+        await engine._tick()
+
+    asyncio.run(run_two_ticks())
+    assert stub_driver.tune_verify_flags == [True]
+
+    engine._last_full_resync_at -= FULL_RESYNC_INTERVAL_S + 0.1
+    engine._mode_push = _ReversePush(target="LSB")  # a reverse-sync mode ladder is actively retrying
+    asyncio.run(engine._tick())
+    assert stub_driver.tuned == [14074000, 14074000]
+    assert stub_driver.tune_verify_flags == [True, False]

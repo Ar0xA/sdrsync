@@ -254,12 +254,17 @@ class WebsdrOrgDriver:
                 return idx
         return None
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         """Returns True only if the frequency was actually pushed to the
         page. The caller (SyncEngine) must only update its "last sent"
         bookkeeping when this is True -- otherwise a no-op (not attached, or
         a failed page.evaluate) would get recorded as delivered, and the
-        engine would never retry it once the WebSDR recovers."""
+        engine would never retry it once the WebSDR recovers.
+
+        verify=False skips arming _schedule_freq_verification() -- see
+        WebSDRDriver.tune_hz's docstring for why (periodic full-resync of
+        an unchanged frequency must not arm a corrective re-tune that can
+        fight a concurrent reverse-sync push)."""
         if not self._attached:
             return False
         effective_hz = freq_hz
@@ -283,7 +288,8 @@ class WebsdrOrgDriver:
             logger.warning(self._last_tune_error)
             return False
 
-        self._schedule_freq_verification(effective_hz)
+        if verify:
+            self._schedule_freq_verification(effective_hz)
         return True
 
     def _schedule_freq_verification(self, expected_hz: int) -> None:

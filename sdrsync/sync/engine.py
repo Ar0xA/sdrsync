@@ -108,14 +108,52 @@ REVERSE_MODE_DEBOUNCE_S = 0.35
 # especially right after the user rapidly changed modes/frequency more than
 # once. Each attempt gets its own short verify window (passed to
 # RigClient.set_mode()/set_freq() as verify_budget_s, overriding their
-# module-level default), with a small pause between attempts. Total
-# worst-case time to give up: REVERSE_PUSH_MAX_ATTEMPTS *
-# REVERSE_PUSH_ATTEMPT_VERIFY_S + sum(REVERSE_PUSH_BACKOFF_S) -- tuned to
-# land around ~2s, not the 6+ seconds a naive "more attempts, same budget
-# each" scaling would produce.
-REVERSE_PUSH_ATTEMPT_VERIFY_S = 0.5
-REVERSE_PUSH_MAX_ATTEMPTS = 3
-REVERSE_PUSH_BACKOFF_S = (0.25, 0.25)  # gap after attempt 1, attempt 2
+# module-level default), with a small pause between attempts.
+#
+# Live evidence (real hardware) showed the original 0.5s/3-attempt shape
+# gave up too early under CAT-bus congestion ("rigctld accepted M CW 0
+# but rig never confirmed it within 0.5s"), producing false "rejected"
+# reverts of a push that was actually still landing. Fewer, longer
+# attempts is the right fix, not more/faster polling within the same
+# short window: every verify readback is itself a CAT-bus transaction
+# that competes with the very SET command it's waiting on, so a shorter
+# budget with tighter polling makes congestion worse, not better.
+# REVERSE_PUSH_MAX_ATTEMPTS dropped from 3 to 2 for the same reason
+# rigctld.py's own docstring already argues against resending while a
+# command may still be landing -- three attempts on an already-congested
+# bus is three chances to collide with a command still in flight, not
+# three independent tries.
+#
+# Nominal worst-case time to give up: REVERSE_MODE_DEBOUNCE_S (or
+# REVERSE_FREQ_DEBOUNCE_S) + REVERSE_PUSH_MAX_ATTEMPTS *
+# REVERSE_PUSH_ATTEMPT_VERIFY_S + sum(REVERSE_PUSH_BACKOFF_S)
+# ~= 0.35 + 2*1.0 + 0.35 = 2.7s (mode) / 0.5 + 2*1.0 + 0.35 = 2.85s
+# (freq) -- and that's before accounting for a poll that itself times
+# out overrunning an attempt's own budget by up to one cmd_timeout,
+# plus (rigctld only) up to one connect_timeout if that poll's timeout
+# closed the connection and _reconnect_if_dropped() has to rebuild it --
+# a fully pathological attempt is therefore ~1.0 (SET) + 1.0 (budget) +
+# 0.25 + 1.0 (poll) + 2.0 (reconnect) ~= 5.25s, so ~11s for the whole
+# two-attempt ladder. That needs a blackholing host, not a merely slow
+# rig; the ~3s figure is the realistic case, not a bound. And
+# REVERSE_MIN_RIG_WRITE_GAP_S can add a further, usually-overlapping
+# delay on top. Treat this as "roughly 3s", not a precise bound.
+REVERSE_PUSH_ATTEMPT_VERIFY_S = 1.0
+REVERSE_PUSH_MAX_ATTEMPTS = 2
+REVERSE_PUSH_BACKOFF_S = (0.35,)  # gap after attempt 1; matches REVERSE_MIN_RIG_WRITE_GAP_S
+# Global floor on how often ANY reverse push may actually write to the
+# rig (set_mode()/set_freq()), measured from the end of the previous
+# write -- shared across BOTH axes and across superseded ladders. Neither
+# the per-axis debounce above nor the retry ladder's target-supersede
+# (dropping a stale in-flight ladder when the user clicks past it) bounds
+# the real CAT write rate: supersede abandons the *ladder* bookkeeping,
+# but the command it already wrote is still landing on the bus, and
+# nothing previously stopped the next value's push from firing on the
+# very next ~0.2s tick right behind it. A single CW mode click alone can
+# trigger both a mode AND a frequency write (CW offset) on two
+# independent per-axis clocks -- this floor is what actually caps "how
+# often do we hit the rig", not either axis's own debounce.
+REVERSE_MIN_RIG_WRITE_GAP_S = 0.35
 
 
 class WebViewHost(Protocol):
@@ -294,6 +332,9 @@ class SyncEngine:
         # See REVERSE_PUSH_* constants and _reverse_sync_tick().
         self._mode_push: Optional[_ReversePush] = None
         self._freq_push: Optional[_ReversePush] = None
+        # See REVERSE_MIN_RIG_WRITE_GAP_S -- 0.0 ("long ago") so the very
+        # first eligible reverse push is never held off by this gate.
+        self._last_rig_write_at: float = 0.0
         # Debounces a discrete mode click the same way _pending_reverse_freq/
         # _pending_reverse_freq_since debounce a continuous drag.
         self._pending_reverse_mode: Optional[str] = None
@@ -694,6 +735,7 @@ class SyncEngine:
         self._last_unmapped_reverse_mode = None
         self._mode_push = None
         self._freq_push = None
+        self._last_rig_write_at = 0.0
         self._pending_reverse_mode = None
         self._pending_reverse_mode_since = 0.0
         self._reverse_sync_error = None
@@ -763,6 +805,12 @@ class SyncEngine:
             self._reverse_reseed_due = False
             return
 
+        # See REVERSE_MIN_RIG_WRITE_GAP_S -- computed once per tick and
+        # applied to both axes below, since a blocked mode write must not
+        # let the freq branch write in the same tick either (that would
+        # defeat the point of a *global* floor).
+        can_write_rig = time.monotonic() - self._last_rig_write_at >= REVERSE_MIN_RIG_WRITE_GAP_S
+
         mode_did_work = False
         if obs_mode is None:
             # Unmapped WebSDR mode (e.g. KiwiSDR's sal/sau/sas/qam/drm/iq,
@@ -794,7 +842,7 @@ class SyncEngine:
                     if time.monotonic() - self._pending_reverse_mode_since >= REVERSE_MODE_DEBOUNCE_S:
                         self._mode_push = _ReversePush(target=obs_mode)
                 push = self._mode_push
-                if push is not None and time.monotonic() >= push.next_attempt_at:
+                if push is not None and can_write_rig and time.monotonic() >= push.next_attempt_at:
                     # Preserve the rig's current filter width when only the
                     # page's narrow/wide variant changed within the same base
                     # mode (the page can't tell us which variant it wants --
@@ -805,6 +853,11 @@ class SyncEngine:
                     # rig may have partially moved between attempts.
                     passband_hz = state.passband_hz if obs_mode == state.mode else None
                     ok = await self._rig.set_mode(obs_mode, passband_hz, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
+                    # Stamp unconditionally, before the generation guard --
+                    # the write physically happened on the wire regardless
+                    # of whether a concurrent reset superseded our own
+                    # in-memory bookkeeping while we were awaiting it.
+                    self._last_rig_write_at = time.monotonic()
                     if generation != self._sync_latch_generation:
                         return  # superseded by a concurrent reset while awaiting
                     mode_did_work = True
@@ -873,10 +926,13 @@ class SyncEngine:
         if self._freq_push is None or self._freq_push.target != pending_freq:
             self._freq_push = _ReversePush(target=pending_freq)
         push = self._freq_push
-        if now < push.next_attempt_at:
+        if not can_write_rig or now < push.next_attempt_at:
             return
 
         ok = await self._rig.set_freq(pending_freq, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
+        # See the mode branch's identical comment -- stamp before the
+        # generation guard, the write already happened either way.
+        self._last_rig_write_at = time.monotonic()
         if generation != self._sync_latch_generation:
             return  # superseded by a concurrent reset while awaiting
         push.attempts += 1
@@ -898,7 +954,14 @@ class SyncEngine:
             self._last_sent_freq = None
             self._freq_push = None
         else:
-            push.next_attempt_at = now + REVERSE_PUSH_BACKOFF_S[min(push.attempts - 1, len(REVERSE_PUSH_BACKOFF_S) - 1)]
+            # time.monotonic() freshly, NOT the stale pre-await `now`:
+            # a failing set_freq() blocks for ~REVERSE_PUSH_ATTEMPT_VERIFY_S
+            # first, so now + backoff would already be in the past and the
+            # inter-attempt gap would be a silent no-op (matches the mode
+            # branch above).
+            push.next_attempt_at = time.monotonic() + REVERSE_PUSH_BACKOFF_S[
+                min(push.attempts - 1, len(REVERSE_PUSH_BACKOFF_S) - 1)
+            ]
 
     async def _tick(self) -> None:
         """Runs one poll iteration. A no-op (beyond publishing a status
@@ -1002,7 +1065,33 @@ class SyncEngine:
                              or due_for_periodic_resync)
                         and self._freq_push is None  # see the mode ladder's identical guard above
                     ):
-                        if await self._driver.tune_hz(self._pending_freq):
+                        # freq_changed mirrors the disjuncts above exactly
+                        # (no await in between, so they can't disagree).
+                        freq_changed = (
+                            self._last_sent_freq is None
+                            or abs(self._pending_freq - self._last_sent_freq) > FREQ_CHANGE_THRESHOLD_HZ
+                        )
+                        # verify=False ONLY for a periodic-resync re-push
+                        # of an unchanged frequency WHILE a reverse-sync
+                        # push is actively in flight -- that's the one
+                        # window where an armed corrective re-tune 0.6s
+                        # later (see WebSDRDriver.tune_hz's docstring) can
+                        # fight a genuine, concurrent reverse-sync push.
+                        # Outside that window, an unchanged-value resync
+                        # still verifies -- it's the only thing that ever
+                        # notices/repairs the page's band selection having
+                        # drifted from our own tracking (e.g. a direct
+                        # click on the page's own band control while PTT
+                        # suppressed reverse sync), and disabling it
+                        # unconditionally would silently give that up.
+                        # Only _mode_push is tested here: the enclosing
+                        # elif above already requires self._freq_push is
+                        # None for this code to run at all (and nothing
+                        # awaits in between, so it can't change), so
+                        # re-testing it here would be unconditionally
+                        # True -- don't "fix" this by adding it back.
+                        verify = freq_changed or self._mode_push is None
+                        if await self._driver.tune_hz(self._pending_freq, verify=verify):
                             self._last_sent_freq = self._pending_freq
                             self._last_pushed_to_websdr_freq = self._pending_freq
                             self._forward_push_completed_at = time.monotonic()

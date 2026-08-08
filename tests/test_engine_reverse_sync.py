@@ -26,6 +26,7 @@ from sdrsync.sync.engine import (
     REVERSE_FREQ_CHANGE_THRESHOLD_HZ,
     REVERSE_FREQ_DEBOUNCE_S,
     REVERSE_HOLDOFF_S,
+    REVERSE_MIN_RIG_WRITE_GAP_S,
     REVERSE_MODE_DEBOUNCE_S,
     REVERSE_PUSH_MAX_ATTEMPTS,
     SyncEngine,
@@ -72,7 +73,7 @@ class StubReverseDriver:
         self.tuned: list[int] = []
         self.modes: list[tuple] = []
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         self.tuned.append(freq_hz)
         return True
 
@@ -129,6 +130,14 @@ def _clear_push_backoff(engine: SyncEngine) -> None:
         engine._mode_push.next_attempt_at = 0.0
     if engine._freq_push is not None:
         engine._freq_push.next_attempt_at = 0.0
+
+
+def _clear_rig_write_gap(engine: SyncEngine) -> None:
+    """Backdates the global rig-write rate limiter (REVERSE_MIN_RIG_WRITE_GAP_S)
+    so a test driving consecutive ticks with no real wall-clock delay
+    between them isn't itself throttled by the same floor that bounds a
+    real burst of user clicks."""
+    engine._last_rig_write_at -= REVERSE_MIN_RIG_WRITE_GAP_S + 0.1
 
 
 def _settle_and_capture_baseline(engine: SyncEngine) -> None:
@@ -287,7 +296,7 @@ class OutOfBandDriver(StubReverseDriver):
     real websdr_org.py behavior when the rig's frequency is outside every
     band the WebSDR covers."""
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         self.tuned.append(freq_hz)
         return False
 
@@ -343,6 +352,7 @@ def test_rejected_freq_reverse_push_gives_up_after_max_attempts_and_reverts_to_r
     for _ in range(REVERSE_PUSH_MAX_ATTEMPTS):
         _clear_reverse_debounce(engine)
         _clear_push_backoff(engine)
+        _clear_rig_write_gap(engine)
         _clear_holdoff(engine)
         asyncio.run(engine._tick())
 
@@ -501,6 +511,7 @@ def test_mode_ladder_retries_and_succeeds_before_giving_up():
 
     stub_rig.set_mode_result = True  # the rig actually caught up
     _clear_push_backoff(engine)
+    _clear_rig_write_gap(engine)
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # attempt 2: succeeds
 
@@ -532,6 +543,7 @@ def test_mode_ladder_gives_up_after_max_attempts_and_reverts_to_rig():
     for _ in range(REVERSE_PUSH_MAX_ATTEMPTS):
         _clear_reverse_mode_debounce(engine)
         _clear_push_backoff(engine)
+        _clear_rig_write_gap(engine)
         _clear_holdoff(engine)
         asyncio.run(engine._tick())
 
@@ -597,3 +609,46 @@ def test_reverse_sync_pending_text_blank_on_first_attempt_shown_from_second():
     assert text is not None
     assert "LSB" in text
     assert f"2/{REVERSE_PUSH_MAX_ATTEMPTS}" in text
+
+
+def test_rig_write_rate_limiter_blocks_a_different_axis_write_after_a_failed_push_too():
+    """REVERSE_MIN_RIG_WRITE_GAP_S (v12): the genuine gap this closes that
+    REVERSE_HOLDOFF_S does NOT -- a push attempt that FAILS (rejected/
+    unconfirmed, not yet given up) does NOT touch
+    _forward_push_completed_at (only a SUCCESSFUL push does, see the
+    mode/freq branches' own `if ok:` blocks), so REVERSE_HOLDOFF_S alone
+    would not have blocked a DIFFERENT axis's otherwise-eligible write on
+    the very next tick. This test uses a failed mode push specifically
+    (set_mode_result=False) rather than a successful one, so it can't be
+    satisfied by REVERSE_HOLDOFF_S alone -- only the new write-rate floor,
+    stamped unconditionally on every write attempt regardless of success,
+    catches this."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_rig.set_mode_result = False  # every mode push attempt "fails" (unconfirmed)
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # attempt 1: fails -- does NOT touch _forward_push_completed_at
+    assert stub_rig.set_modes == [("LSB", None)]
+    assert engine._mode_push is not None  # still retrying, not given up yet
+
+    status.freq_hz = 14_200_000
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the freq debounce
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # debounce elapsed, otherwise eligible -- but blocked by the write-rate floor
+    assert stub_rig.set_freqs == []
+
+    _clear_rig_write_gap(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # gap elapsed -- now goes through (mode's own backoff still blocks it separately)
+    assert stub_rig.set_freqs == [14_200_000]

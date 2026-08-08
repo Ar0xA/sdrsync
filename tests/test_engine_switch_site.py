@@ -28,7 +28,7 @@ class StubDriver:
     async def close(self) -> None:
         self.closed = True
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         return True
 
     async def set_mode(self, hamlib_mode: str, passband_hz) -> bool:

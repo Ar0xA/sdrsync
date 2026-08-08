@@ -51,16 +51,18 @@ RECONNECT_WARN_AFTER = 5
 # source during plan review, real CAT-bus turnaround is commonly
 # 100-500ms.
 #
-# Bounded by WALL CLOCK (a deadline checked before each poll), not by
-# attempt count -- an attempt-count bound looks like "5 * 0.15s = ~0.75s"
-# on paper, but each _poll_call() can itself take up to cmd_timeout
-# (1.0s) if a poll genuinely times out, making the real worst case
-# ~1.0s (initial set) + 5*1.0s (polls) + 4*0.15s (sleeps) = ~6.6s of
-# _tick() blocked on one push -- no status snapshots, no forward sync,
-# an apparently-frozen GUI, and (if the push keeps getting rejected every
-# tick) that cost repeating every tick indefinitely. The wall-clock
-# deadline below caps the real worst case at SET_VERIFY_BUDGET_S
-# regardless of how many individual polls time out.
+# Bounded by WALL CLOCK, not by attempt count -- an attempt-count bound
+# looks like "5 * 0.15s = ~0.75s" on paper, but each _poll_call() can
+# itself take up to cmd_timeout (1.0s) if a poll genuinely times out,
+# making the real worst case ~1.0s (initial set) + 5*1.0s (polls) +
+# 4*0.15s (sleeps) = ~6.6s of _tick() blocked on one push -- no status
+# snapshots, no forward sync, an apparently-frozen GUI, and (if the push
+# keeps getting rejected every tick) that cost repeating every tick
+# indefinitely. The deadline is checked AFTER each sleep+poll (not
+# before), so the loop always does at least one full poll -- the real
+# worst case is therefore SET_VERIFY_BUDGET_S + one extra
+# SET_VERIFY_POLL_INTERVAL_S + cmd_timeout, not a hard cap at
+# SET_VERIFY_BUDGET_S itself.
 SET_VERIFY_BUDGET_S = 1.5
 SET_VERIFY_POLL_INTERVAL_S = 0.15
 FREQ_VERIFY_TOLERANCE_HZ = 10
@@ -299,17 +301,16 @@ class FlrigClient:
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         await self._call(lambda: self._proxy.rig.set_vfoA(freq_hz))
         deadline = asyncio.get_running_loop().time() + budget
-        first = True
-        while asyncio.get_running_loop().time() < deadline:
-            if not first:
-                await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
-            first = False
+        while True:
+            await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
             if self._proxy is None:
                 break
             resp = await self._poll_call(lambda: self._proxy.rig.get_vfo())
             actual = parse_freq_response(resp)
             if actual is not None and abs(actual - freq_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
                 return True
+            if asyncio.get_running_loop().time() >= deadline:
+                break
         logger.warning("flrig did not confirm set_vfoA(%d) within %.2fs", freq_hz, budget)
         return False
 
@@ -327,17 +328,16 @@ class FlrigClient:
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         await self._call(lambda: self._proxy.rig.set_mode(mode_name))
         deadline = asyncio.get_running_loop().time() + budget
-        first = True
-        while asyncio.get_running_loop().time() < deadline:
-            if not first:
-                await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
-            first = False
+        while True:
+            await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
             if self._proxy is None:
                 break
             resp = await self._poll_call(lambda: self._proxy.rig.get_mode())
             actual = parse_mode_response(resp)
             if actual is not None and actual == mode_name:
                 return True
+            if asyncio.get_running_loop().time() >= deadline:
+                break
         logger.warning("flrig did not confirm set_mode(%r) within %.2fs", mode_name, budget)
         return False
 
