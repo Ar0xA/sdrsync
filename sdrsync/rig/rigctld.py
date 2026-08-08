@@ -14,12 +14,17 @@ that the physical rig actually took it -- CAT-bus commands can be
 dropped or collide, especially over serial links, and this was observed
 to happen in practice (mode pushes "often but not always" landing).
 set_freq/set_mode therefore verify via a poll-until-match readback after
-sending, resending and re-polling up to SET_VERIFY_MAX_ATTEMPTS times
-before giving up and returning False -- mirrors FlrigClient's existing
-poll-until-match verification (needed there because flrig's own RPC
-replies aren't a reliable success signal at all), just attempt-count
-bounded here instead of wall-clock bounded, since rigctld's reply
-already gives a first-pass accept/reject signal flrig's doesn't.
+sending, polling repeatedly for up to SET_VERIFY_BUDGET_S before giving
+up and returning False -- mirrors FlrigClient's existing poll-until-
+match verification. Wall-clock bounded, not attempt-count bounded: an
+earlier attempt-count version (3 tries, 200ms apart, ~0.6s total) was
+observed live to give up too early on real hardware -- the rig had
+genuinely accepted the command and applied it correctly, just slower
+than the budget allowed, producing a false "rejected" warning. The
+command is sent once, not resent on each poll -- rigctld already
+acknowledged it (RPRT 0); resending while it may still be landing risks
+confusing rigs that don't tolerate overlapping CAT commands, and every
+sign so far points to "slow to apply", not "silently dropped".
 """
 from __future__ import annotations
 
@@ -37,11 +42,14 @@ RECONNECT_BASE_DELAY_S = 2.0
 RECONNECT_MAX_DELAY_S = 30.0
 RECONNECT_WARN_AFTER = 5
 
-# set_freq()/set_mode() readback-verification cadence -- poll this long
-# after (re)sending the SET command, retry up to this many times total
-# before giving up. See the module docstring for why this exists at all.
-SET_VERIFY_POLL_DELAY_S = 0.2
-SET_VERIFY_MAX_ATTEMPTS = 3
+# set_freq()/set_mode() readback-verification cadence -- see the module
+# docstring for why this is wall-clock bounded rather than attempt-count
+# bounded. Mirrors FlrigClient's SET_VERIFY_BUDGET_S/
+# SET_VERIFY_POLL_INTERVAL_S, just with a longer budget since rigctld's
+# own protocol round-trip is normally much faster than flrig's XML-RPC,
+# leaving more of the budget for the rig's own CAT-bus turnaround.
+SET_VERIFY_BUDGET_S = 2.0
+SET_VERIFY_POLL_INTERVAL_S = 0.25
 # abs(Hz) tolerance for treating a frequency readback as "confirmed" --
 # mirrors FlrigClient.FREQ_VERIFY_TOLERANCE_HZ (some rigs' CAT layers
 # round to a step size rather than echoing back the exact requested Hz).
@@ -230,28 +238,26 @@ class RigctldClient:
 
         'RPRT 0' only confirms rigctld accepted the command, not that the
         physical rig actually took it -- verified via a poll-until-match
-        readback of get_freq(), resending and re-polling up to
-        SET_VERIFY_MAX_ATTEMPTS times (see module docstring)."""
+        readback of get_freq() over SET_VERIFY_BUDGET_S (see module
+        docstring for why this is wall-clock bounded and doesn't resend
+        the command on each poll)."""
         freq_hz = int(freq_hz)
-        for attempt in range(1, SET_VERIFY_MAX_ATTEMPTS + 1):
-            resp = await self._send_raw(f"F {freq_hz}")
-            if not parse_set_response(resp):
-                logger.warning(
-                    "rigctld rejected F %d (attempt %d/%d): %r",
-                    freq_hz, attempt, SET_VERIFY_MAX_ATTEMPTS, resp,
-                )
-                continue
-            await asyncio.sleep(SET_VERIFY_POLL_DELAY_S)
+        resp = await self._send_raw(f"F {freq_hz}")
+        if not parse_set_response(resp):
+            logger.warning("rigctld rejected F %d: %r", freq_hz, resp)
+            return False
+        deadline = asyncio.get_running_loop().time() + SET_VERIFY_BUDGET_S
+        first = True
+        while asyncio.get_running_loop().time() < deadline:
+            if not first:
+                await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
+            first = False
             actual = await self.get_freq()
             if actual is not None and abs(actual - freq_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
                 return True
-            logger.debug(
-                "rigctld accepted F %d but rig reports %r after attempt %d/%d",
-                freq_hz, actual, attempt, SET_VERIFY_MAX_ATTEMPTS,
-            )
         logger.warning(
-            "rigctld did not confirm frequency %d Hz after %d attempt(s)",
-            freq_hz, SET_VERIFY_MAX_ATTEMPTS,
+            "rigctld accepted F %d but the rig never confirmed it within %.1fs",
+            freq_hz, SET_VERIFY_BUDGET_S,
         )
         return False
 
@@ -263,26 +269,23 @@ class RigctldClient:
         via a poll-until-match readback of get_mode(), same reasoning
         (and cadence) as set_freq() above."""
         pb = 0 if not passband_hz else int(passband_hz)
-        for attempt in range(1, SET_VERIFY_MAX_ATTEMPTS + 1):
-            resp = await self._send_raw(f"M {mode_name} {pb}")
-            if not parse_set_response(resp):
-                logger.warning(
-                    "rigctld rejected M %s %d (attempt %d/%d): %r",
-                    mode_name, pb, attempt, SET_VERIFY_MAX_ATTEMPTS, resp,
-                )
-                continue
-            await asyncio.sleep(SET_VERIFY_POLL_DELAY_S)
+        resp = await self._send_raw(f"M {mode_name} {pb}")
+        if not parse_set_response(resp):
+            logger.warning("rigctld rejected M %s %d: %r", mode_name, pb, resp)
+            return False
+        deadline = asyncio.get_running_loop().time() + SET_VERIFY_BUDGET_S
+        first = True
+        while asyncio.get_running_loop().time() < deadline:
+            if not first:
+                await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
+            first = False
             confirmed = await self.get_mode()
             actual_mode = confirmed[0] if confirmed else None
             if actual_mode == mode_name:
                 return True
-            logger.debug(
-                "rigctld accepted M %s %d but rig reports mode %r after attempt %d/%d",
-                mode_name, pb, actual_mode, attempt, SET_VERIFY_MAX_ATTEMPTS,
-            )
         logger.warning(
-            "rigctld did not confirm mode %s after %d attempt(s)",
-            mode_name, SET_VERIFY_MAX_ATTEMPTS,
+            "rigctld accepted M %s %d but the rig never confirmed it within %.1fs",
+            mode_name, pb, SET_VERIFY_BUDGET_S,
         )
         return False
 

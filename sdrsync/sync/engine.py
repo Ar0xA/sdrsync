@@ -801,6 +801,36 @@ class SyncEngine:
         self._rig_connect_deadline = None
         state = await self._rig.get_state()
 
+        # A reverse push flagged as "rejected" can, on real hardware,
+        # actually have succeeded slightly slower than set_mode()/
+        # set_freq()'s own readback-verification budget allowed for --
+        # self-heal the stale warning the moment a later regular poll
+        # (this one) shows the rig's live state now matches what was
+        # pushed, rather than leaving a false alarm displayed
+        # indefinitely (it otherwise only clears on the next distinct
+        # successful reverse push or a fresh WebSDR attach). Runs
+        # unconditionally, using state already fetched this tick -- no
+        # extra round trip, and no need to wait for a reverse-eligible
+        # tick to notice.
+        if self._last_reverse_mode_reject_key is not None and state.mode == self._last_reverse_mode_reject_key:
+            logger.info(
+                "Rig now reports mode %r, earlier flagged as rejected -- it caught up, clearing the warning",
+                state.mode,
+            )
+            self._last_reverse_mode_reject_key = None
+            self._reverse_sync_error = None
+        if (
+            self._last_reverse_freq_reject_key is not None
+            and state.freq_hz is not None
+            and abs(state.freq_hz - self._last_reverse_freq_reject_key) <= REVERSE_FREQ_CHANGE_THRESHOLD_HZ
+        ):
+            logger.info(
+                "Rig now reports frequency %d Hz, earlier flagged as rejected -- it caught up, clearing the warning",
+                state.freq_hz,
+            )
+            self._last_reverse_freq_reject_key = None
+            self._reverse_sync_error = None
+
         if self._websdr_active and self._driver is not None:
             # Captured before any awaits below, for the reverse gate's
             # own PTT check further down -- see its comment for why.

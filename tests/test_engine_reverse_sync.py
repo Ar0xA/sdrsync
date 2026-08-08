@@ -22,7 +22,12 @@ import queue
 
 from sdrsync.config import AppSettings
 from sdrsync.rig.rigctld import RigState
-from sdrsync.sync.engine import REVERSE_FREQ_DEBOUNCE_S, REVERSE_HOLDOFF_S, SyncEngine
+from sdrsync.sync.engine import (
+    REVERSE_FREQ_CHANGE_THRESHOLD_HZ,
+    REVERSE_FREQ_DEBOUNCE_S,
+    REVERSE_HOLDOFF_S,
+    SyncEngine,
+)
 from sdrsync.websdr.base import WebSDRStatus
 
 
@@ -424,3 +429,47 @@ def test_concurrent_reset_during_await_wins_over_stale_reverse_push():
     asyncio.run(engine._tick())
 
     assert engine._reverse_baseline_captured is False
+
+
+def test_stale_mode_rejection_warning_self_heals_once_rig_catches_up():
+    """Regression: a reverse mode push that set_mode() reported as
+    rejected (its own verify budget exhausted) can still, on real
+    hardware, land slightly later -- the next regular poll must clear
+    the stale warning once the rig's own state.mode confirms it,
+    instead of leaving a false "rejected" alarm displayed forever."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    # Simulate an earlier tick that flagged a mode rejection.
+    engine._last_reverse_mode_reject_key = "LSB"
+    engine._reverse_sync_error = "Rig rejected mode 'LSB' pushed from WebSDR"
+
+    # The rig now reports the previously-rejected mode -- it caught up.
+    stub_rig.state.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert engine._last_reverse_mode_reject_key is None
+    assert engine._reverse_sync_error is None
+
+
+def test_stale_freq_rejection_warning_self_heals_once_rig_catches_up():
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    engine._last_reverse_freq_reject_key = 14200000
+    engine._reverse_sync_error = "Rig rejected frequency 14200000 Hz from WebSDR"
+
+    # Within tolerance of the previously-rejected value -- it caught up.
+    stub_rig.state.freq_hz = 14200000 + REVERSE_FREQ_CHANGE_THRESHOLD_HZ
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert engine._last_reverse_freq_reject_key is None
+    assert engine._reverse_sync_error is None

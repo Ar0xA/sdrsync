@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from typing import Optional
 
 logger = logging.getLogger("sdrsync.fake_rigctld")
 
@@ -29,15 +30,21 @@ class FakeRigState:
         # RPRT 0 -- lets tests exercise RigctldClient.set_freq()/set_mode()'s
         # rejection handling without a real rig.
         self.set_rejected = False
-        # Number of upcoming 'F'/'M' commands to ack (RPRT 0) WITHOUT
-        # actually applying the change -- simulates a CAT-bus command
-        # that rigctld accepted but the physical rig silently dropped
-        # (the real-world failure mode set_freq()/set_mode()'s readback
-        # verification exists to catch). Decremented independently per
-        # command type on each matching command received; the command
-        # once the counter reaches 0 applies normally.
-        self.freq_set_ignore_count = 0
-        self.mode_set_ignore_count = 0
+        # Number of upcoming 'f'/'m' GET polls to keep reporting the OLD
+        # value after an accepted 'F'/'M' SET command, before the new
+        # value becomes visible -- simulates real CAT-bus turnaround lag
+        # (the command genuinely landed, it just takes the physical rig
+        # a moment to catch up), which is what set_freq()/set_mode()'s
+        # poll-until-match verification budget exists to ride out. Set to
+        # a huge number to simulate a command that never actually lands
+        # (tests the give-up path) rather than one that's merely slow.
+        # Independent per field, decremented only by GET polls of that
+        # field.
+        self.freq_apply_after_polls = 0
+        self.mode_apply_after_polls = 0
+        self._pending_freq_hz: Optional[int] = None
+        self._pending_mode: Optional[str] = None
+        self._pending_passband_hz: Optional[int] = None
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: FakeRigState) -> None:
@@ -50,8 +57,22 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 break
             cmd = line.decode(errors="replace").strip()
             if cmd == "f":
+                if state._pending_freq_hz is not None:
+                    if state.freq_apply_after_polls > 0:
+                        state.freq_apply_after_polls -= 1
+                    else:
+                        state.freq_hz = state._pending_freq_hz
+                        state._pending_freq_hz = None
                 writer.write(f"{state.freq_hz}\n".encode())
             elif cmd == "m":
+                if state._pending_mode is not None:
+                    if state.mode_apply_after_polls > 0:
+                        state.mode_apply_after_polls -= 1
+                    else:
+                        state.mode = state._pending_mode
+                        state.passband_hz = state._pending_passband_hz
+                        state._pending_mode = None
+                        state._pending_passband_hz = None
                 if state.mode_error:
                     writer.write(b"RPRT -11\n")
                 else:
@@ -65,21 +86,15 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 if state.set_rejected or len(parts) != 2 or not parts[1].lstrip("-").isdigit():
                     writer.write(b"RPRT -11\n")
                 else:
-                    if state.freq_set_ignore_count > 0:
-                        state.freq_set_ignore_count -= 1
-                    else:
-                        state.freq_hz = int(parts[1])
+                    state._pending_freq_hz = int(parts[1])
                     writer.write(b"RPRT 0\n")
             elif cmd.startswith("M "):
                 parts = cmd.split()
                 if state.set_rejected or len(parts) != 3 or not parts[2].lstrip("-").isdigit():
                     writer.write(b"RPRT -11\n")
                 else:
-                    if state.mode_set_ignore_count > 0:
-                        state.mode_set_ignore_count -= 1
-                    else:
-                        state.mode = parts[1]
-                        state.passband_hz = int(parts[2])
+                    state._pending_mode = parts[1]
+                    state._pending_passband_hz = int(parts[2])
                     writer.write(b"RPRT 0\n")
             else:
                 writer.write(b"RPRT -11\n")
