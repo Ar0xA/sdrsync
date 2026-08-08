@@ -28,14 +28,15 @@ control functions. This means:
   is the whole setup.
 - Each WebSDR *software family* (websdr.org's classic "WebSDR", KiwiSDR,
   OpenWebRX, ...) has its own unrelated control API, so each gets its own
-  driver module implementing `sdrsync.websdr.base.WebSDRDriver`. Three
+  driver module implementing `sdrsync.websdr.base.WebSDRDriver`. Four
   families are implemented today: websdr.org
   (`sdrsync/websdr/websdr_org.py`), which covers
   `websdr.ewi.utwente.nl:8901` and other sites running the same software;
   KiwiSDR (`sdrsync/websdr/kiwisdr.py`), which covers `*.proxy.kiwisdr.com`
-  and other KiwiSDR instances; and OpenWebRX/OpenWebRX+
+  and other KiwiSDR instances; OpenWebRX/OpenWebRX+
   (`sdrsync/websdr/openwebrx.py`), likely the most common self-hosted
-  WebSDR software by receiver count.
+  WebSDR software by receiver count; and UberSDR
+  (`sdrsync/websdr/ubersdr.py`).
   - **OpenWebRX limitation**: some OpenWebRX stations run multiple SDR
     "profiles" (e.g. a separate HF device and a separate VHF/UHF device).
     Automatically switching profiles to follow a rig frequency outside the
@@ -46,6 +47,41 @@ control functions. This means:
   - **OpenWebRX mute-on-TX**: uses the page's own mute toggle
     (`toggleMute()`), confirmed working live — unlike the other two
     drivers this one doesn't need a documented no-op fallback here.
+  - **UberSDR is the exception to the "call the site's own JS" rule**, and
+    the only one that is not reverse-engineered. Its v2 interface publishes
+    a documented, versioned control API (`static/v2/BRIDGE_API.md` in the
+    UberSDR source) for exactly this purpose — the same one its own Chrome
+    and Firefox extensions use — so the driver is a client of that API and
+    touches no page internals. What that buys, concretely:
+    - **Identification is a handshake, not a guess.** The driver sends the
+      API's `hello` and the page answers with an `announce` carrying the
+      receiver's identity, protocol version and capability list. A page that
+      answers *is* a controllable UberSDR; one that does not is not,
+      whatever its HTML looks like. (The `<script src>` fingerprint is still
+      registered, because the **Detect** button identifies a pasted URL from
+      HTML alone without starting a browser.)
+    - **Refusals come with reasons.** An out-of-range frequency is rejected
+      with "frequency 40000000 is outside 10000–30000000" rather than
+      silently clamped, so the driver reports what the receiver said instead
+      of comparing a readback and guessing why it differs.
+    - **Mode and filter are set in one call**, so the receiver never passes
+      audibly through the new mode's default passband on the way to the
+      width the rig reported. The rig's passband becomes real filter edges
+      (2400 Hz on USB → 50–2450 Hz), not a choice between a "narrow" and a
+      "wide" mode string.
+    - **Mute-on-TX uses `duck`, not `mute`.** UberSDR separates the
+      operator's own mute setting from transient silence applied by a
+      controller. Using the transient one means sdrsync dying mid-transmission
+      cannot leave somebody's receiver muted for good, and the mute button on
+      their page never shows a state they did not choose.
+    - **Only the v2 interface has this API.** Paste the receiver's root URL —
+      the address operators publish — and the driver navigates to `/v2/`
+      itself, preserving any query string so an UberSDR share link lands
+      where it says.
+    - **If the operator has switched the API off** (their SDR Control panel →
+      *Browser bridge*), the page says so explicitly and the WebSDR panel
+      reports that, rather than showing a timeout that looks like a broken
+      site.
 - Pasting an arbitrary WebSDR URL doesn't require knowing which software
   it runs: pick **Custom URL...** in the site dropdown, paste the URL, and
   click **Detect** — sdrsync fetches the page's HTML and checks its
@@ -176,7 +212,8 @@ pytest
 
 Covers pure logic and stubbed-object engine behavior only (mode mapping,
 band selection, rigctld response parsing, mode/frequency-sync
-independence) — no browser, socket, or real hardware needed.
+independence, and — for UberSDR — the exact commands the driver puts on
+the wire, via a stub page) — no browser, socket, or real hardware needed.
 
 ## License
 

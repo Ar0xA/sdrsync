@@ -18,5 +18,6 @@
   {"name": "MM3NDH (Central Scotland, UK)", "url": "https://websdr2.scotlandchat.co.uk/", "driver_type": "openwebrx"},
   {"name": "EA5TB (Valencia, Spain)", "url": "http://sdrvalencia.com/", "driver_type": "openwebrx"},
   {"name": "ON0LLV (Belgium)", "url": "http://on0llv.on6ll.be:8073/", "driver_type": "openwebrx"},
-  {"name": "Maarssen (Netherlands)", "url": "http://radarmaarssen.nl:8073/", "driver_type": "openwebrx"}
+  {"name": "Maarssen (Netherlands)", "url": "http://radarmaarssen.nl:8073/", "driver_type": "openwebrx"},
+  {"name": "M9PSY (UK, full HF)", "url": "https://m9psy.tunnel.ubersdr.org/", "driver_type": "ubersdr"}
 ]
