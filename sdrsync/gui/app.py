@@ -320,10 +320,12 @@ class MainFrame(wx.Frame):
         row += 1
 
         self.websdr_conn_text = wx.StaticText(parent, label="not connected")
+        self.websdr_driver_text = wx.StaticText(parent, label="-")
         self.websdr_freq_text = wx.StaticText(parent, label="-")
         self.websdr_mode_text = wx.StaticText(parent, label="-")
         self.websdr_audio_text = wx.StaticText(parent, label="-")
         row = self._grid_status_row(parent, grid, row, "Status:", self.websdr_conn_text)
+        row = self._grid_status_row(parent, grid, row, "Driver:", self.websdr_driver_text)
         row = self._grid_status_row(parent, grid, row, "Frequency:", self.websdr_freq_text)
         row = self._grid_status_row(parent, grid, row, "Mode:", self.websdr_mode_text)
         row = self._grid_status_row(parent, grid, row, "Audio:", self.websdr_audio_text)
@@ -817,6 +819,7 @@ class MainFrame(wx.Frame):
         self._active_websdr_site = site
         self._websdr_conn_text = "connecting..."
         self.websdr_conn_text.SetLabel("connecting...")
+        self.websdr_driver_text.SetLabel(site.driver_type)
         self.websdr_freq_text.SetLabel("-")
         self.websdr_mode_text.SetLabel("-")
         self.websdr_audio_text.SetLabel("-")
@@ -1018,6 +1021,7 @@ class MainFrame(wx.Frame):
             _set_wrapped(self.websdr_err_text, f"Sync engine crashed: {snap.fatal_error}")
             _set_wrapped(self.rig_err_text, f"Sync engine crashed: {snap.fatal_error}")
             self.websdr_conn_text.SetLabel("error")
+            self.websdr_driver_text.SetLabel("-")
             self.rig_conn_text.SetLabel("error")
             _set_wrapped(self.reverse_sync_error_text, "")
             self._websdr_active = False
@@ -1066,6 +1070,7 @@ class MainFrame(wx.Frame):
             self._websdr_conn_text = "not connected"
             self._websdr_connected = False
             self.websdr_conn_text.SetLabel("not connected")
+            self.websdr_driver_text.SetLabel("-")
             self.websdr_freq_text.SetLabel("-")
             self.websdr_mode_text.SetLabel("-")
             self.websdr_audio_text.SetLabel("-")
@@ -1073,6 +1078,9 @@ class MainFrame(wx.Frame):
         else:
             ws = snap.websdr
             self._websdr_connected = bool(ws and ws.connected)
+            self.websdr_driver_text.SetLabel(
+                self._active_websdr_site.driver_type if self._active_websdr_site is not None else "-"
+            )
             if ws is not None:
                 if ws.connected:
                     self._websdr_ever_connected = True
