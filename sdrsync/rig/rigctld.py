@@ -233,20 +233,24 @@ class RigctldClient:
             logger.warning("Unexpected PTT value from rigctld: %r", resp)
         return ptt
 
-    async def set_freq(self, freq_hz: int) -> bool:
+    async def set_freq(self, freq_hz: int, verify_budget_s: Optional[float] = None) -> bool:
         """Reverse-sync (WebSDR -> rig): sets the rig's VFO frequency.
 
         'RPRT 0' only confirms rigctld accepted the command, not that the
         physical rig actually took it -- verified via a poll-until-match
-        readback of get_freq() over SET_VERIFY_BUDGET_S (see module
-        docstring for why this is wall-clock bounded and doesn't resend
-        the command on each poll)."""
+        readback of get_freq() (see module docstring for why this is
+        wall-clock bounded and doesn't resend the command on each poll).
+        verify_budget_s overrides the module default SET_VERIFY_BUDGET_S
+        -- used by sync/engine.py's reverse-sync retry ladder, which wants
+        a short per-attempt budget and retries several times itself
+        rather than one long wait."""
         freq_hz = int(freq_hz)
+        budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         resp = await self._send_raw(f"F {freq_hz}")
         if not parse_set_response(resp):
             logger.warning("rigctld rejected F %d: %r", freq_hz, resp)
             return False
-        deadline = asyncio.get_running_loop().time() + SET_VERIFY_BUDGET_S
+        deadline = asyncio.get_running_loop().time() + budget
         first = True
         while asyncio.get_running_loop().time() < deadline:
             if not first:
@@ -257,23 +261,24 @@ class RigctldClient:
                 return True
         logger.warning(
             "rigctld accepted F %d but the rig never confirmed it within %.1fs",
-            freq_hz, SET_VERIFY_BUDGET_S,
+            freq_hz, budget,
         )
         return False
 
-    async def set_mode(self, mode_name: str, passband_hz: Optional[int]) -> bool:
+    async def set_mode(self, mode_name: str, passband_hz: Optional[int], verify_budget_s: Optional[float] = None) -> bool:
         """Reverse-sync (WebSDR -> rig): sets the rig's mode + passband.
 
         passband_hz=0 (or None) means "rig default for this mode" -- valid
         hamlib/rigctld convention, not a sentinel for "unset". Verified
         via a poll-until-match readback of get_mode(), same reasoning
-        (and cadence) as set_freq() above."""
+        (and cadence) as set_freq() above. verify_budget_s: see set_freq()."""
         pb = 0 if not passband_hz else int(passband_hz)
+        budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         resp = await self._send_raw(f"M {mode_name} {pb}")
         if not parse_set_response(resp):
             logger.warning("rigctld rejected M %s %d: %r", mode_name, pb, resp)
             return False
-        deadline = asyncio.get_running_loop().time() + SET_VERIFY_BUDGET_S
+        deadline = asyncio.get_running_loop().time() + budget
         first = True
         while asyncio.get_running_loop().time() < deadline:
             if not first:
@@ -285,7 +290,7 @@ class RigctldClient:
                 return True
         logger.warning(
             "rigctld accepted M %s %d but the rig never confirmed it within %.1fs",
-            mode_name, pb, SET_VERIFY_BUDGET_S,
+            mode_name, pb, budget,
         )
         return False
 

@@ -26,6 +26,8 @@ from sdrsync.sync.engine import (
     REVERSE_FREQ_CHANGE_THRESHOLD_HZ,
     REVERSE_FREQ_DEBOUNCE_S,
     REVERSE_HOLDOFF_S,
+    REVERSE_MODE_DEBOUNCE_S,
+    REVERSE_PUSH_MAX_ATTEMPTS,
     SyncEngine,
 )
 from sdrsync.websdr.base import WebSDRStatus
@@ -48,11 +50,11 @@ class StubReverseRig:
     async def close(self) -> None:
         pass
 
-    async def set_freq(self, freq_hz: int) -> bool:
+    async def set_freq(self, freq_hz: int, verify_budget_s=None) -> bool:
         self.set_freqs.append(freq_hz)
         return self.set_freq_result
 
-    async def set_mode(self, mode_name: str, passband_hz) -> bool:
+    async def set_mode(self, mode_name: str, passband_hz, verify_budget_s=None) -> bool:
         self.set_modes.append((mode_name, passband_hz))
         return self.set_mode_result
 
@@ -113,6 +115,20 @@ def _clear_holdoff(engine: SyncEngine) -> None:
 
 def _clear_reverse_debounce(engine: SyncEngine) -> None:
     engine._pending_reverse_freq_since -= REVERSE_FREQ_DEBOUNCE_S + 0.1
+
+
+def _clear_reverse_mode_debounce(engine: SyncEngine) -> None:
+    engine._pending_reverse_mode_since -= REVERSE_MODE_DEBOUNCE_S + 0.1
+
+
+def _clear_push_backoff(engine: SyncEngine) -> None:
+    """Backdates whichever retry ladder(s) are currently backing off, so
+    the next tick's attempt fires immediately instead of waiting out
+    REVERSE_PUSH_BACKOFF_S."""
+    if engine._mode_push is not None:
+        engine._mode_push.next_attempt_at = 0.0
+    if engine._freq_push is not None:
+        engine._freq_push.next_attempt_at = 0.0
 
 
 def _settle_and_capture_baseline(engine: SyncEngine) -> None:
@@ -222,7 +238,12 @@ def test_genuinely_new_mode_triggers_exactly_one_push():
 
     status.mode = "LSB"
     _clear_holdoff(engine)
-    asyncio.run(engine._tick())
+    asyncio.run(engine._tick())  # arms the reverse mode debounce, no push yet
+    assert stub_rig.set_modes == []
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+
+    asyncio.run(engine._tick())  # debounce elapsed -> pushes once
     # Base mode changed (USB -> LSB, StubReverseRig's own state.mode
     # never mutates) -> rig default passband (None), not the rig's
     # existing 2700.
@@ -250,6 +271,11 @@ def test_reverse_mode_push_reuses_rig_passband_when_base_mode_unchanged():
     engine._reverse_baseline_captured = True
     engine._last_observed_mode_key = "LSB"
     engine._last_pushed_to_websdr_mode = "LSB"
+    # Bypass the mode debounce -- pretend "USB" has already been stable
+    # long enough, since this test isolates the passband decision, not
+    # the debounce timing (already covered elsewhere).
+    engine._pending_reverse_mode = "USB"
+    engine._pending_reverse_mode_since = 0.0
 
     asyncio.run(engine._reverse_sync_tick(status, stub_rig.state))
 
@@ -294,10 +320,13 @@ def test_baseline_freq_prevents_yank_to_websdr_default_after_forward_failure():
     assert stub_rig.set_modes == []
 
 
-def test_rejected_freq_reverse_push_is_not_retried_every_tick():
-    """Regression: a persistently-rejected value must be latched as
-    'already considered' so it doesn't re-fire set_freq() (and, for
-    flrig, its own poll-until-match budget) every single tick forever."""
+def test_rejected_freq_reverse_push_gives_up_after_max_attempts_and_reverts_to_rig():
+    """Regression: a persistently-unconfirmed value must not hammer
+    set_freq() forever, but also must not be latched as 'rejected
+    forever' after a single attempt -- the retry ladder tries several
+    times, spaced out, and once it gives up, reverts the WebSDR display
+    to match the rig's actual frequency (rig status is master) rather
+    than leaving a silent, permanent desync."""
     engine = make_engine()
     stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
     stub_rig.set_freq_result = False
@@ -307,12 +336,26 @@ def test_rejected_freq_reverse_push_is_not_retried_every_tick():
     _settle_and_capture_baseline(engine)
 
     status.freq_hz = 30000000  # rejected by the rig every time it's tried
-    for _ in range(5):
-        _clear_holdoff(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the reverse debounce, no push yet
+    assert stub_rig.set_freqs == []
+
+    for _ in range(REVERSE_PUSH_MAX_ATTEMPTS):
         _clear_reverse_debounce(engine)
+        _clear_push_backoff(engine)
+        _clear_holdoff(engine)
         asyncio.run(engine._tick())
 
-    assert stub_rig.set_freqs.count(30000000) == 1
+    assert stub_rig.set_freqs.count(30000000) == REVERSE_PUSH_MAX_ATTEMPTS
+    assert engine._freq_push is None  # ladder gave up, not left dangling
+    assert engine._reverse_sync_error is not None
+    assert engine._last_sent_freq is None  # forces forward re-assert of the rig's real freq
+
+    # Further ticks (page still stuck showing the same rejected value)
+    # must not keep retrying it.
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    assert stub_rig.set_freqs.count(30000000) == REVERSE_PUSH_MAX_ATTEMPTS
 
 
 def test_forward_push_echo_with_collapsed_mode_does_not_bounce_back():
@@ -418,7 +461,7 @@ def test_concurrent_reset_during_await_wins_over_stale_reverse_push():
     _clear_reverse_debounce(engine)
     _clear_holdoff(engine)
 
-    async def set_freq_that_resets(freq_hz):
+    async def set_freq_that_resets(freq_hz, verify_budget_s=None):
         # Simulates the attach supervisor's _reset_sync_latches() landing
         # while this call is in flight.
         engine._reset_sync_latches()
@@ -431,45 +474,126 @@ def test_concurrent_reset_during_await_wins_over_stale_reverse_push():
     assert engine._reverse_baseline_captured is False
 
 
-def test_stale_mode_rejection_warning_self_heals_once_rig_catches_up():
-    """Regression: a reverse mode push that set_mode() reported as
-    rejected (its own verify budget exhausted) can still, on real
-    hardware, land slightly later -- the next regular poll must clear
-    the stale warning once the rig's own state.mode confirms it,
-    instead of leaving a false "rejected" alarm displayed forever."""
+def test_mode_ladder_retries_and_succeeds_before_giving_up():
+    """A push that isn't confirmed on the first attempt but IS confirmed
+    on a later one (the rig just needed more time) must succeed cleanly,
+    not be treated as a permanent rejection -- this is the fix for real
+    hardware where a single ~0.5s verify window sometimes isn't quite
+    enough."""
     engine = make_engine()
     stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
     status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
     stub_driver = StubReverseDriver(status)
     engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
 
-    # Simulate an earlier tick that flagged a mode rejection.
-    engine._last_reverse_mode_reject_key = "LSB"
-    engine._reverse_sync_error = "Rig rejected mode 'LSB' pushed from WebSDR"
-
-    # The rig now reports the previously-rejected mode -- it caught up.
-    stub_rig.state.mode = "LSB"
+    stub_rig.set_mode_result = False  # first attempt "fails" (unconfirmed)
+    status.mode = "LSB"
     _clear_holdoff(engine)
-    asyncio.run(engine._tick())
+    asyncio.run(engine._tick())  # arms the mode debounce
 
-    assert engine._last_reverse_mode_reject_key is None
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # attempt 1: fails
+    assert stub_rig.set_modes == [("LSB", None)]
+    assert engine._mode_push is not None
+    assert engine._reverse_sync_error is None  # not final yet -- still retrying
+
+    stub_rig.set_mode_result = True  # the rig actually caught up
+    _clear_push_backoff(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # attempt 2: succeeds
+
+    assert stub_rig.set_modes == [("LSB", None), ("LSB", None)]
+    assert engine._mode_push is None
     assert engine._reverse_sync_error is None
 
 
-def test_stale_freq_rejection_warning_self_heals_once_rig_catches_up():
+def test_mode_ladder_gives_up_after_max_attempts_and_reverts_to_rig():
+    """Regression: a mode push that never gets confirmed must not be
+    latched as 'rejected forever' after one try (the original bug this
+    session found live) -- the retry ladder tries several times, spaced
+    out, and if it still can't confirm, reverts the WebSDR display to
+    match the rig's actual mode (rig status is master) instead of
+    leaving the two sides silently, permanently disagreeing."""
     engine = make_engine()
     stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_rig.set_mode_result = False
     status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
     stub_driver = StubReverseDriver(status)
     engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
 
-    engine._last_reverse_freq_reject_key = 14200000
-    engine._reverse_sync_error = "Rig rejected frequency 14200000 Hz from WebSDR"
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce, no push yet
+    assert stub_rig.set_modes == []
 
-    # Within tolerance of the previously-rejected value -- it caught up.
-    stub_rig.state.freq_hz = 14200000 + REVERSE_FREQ_CHANGE_THRESHOLD_HZ
+    for _ in range(REVERSE_PUSH_MAX_ATTEMPTS):
+        _clear_reverse_mode_debounce(engine)
+        _clear_push_backoff(engine)
+        _clear_holdoff(engine)
+        asyncio.run(engine._tick())
+
+    assert stub_rig.set_modes.count(("LSB", None)) == REVERSE_PUSH_MAX_ATTEMPTS
+    assert engine._mode_push is None  # ladder gave up, not left dangling
+    assert engine._reverse_sync_error is not None
+    assert engine._last_sent_mode_key is None  # forces forward re-assert of the rig's real mode
+
+    # Further ticks (page still stuck showing the same rejected mode)
+    # must not keep retrying it.
     _clear_holdoff(engine)
     asyncio.run(engine._tick())
+    assert stub_rig.set_modes.count(("LSB", None)) == REVERSE_PUSH_MAX_ATTEMPTS
 
-    assert engine._last_reverse_freq_reject_key is None
-    assert engine._reverse_sync_error is None
+
+def test_rapid_mode_switch_supersedes_stale_in_flight_push():
+    """Regression: rapidly clicking through several modes on the WebSDR
+    page (the user's own reported trigger for the live bug) must not
+    leave the engine chasing -- and eventually warning about -- a value
+    already clicked past. An in-flight retry ladder targeting a
+    since-abandoned mode is dropped silently, not retried to exhaustion."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_rig.set_mode_result = False  # nothing ever confirms
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "CW"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms debounce for CW
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # attempt 1 for CW: fails, ladder now in flight
+    assert stub_rig.set_modes == [("CW", None)]
+    assert engine._mode_push is not None
+    assert engine._mode_push.target == "CW"
+
+    # User clicks a different mode before CW's ladder resolves.
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # drops the stale CW ladder; arms LSB's debounce instead
+
+    assert engine._mode_push is None
+    assert stub_rig.set_modes == [("CW", None)]  # no further CW attempts, no LSB attempt yet (debouncing)
+
+
+def test_reverse_sync_pending_text_blank_on_first_attempt_shown_from_second():
+    """The grey, informational 'still retrying' text must not appear
+    after a single unconfirmed readback (routine CAT-bus latency on some
+    rigs) -- only once a second attempt is actually underway."""
+    engine = make_engine()
+    assert engine._reverse_sync_pending_text() is None
+
+    from sdrsync.sync.engine import _ReversePush
+
+    engine._mode_push = _ReversePush(target="LSB", attempts=0)
+    assert engine._reverse_sync_pending_text() is None  # attempt 1 in flight -- still quiet
+
+    engine._mode_push = _ReversePush(target="LSB", attempts=1)
+    text = engine._reverse_sync_pending_text()
+    assert text is not None
+    assert "LSB" in text
+    assert f"2/{REVERSE_PUSH_MAX_ATTEMPTS}" in text

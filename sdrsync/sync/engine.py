@@ -79,6 +79,29 @@ REVERSE_FREQ_DEBOUNCE_S = 0.5
 # Coarser than the forward direction's FREQ_CHANGE_THRESHOLD_HZ -- a
 # waterfall click readback isn't pixel-exact.
 REVERSE_FREQ_CHANGE_THRESHOLD_HZ = 50
+# Debounces a discrete mode click/button the same way REVERSE_FREQ_DEBOUNCE_S
+# debounces a continuous drag -- shorter than the freq value since a mode
+# click is terminal (no "still moving" case to wait out), this only exists
+# to swallow a double-click or an immediate self-correction, not to add
+# latency to the common single-click case. NOT what fixes rapid clicking
+# through several modes in a row -- that's handled by the retry ladder's
+# target-supersede logic below (a stale in-flight push gets dropped, not
+# chased), so don't "fix" perceived chasing by raising this value.
+REVERSE_MODE_DEBOUNCE_S = 0.35
+# Retry ladder for a reverse push (mode or frequency) that rigctld/flrig's
+# own readback verification didn't confirm on the first try -- real CAT-bus
+# hardware can be slower than any single verification window budgets for,
+# especially right after the user rapidly changed modes/frequency more than
+# once. Each attempt gets its own short verify window (passed to
+# RigClient.set_mode()/set_freq() as verify_budget_s, overriding their
+# module-level default), with a small pause between attempts. Total
+# worst-case time to give up: REVERSE_PUSH_MAX_ATTEMPTS *
+# REVERSE_PUSH_ATTEMPT_VERIFY_S + sum(REVERSE_PUSH_BACKOFF_S) -- tuned to
+# land around ~2s, not the 6+ seconds a naive "more attempts, same budget
+# each" scaling would produce.
+REVERSE_PUSH_ATTEMPT_VERIFY_S = 0.5
+REVERSE_PUSH_MAX_ATTEMPTS = 3
+REVERSE_PUSH_BACKOFF_S = (0.25, 0.25)  # gap after attempt 1, attempt 2
 
 
 class WebViewHost(Protocol):
@@ -109,9 +132,19 @@ class RigClient(Protocol):
 
     async def close(self) -> None: ...
 
-    async def set_freq(self, freq_hz: int) -> bool: ...
+    async def set_freq(self, freq_hz: int, verify_budget_s: Optional[float] = None) -> bool: ...
 
-    async def set_mode(self, mode_name: str, passband_hz: Optional[int]) -> bool: ...
+    async def set_mode(self, mode_name: str, passband_hz: Optional[int], verify_budget_s: Optional[float] = None) -> bool: ...
+
+
+@dataclass
+class _ReversePush:
+    """Tracks one in-flight (or backing-off-between-attempts) reverse-sync
+    retry ladder for a single axis (mode OR frequency) across ticks.
+    target is the value being pushed (str hamlib mode name, or int Hz)."""
+    target: object
+    attempts: int = 0
+    next_attempt_at: float = 0.0
 
 
 @dataclass
@@ -129,11 +162,16 @@ class StatusSnapshot(GuiMessage):
     websdr_active: bool = False
     websdr: Optional[WebSDRStatus] = None
     fatal_error: Optional[str] = None
-    # v11 reverse sync (WebSDR -> rig): set when the rig rejects a value
-    # pushed from the WebSDR page, cleared on the next successful reverse
-    # push or fresh WebSDR attach. No retry loop of its own -- a rejected
-    # SET naturally gets another chance the next time the page changes.
+    # v11 reverse sync (WebSDR -> rig): reverse_sync_error is FINAL/
+    # actionable (the retry ladder gave up after REVERSE_PUSH_MAX_ATTEMPTS
+    # and reverted the WebSDR page to match the rig -- rig status is
+    # master), cleared on the next successful reverse push or fresh WebSDR
+    # attach. reverse_sync_pending is transient/informational (an attempt
+    # already failed once and a retry is queued) -- deliberately blank on
+    # the very first attempt, since a single unconfirmed readback is
+    # routine CAT-bus latency on some rigs, not worth surfacing.
     reverse_sync_error: Optional[str] = None
+    reverse_sync_pending: Optional[str] = None
 
 
 class SyncEngine:
@@ -230,11 +268,20 @@ class SyncEngine:
         # _reverse_sync_tick()'s docstring for why the first observation
         # must never be treated as a user action.
         self._reverse_baseline_captured: bool = False
-        # Rate-limits repeated-identical-rejection logging, same pattern
-        # as each driver's own _last_unmapped_mode. Separate keys since a
-        # mode rejection and a frequency rejection are unrelated events.
-        self._last_reverse_mode_reject_key: Optional[str] = None
-        self._last_reverse_freq_reject_key: Optional[int] = None
+        # Rate-limits repeated-identical-unmapped-mode logging, same
+        # pattern as each driver's own _last_unmapped_mode -- distinct
+        # from the retry ladders below, which handle genuinely mapped
+        # values the rig didn't confirm, not values with no mapping at all.
+        self._last_unmapped_reverse_mode: Optional[str] = None
+        # In-flight (or backing-off-between-attempts) retry ladders --
+        # None means no push is currently being attempted for that axis.
+        # See REVERSE_PUSH_* constants and _reverse_sync_tick().
+        self._mode_push: Optional[_ReversePush] = None
+        self._freq_push: Optional[_ReversePush] = None
+        # Debounces a discrete mode click the same way _pending_reverse_freq/
+        # _pending_reverse_freq_since debounce a continuous drag.
+        self._pending_reverse_mode: Optional[str] = None
+        self._pending_reverse_mode_since: float = 0.0
         self._reverse_sync_error: Optional[str] = None
         # Bumped by _reset_sync_latches() -- _reverse_sync_tick() checks
         # this after each await (set_mode()/set_freq() to the rig) before
@@ -308,12 +355,30 @@ class SyncEngine:
             rig_error=self._rig_error,
             websdr_active=self._websdr_active,
             reverse_sync_error=self._reverse_sync_error,
+            reverse_sync_pending=self._reverse_sync_pending_text(),
             **overrides,
         )
         try:
             self.status_queue.put_nowait(snapshot)
         except queue.Full:
             pass
+
+    def _reverse_sync_pending_text(self) -> Optional[str]:
+        """Computed fresh on every publish (not a stored field) so it can
+        never go stale across the ladder's several return points. Blank
+        on attempt 1 deliberately -- a single unconfirmed readback is
+        routine CAT-bus latency on some rigs, not worth alarming over."""
+        if self._mode_push is not None and self._mode_push.attempts >= 1:
+            return (
+                f"Setting mode {self._mode_push.target!r} on the rig... "
+                f"(attempt {self._mode_push.attempts + 1}/{REVERSE_PUSH_MAX_ATTEMPTS})"
+            )
+        if self._freq_push is not None and self._freq_push.attempts >= 1:
+            return (
+                f"Setting frequency {self._freq_push.target} Hz on the rig... "
+                f"(attempt {self._freq_push.attempts + 1}/{REVERSE_PUSH_MAX_ATTEMPTS})"
+            )
+        return None
 
     def publish_fatal_error(self, message: str) -> None:
         """Thread-safe: status_queue is a plain queue.Queue, safe to call
@@ -609,8 +674,11 @@ class SyncEngine:
         self._pending_reverse_freq_since = 0.0
         self._last_observed_mode_key = None
         self._reverse_baseline_captured = False
-        self._last_reverse_mode_reject_key = None
-        self._last_reverse_freq_reject_key = None
+        self._last_unmapped_reverse_mode = None
+        self._mode_push = None
+        self._freq_push = None
+        self._pending_reverse_mode = None
+        self._pending_reverse_mode_since = 0.0
         self._reverse_sync_error = None
         self._sync_latch_generation += 1
 
@@ -678,54 +746,88 @@ class SyncEngine:
             self._reverse_reseed_due = False
             return
 
+        mode_did_work = False
         if obs_mode is None:
             # Unmapped WebSDR mode (e.g. KiwiSDR's sal/sau/sas/qam/drm/iq,
-            # or an OpenWebRX digital mode) -- rate-limited like the
-            # rejection case below, so a user parked on an unmapped mode
-            # doesn't spam the log every tick but does get one warning.
-            if websdr_status.mode != self._last_reverse_mode_reject_key:
-                self._last_reverse_mode_reject_key = websdr_status.mode
+            # or an OpenWebRX digital mode) -- rate-limited, so a user
+            # parked on an unmapped mode doesn't spam the log every tick.
+            if websdr_status.mode != self._last_unmapped_reverse_mode:
+                self._last_unmapped_reverse_mode = websdr_status.mode
                 logger.debug(
                     "WebSDR mode %r has no reverse hamlib mapping; frequency reverse-sync continues",
                     websdr_status.mode,
                 )
-        elif obs_mode != self._last_pushed_to_websdr_mode and obs_mode != self._last_observed_mode_key:
-            self._last_observed_mode_key = obs_mode
-            # Preserve the rig's current filter width when only the
-            # page's narrow/wide variant changed within the same base
-            # mode (the page can't tell us which variant it wants --
-            # WebSDRStatus.mode is already base-collapsed) -- 0 (rig
-            # default) only when the base mode itself actually changed.
-            passband_hz = state.passband_hz if obs_mode == state.mode else None
-            ok = await self._rig.set_mode(obs_mode, passband_hz)
-            if generation != self._sync_latch_generation:
-                return  # superseded by a concurrent reset while awaiting
-            if ok:
-                # Also updated here (not just via the reseed path) so a
-                # repeat of this same now-applied value on a later tick
-                # isn't mistaken for a fresh user edit and re-pushed.
-                self._last_pushed_to_websdr_mode = obs_mode
-                self._forward_push_completed_at = time.monotonic()
-                self._reverse_sync_error = None
-                self._last_reverse_mode_reject_key = None
-            else:
-                # Latch the rejected value as "already considered" even
-                # on failure -- otherwise an unchanged page value would
-                # re-pass every gate and re-fire set_mode() every single
-                # tick forever (a real per-tick hammering loop, worse for
-                # flrig where each attempt costs its own poll-until-match
-                # budget). A later, genuinely different page value still
-                # differs from this and is free to try again.
-                self._last_observed_mode_key = obs_mode
-                if obs_mode != self._last_reverse_mode_reject_key:
-                    self._last_reverse_mode_reject_key = obs_mode
-                    self._reverse_sync_error = f"Rig rejected mode {obs_mode!r} pushed from WebSDR"
-                    logger.warning(self._reverse_sync_error)
-                else:
-                    logger.debug("Rig still rejecting mode %r from WebSDR", obs_mode)
-            return  # per-tick budget cap: mode takes priority over frequency this tick
         else:
-            self._last_observed_mode_key = obs_mode
+            # The page moved on to a different mode while a push was
+            # still being retried (most often rapid clicking through
+            # several modes) -- the in-flight target is stale. Drop it
+            # rather than keep chasing a value the user already clicked
+            # past; this is also what prevents a stale rejection warning
+            # from an abandoned intermediate click lingering on screen
+            # after the user has already moved on to something else.
+            if self._mode_push is not None and obs_mode != self._mode_push.target:
+                self._mode_push = None
+
+            if obs_mode != self._pending_reverse_mode:
+                self._pending_reverse_mode = obs_mode
+                self._pending_reverse_mode_since = time.monotonic()
+
+            if obs_mode != self._last_pushed_to_websdr_mode and obs_mode != self._last_observed_mode_key:
+                if self._mode_push is None:
+                    if time.monotonic() - self._pending_reverse_mode_since >= REVERSE_MODE_DEBOUNCE_S:
+                        self._mode_push = _ReversePush(target=obs_mode)
+                push = self._mode_push
+                if push is not None and time.monotonic() >= push.next_attempt_at:
+                    # Preserve the rig's current filter width when only the
+                    # page's narrow/wide variant changed within the same base
+                    # mode (the page can't tell us which variant it wants --
+                    # WebSDRStatus.mode is already base-collapsed) -- 0 (rig
+                    # default) only when the base mode itself actually
+                    # changed. Recomputed fresh each attempt from this
+                    # tick's state, not captured once at ladder start -- the
+                    # rig may have partially moved between attempts.
+                    passband_hz = state.passband_hz if obs_mode == state.mode else None
+                    ok = await self._rig.set_mode(obs_mode, passband_hz, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
+                    if generation != self._sync_latch_generation:
+                        return  # superseded by a concurrent reset while awaiting
+                    mode_did_work = True
+                    push.attempts += 1
+                    if ok:
+                        self._last_pushed_to_websdr_mode = obs_mode
+                        self._last_observed_mode_key = obs_mode
+                        self._forward_push_completed_at = time.monotonic()
+                        self._reverse_sync_error = None
+                        self._mode_push = None
+                    elif push.attempts >= REVERSE_PUSH_MAX_ATTEMPTS:
+                        # Gave it several tries, spaced out, not just one
+                        # shot -- genuinely not landing. Rig status is
+                        # master: rather than leave the two sides silently
+                        # disagreeing forever, revert the WebSDR page to
+                        # match the rig's actual mode (force the forward
+                        # direction to re-assert it on the very next tick)
+                        # instead of waiting indefinitely for a click that
+                        # isn't sticking.
+                        logger.warning(
+                            "Rig did not confirm mode %r after %d attempts -- "
+                            "reverting WebSDR to match the rig's actual mode %r",
+                            obs_mode, push.attempts, state.mode,
+                        )
+                        self._reverse_sync_error = (
+                            f"Could not set mode {obs_mode!r} on the rig -- WebSDR reverted to match the rig"
+                        )
+                        self._last_observed_mode_key = obs_mode
+                        self._last_sent_mode_key = None
+                        self._mode_push = None
+                    else:
+                        push.next_attempt_at = time.monotonic() + REVERSE_PUSH_BACKOFF_S[
+                            min(push.attempts - 1, len(REVERSE_PUSH_BACKOFF_S) - 1)
+                        ]
+            else:
+                self._last_observed_mode_key = obs_mode
+                self._mode_push = None
+
+        if mode_did_work:
+            return  # per-tick budget cap: mode takes priority over frequency this tick
 
         if obs_freq is None:
             return
@@ -747,28 +849,39 @@ class SyncEngine:
             self._last_observed_freq is not None
             and abs(self._pending_reverse_freq - self._last_observed_freq) <= REVERSE_FREQ_CHANGE_THRESHOLD_HZ
         ):
+            self._freq_push = None
             return
 
-        # Latch as "considered" before the await, regardless of outcome
-        # (mirrors the mode branch's rejection handling above) -- an
-        # unchanged page value must not re-trigger set_freq() every tick
-        # forever after a genuine rejection.
-        self._last_observed_freq = self._pending_reverse_freq
         pending_freq = self._pending_reverse_freq
-        ok = await self._rig.set_freq(pending_freq)
+        if self._freq_push is None or self._freq_push.target != pending_freq:
+            self._freq_push = _ReversePush(target=pending_freq)
+        push = self._freq_push
+        if now < push.next_attempt_at:
+            return
+
+        ok = await self._rig.set_freq(pending_freq, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
         if generation != self._sync_latch_generation:
             return  # superseded by a concurrent reset while awaiting
+        push.attempts += 1
         if ok:
             self._last_pushed_to_websdr_freq = pending_freq
             self._forward_push_completed_at = time.monotonic()
             self._reverse_sync_error = None
-            self._last_reverse_freq_reject_key = None
-        elif pending_freq != self._last_reverse_freq_reject_key:
-            self._last_reverse_freq_reject_key = pending_freq
-            self._reverse_sync_error = f"Rig rejected frequency {pending_freq} Hz from WebSDR"
-            logger.warning(self._reverse_sync_error)
+            self._freq_push = None
+        elif push.attempts >= REVERSE_PUSH_MAX_ATTEMPTS:
+            logger.warning(
+                "Rig did not confirm frequency %d Hz after %d attempts -- "
+                "reverting WebSDR to match the rig's actual frequency %r Hz",
+                pending_freq, push.attempts, state.freq_hz,
+            )
+            self._reverse_sync_error = (
+                f"Could not set frequency {pending_freq} Hz on the rig -- WebSDR reverted to match the rig"
+            )
+            self._last_observed_freq = pending_freq
+            self._last_sent_freq = None
+            self._freq_push = None
         else:
-            logger.debug("Rig still rejecting frequency %d Hz from WebSDR", pending_freq)
+            push.next_attempt_at = now + REVERSE_PUSH_BACKOFF_S[min(push.attempts - 1, len(REVERSE_PUSH_BACKOFF_S) - 1)]
 
     async def _tick(self) -> None:
         """Runs one poll iteration. A no-op (beyond publishing a status
@@ -801,36 +914,6 @@ class SyncEngine:
         self._rig_connect_deadline = None
         state = await self._rig.get_state()
 
-        # A reverse push flagged as "rejected" can, on real hardware,
-        # actually have succeeded slightly slower than set_mode()/
-        # set_freq()'s own readback-verification budget allowed for --
-        # self-heal the stale warning the moment a later regular poll
-        # (this one) shows the rig's live state now matches what was
-        # pushed, rather than leaving a false alarm displayed
-        # indefinitely (it otherwise only clears on the next distinct
-        # successful reverse push or a fresh WebSDR attach). Runs
-        # unconditionally, using state already fetched this tick -- no
-        # extra round trip, and no need to wait for a reverse-eligible
-        # tick to notice.
-        if self._last_reverse_mode_reject_key is not None and state.mode == self._last_reverse_mode_reject_key:
-            logger.info(
-                "Rig now reports mode %r, earlier flagged as rejected -- it caught up, clearing the warning",
-                state.mode,
-            )
-            self._last_reverse_mode_reject_key = None
-            self._reverse_sync_error = None
-        if (
-            self._last_reverse_freq_reject_key is not None
-            and state.freq_hz is not None
-            and abs(state.freq_hz - self._last_reverse_freq_reject_key) <= REVERSE_FREQ_CHANGE_THRESHOLD_HZ
-        ):
-            logger.info(
-                "Rig now reports frequency %d Hz, earlier flagged as rejected -- it caught up, clearing the warning",
-                state.freq_hz,
-            )
-            self._last_reverse_freq_reject_key = None
-            self._reverse_sync_error = None
-
         if self._websdr_active and self._driver is not None:
             # Captured before any awaits below, for the reverse gate's
             # own PTT check further down -- see its comment for why.
@@ -856,7 +939,13 @@ class SyncEngine:
 
             if not transmitting:
                 mode_key = (state.mode, state.passband_hz) if state.mode is not None else None
-                if mode_key is not None and mode_key != self._last_sent_mode_key:
+                # Suppress the forward push while a reverse-sync mode
+                # ladder is actively retrying -- the rig still reports its
+                # OLD mode during that window, and pushing it back onto
+                # the WebSDR page would change obs_mode, which would then
+                # look like the user abandoned their own click and
+                # supersede the very push being retried.
+                if mode_key is not None and mode_key != self._last_sent_mode_key and self._mode_push is None:
                     # Only latch as "sent" if the driver actually applied it
                     # -- it may have been a no-op (not attached, e.g.
                     # mid-outage) or a failed page call, and either would
@@ -882,6 +971,7 @@ class SyncEngine:
                         now - self._pending_freq_since >= FREQ_DEBOUNCE_S
                         and (self._last_sent_freq is None
                              or abs(self._pending_freq - self._last_sent_freq) > FREQ_CHANGE_THRESHOLD_HZ)
+                        and self._freq_push is None  # see the mode ladder's identical guard above
                     ):
                         if await self._driver.tune_hz(self._pending_freq):
                             self._last_sent_freq = self._pending_freq

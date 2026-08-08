@@ -284,17 +284,21 @@ class FlrigClient:
         except (*_RPC_ERRORS, asyncio.TimeoutError):
             return None
 
-    async def set_freq(self, freq_hz: int) -> bool:
+    async def set_freq(self, freq_hz: int, verify_budget_s: Optional[float] = None) -> bool:
         """Reverse-sync (WebSDR -> rig). See module docstring: set_vfoA's
         RPC response is not a reliable success signal, so this verifies
         via a bounded poll-until-match readback of get_freq() instead.
-        Bounded by wall clock (SET_VERIFY_BUDGET_S), not attempt count --
-        see that constant's comment for why."""
+        Bounded by wall clock, not attempt count -- see SET_VERIFY_BUDGET_S's
+        comment for why. verify_budget_s overrides the module default
+        (used by sync/engine.py's reverse-sync retry ladder, which wants a
+        shorter per-attempt budget and retries several times itself rather
+        than one long wait)."""
         if self._proxy is None:
             return False
         freq_hz = int(freq_hz)
+        budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         await self._call(lambda: self._proxy.rig.set_vfoA(freq_hz))
-        deadline = asyncio.get_running_loop().time() + SET_VERIFY_BUDGET_S
+        deadline = asyncio.get_running_loop().time() + budget
         first = True
         while asyncio.get_running_loop().time() < deadline:
             if not first:
@@ -306,21 +310,23 @@ class FlrigClient:
             actual = parse_freq_response(resp)
             if actual is not None and abs(actual - freq_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
                 return True
-        logger.warning("flrig did not confirm set_vfoA(%d) within %.2fs", freq_hz, SET_VERIFY_BUDGET_S)
+        logger.warning("flrig did not confirm set_vfoA(%d) within %.2fs", freq_hz, budget)
         return False
 
-    async def set_mode(self, mode_name: str, passband_hz: Optional[int]) -> bool:
+    async def set_mode(self, mode_name: str, passband_hz: Optional[int], verify_budget_s: Optional[float] = None) -> bool:
         """Reverse-sync (WebSDR -> rig). passband_hz is accepted for
         interface parity with RigctldClient.set_mode but unused -- flrig's
         rig.set_mode takes only a mode name (bandwidth is a separate,
         unrelated RPC on this backend). Verified via a bounded
         poll-until-match readback of get_mode(), same reasoning as
         set_freq() -- set_mode's own RPC response silently no-ops on an
-        unrecognized mode string rather than erroring."""
+        unrecognized mode string rather than erroring. verify_budget_s: see
+        set_freq()."""
         if self._proxy is None:
             return False
+        budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         await self._call(lambda: self._proxy.rig.set_mode(mode_name))
-        deadline = asyncio.get_running_loop().time() + SET_VERIFY_BUDGET_S
+        deadline = asyncio.get_running_loop().time() + budget
         first = True
         while asyncio.get_running_loop().time() < deadline:
             if not first:
@@ -332,7 +338,7 @@ class FlrigClient:
             actual = parse_mode_response(resp)
             if actual is not None and actual == mode_name:
                 return True
-        logger.warning("flrig did not confirm set_mode(%r) within %.2fs", mode_name, SET_VERIFY_BUDGET_S)
+        logger.warning("flrig did not confirm set_mode(%r) within %.2fs", mode_name, budget)
         return False
 
     async def get_state(self) -> RigState:

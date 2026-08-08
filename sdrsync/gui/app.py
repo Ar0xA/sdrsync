@@ -315,6 +315,16 @@ class MainFrame(wx.Frame):
         grid.Add(self.reverse_sync_error_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
         row += 1
 
+        # Transient/informational (grey) -- a reverse-sync retry is in
+        # progress, distinct from reverse_sync_error_text above (red,
+        # final/actionable -- the retry ladder gave up). Independent
+        # controls since a mode retry and a stale freq error (or vice
+        # versa) can be true at the same time.
+        self.reverse_sync_pending_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
+        self.reverse_sync_pending_text.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        grid.Add(self.reverse_sync_pending_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
+        row += 1
+
         self.websdr_preflight_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
         grid.Add(self.websdr_preflight_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
         row += 1
@@ -1024,6 +1034,7 @@ class MainFrame(wx.Frame):
             self.websdr_driver_text.SetLabel("-")
             self.rig_conn_text.SetLabel("error")
             _set_wrapped(self.reverse_sync_error_text, "")
+            _set_wrapped(self.reverse_sync_pending_text, "")
             self._websdr_active = False
             self._websdr_connected = False
             self._active_websdr_site = None
@@ -1096,6 +1107,7 @@ class MainFrame(wx.Frame):
                     self.websdr_audio_text.SetLabel("streaming" if ws.audio_active else "silent")
                 _set_wrapped(self.websdr_err_text, ws.last_error or "")
         _set_wrapped(self.reverse_sync_error_text, snap.reverse_sync_error or "")
+        _set_wrapped(self.reverse_sync_pending_text, snap.reverse_sync_pending or "")
         self._update_websdr_controls()
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:
