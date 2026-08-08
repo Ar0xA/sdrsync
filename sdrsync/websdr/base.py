@@ -75,7 +75,27 @@ class WebSDRDriver(Protocol):
         ...
 
     async def get_status(self) -> WebSDRStatus:
-        """Current status for display in the GUI. Never used to drive the rig (one-way sync)."""
+        """Current status for display in the GUI. Also the source data for
+        reverse sync (WebSDR -> rig, v11) -- see hamlib_mode_from_status()/
+        rig_freq_from_status() below, fed by this same call's result with
+        no extra page round-trip."""
+        ...
+
+    def hamlib_mode_from_status(self, status: WebSDRStatus) -> Optional[str]:
+        """Reverse-direction (WebSDR -> rig): map this status snapshot's
+        already-normalized mode string to a canonical hamlib mode name.
+        None if unmapped -- caller should skip the reverse push and log,
+        not raise. Pure/sync (no page access) -- status is expected to be
+        a value already returned by get_status() in the same tick."""
+        ...
+
+    def rig_freq_from_status(self, status: WebSDRStatus) -> Optional[int]:
+        """Reverse-direction (WebSDR -> rig): this status snapshot's
+        frequency, converted to rig-native Hz (i.e. with cw_offset_hz
+        un-applied when hamlib_mode_from_status(status) is 'CW' --
+        symmetric to tune_hz()'s forward application). None if the
+        status has no usable frequency. Pure/sync, same status-snapshot
+        contract as hamlib_mode_from_status()."""
         ...
 
     async def close(self) -> None:

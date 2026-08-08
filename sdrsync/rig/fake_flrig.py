@@ -1,11 +1,12 @@
 """Minimal fake flrig XML-RPC server, for smoke-testing without real
 flrig software.
 
-Registers just the 5 RPC methods sdrsync.rig.flrig.FlrigClient actually
-calls: main.get_version, rig.get_vfo, rig.get_mode, rig.get_bw,
-rig.get_ptt. Run standalone (`python -m sdrsync.rig.fake_flrig`) to get
-an interactive prompt that lets you change frequency/mode/PTT while the
-rest of the app polls this server exactly like a real flrig instance.
+Registers the RPC methods sdrsync.rig.flrig.FlrigClient actually calls:
+main.get_version, rig.get_vfo, rig.get_mode, rig.get_bw, rig.get_ptt,
+and (v11 reverse sync) rig.set_vfoA, rig.set_mode. Run standalone
+(`python -m sdrsync.rig.fake_flrig`) to get an interactive prompt that
+lets you change frequency/mode/PTT while the rest of the app polls this
+server exactly like a real flrig instance.
 
 Threading note: xmlrpc.server.SimpleXMLRPCServer is a synchronous
 socketserver.TCPServer with no native asyncio integration (unlike
@@ -47,6 +48,33 @@ class FakeFlrigState:
         self.mode = "USB"
         self.passband_hz = 2400
         self.ptt = "0"
+        # v11 reverse-sync (WebSDR -> rig) SET testing, mirrors real
+        # flrig's own confirmed-unreliable set_vfoA/set_mode RPC
+        # responses (see flrig.py's module docstring) -- both test flags
+        # below leave the RPC call itself succeeding (no exception),
+        # only the resulting *state change* behaves differently, since
+        # that's what FlrigClient's poll-until-match readback actually
+        # has to contend with.
+        #
+        # When True, set_vfoA()/set_mode() are accepted but never change
+        # state at all -- exercises FlrigClient.set_freq()/set_mode()'s
+        # poll-until-match exhaustion/give-up path (a genuinely rejected
+        # value, e.g. outside the rig's range).
+        self.set_rejected = False
+        # When > 0, a set_vfoA()/set_mode() call doesn't apply
+        # immediately -- it's staged as pending and only takes effect
+        # after this many subsequent get_vfo()/get_mode() polls,
+        # simulating real CAT-bus turnaround lag (flrig's own cached
+        # state is refreshed by its internal rig-polling loop, not
+        # instantaneously on the SET RPC's reply). Exercises the
+        # poll-until-match readback's actual success path -- the case
+        # that matters most in real use, unlike the permanent-reject
+        # flag above.
+        self.transient_delay_polls = 0
+        self._pending_freq_hz: "int | None" = None
+        self._pending_freq_countdown = 0
+        self._pending_mode: "str | None" = None
+        self._pending_mode_countdown = 0
 
 
 class _FlrigXMLRPCServer(SimpleXMLRPCServer):
@@ -60,12 +88,56 @@ class _FlrigXMLRPCServer(SimpleXMLRPCServer):
     allow_reuse_address = False
 
 
+def _get_vfo(state: FakeFlrigState) -> str:
+    if state._pending_freq_hz is not None:
+        state._pending_freq_countdown -= 1
+        if state._pending_freq_countdown <= 0:
+            state.freq_hz = state._pending_freq_hz
+            state._pending_freq_hz = None
+    return str(state.freq_hz)
+
+
+def _get_mode(state: FakeFlrigState) -> str:
+    if state._pending_mode is not None:
+        state._pending_mode_countdown -= 1
+        if state._pending_mode_countdown <= 0:
+            state.mode = state._pending_mode
+            state._pending_mode = None
+    return state.mode
+
+
+def _set_vfoA(state: FakeFlrigState, freq_hz) -> int:
+    # Real flrig's set_vfoA success path never sets a meaningful `result`
+    # either -- the RPC call always "succeeds" from the caller's
+    # perspective, only the resulting state (or lack of it) differs.
+    if not state.set_rejected:
+        freq_hz = int(freq_hz)
+        if state.transient_delay_polls > 0:
+            state._pending_freq_hz = freq_hz
+            state._pending_freq_countdown = state.transient_delay_polls
+        else:
+            state.freq_hz = freq_hz
+    return 0
+
+
+def _set_mode(state: FakeFlrigState, mode_name) -> int:
+    if not state.set_rejected:
+        if state.transient_delay_polls > 0:
+            state._pending_mode = mode_name
+            state._pending_mode_countdown = state.transient_delay_polls
+        else:
+            state.mode = mode_name
+    return 0
+
+
 def _register_methods(server: _FlrigXMLRPCServer, state: FakeFlrigState) -> None:
     server.register_function(lambda: FLRIG_MOCK_VERSION, "main.get_version")
-    server.register_function(lambda: str(state.freq_hz), "rig.get_vfo")
-    server.register_function(lambda: state.mode, "rig.get_mode")
+    server.register_function(lambda: _get_vfo(state), "rig.get_vfo")
+    server.register_function(lambda: _get_mode(state), "rig.get_mode")
     server.register_function(lambda: [str(state.passband_hz), ""], "rig.get_bw")
     server.register_function(lambda: int(state.ptt), "rig.get_ptt")
+    server.register_function(lambda freq_hz: _set_vfoA(state, freq_hz), "rig.set_vfoA")
+    server.register_function(lambda mode_name: _set_mode(state, mode_name), "rig.set_mode")
 
 
 class FlrigMockServerHandle:

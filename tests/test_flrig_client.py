@@ -55,6 +55,101 @@ def test_get_bandwidth_uses_only_element_zero_of_dual_dsp_response():
     asyncio.run(run())
 
 
+def test_set_freq_success_applies_and_confirms():
+    async def run():
+        handle, state = await start_server(port=0)
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_freq(7074000) is True
+            assert state.freq_hz == 7074000
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_mode_success_applies_and_confirms():
+    async def run():
+        handle, state = await start_server(port=0)
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_mode("LSB", None) is True
+            assert state.mode == "LSB"
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_freq_permanent_rejection_gives_up_after_bounded_polling():
+    """set_rejected leaves state unchanged forever -- set_freq() must
+    exhaust its bounded poll-until-match attempts and return False, not
+    hang or retry indefinitely."""
+    async def run():
+        handle, state = await start_server(port=0)
+        state.set_rejected = True
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            start = time.monotonic()
+            result = await asyncio.wait_for(client.set_freq(7074000), timeout=5.0)
+            elapsed = time.monotonic() - start
+            assert result is False
+            assert state.freq_hz == 14074000  # unchanged
+            assert elapsed < 3.0  # bounded, not hung
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_mode_transient_delay_succeeds_once_state_catches_up():
+    """The case that matters most in real use: flrig's cached get_mode()
+    state lags a few polls behind a genuinely-accepted set_mode() call
+    (real CAT-bus turnaround), not a permanent rejection -- the
+    poll-until-match readback loop must ride this out and still report
+    success, not give up on the first stale read."""
+    async def run():
+        handle, state = await start_server(port=0)
+        state.transient_delay_polls = 2
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_mode("CW", None) is True
+            assert state.mode == "CW"
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_freq_transient_delay_succeeds_once_state_catches_up():
+    async def run():
+        handle, state = await start_server(port=0)
+        state.transient_delay_polls = 2
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_freq(3573000) is True
+            assert state.freq_hz == 3573000
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_ensure_connected_recovers_after_mock_server_restart():
     """Closing and rebinding the fake server on the same port must not
     leave the client permanently broken -- proves the 'drop self._proxy

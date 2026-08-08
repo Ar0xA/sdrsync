@@ -81,6 +81,34 @@ def map_hamlib_mode(hamlib_mode: str, passband_hz: Optional[int]) -> Optional[st
     return base_mode
 
 
+# WebSDR base mode string (post-N-stripping, the exact set get_status()
+# already normalizes to -- see get_status()'s own mode-stripping logic)
+# -> canonical hamlib mode name. Reverse of _MODE_MAP above, but NOT
+# mechanically derived from it: _MODE_MAP is many-to-one (e.g. USB/
+# PKTUSB/DATA-U all forward-map to "USB"), so each collision here is an
+# explicit, deliberate choice of ONE canonical hamlib name to reverse-map
+# back to -- never the data/CW variants, which this driver's forward
+# direction also never sends to this site in the first place.
+_REVERSE_MODE_MAP: dict[str, str] = {
+    "USB": "USB",
+    "LSB": "LSB",
+    "CW": "CW",
+    "AM": "AM",
+    "AMSYNC": "SAM",
+    "FM": "FM",
+}
+
+
+def map_websdr_mode_to_hamlib(websdr_mode: Optional[str]) -> Optional[str]:
+    """Pure reverse mapping: a websdr.org base mode string (as already
+    normalized by get_status(), i.e. any trailing 'N' narrow suffix
+    already stripped) -> a canonical hamlib mode name. None if unknown
+    (caller should skip the reverse push and log, not raise)."""
+    if websdr_mode is None:
+        return None
+    return _REVERSE_MODE_MAP.get(websdr_mode.upper())
+
+
 class WebsdrOrgDriver:
     """WebSDRDriver implementation for the websdr.org (PA3FWM) WebSDR software family.
 
@@ -350,6 +378,29 @@ class WebsdrOrgDriver:
             )
         except PlaywrightError as e:
             logger.debug("mute() call failed (non-fatal): %s", e)
+
+    def _reverse_effective_hz(
+        self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]
+    ) -> Optional[int]:
+        """Un-applies cw_offset_hz for the reverse direction (WebSDR ->
+        rig), symmetric to tune_hz()'s forward application above. Takes
+        the mode as an explicit argument, sourced from the SAME status
+        snapshot map_websdr_mode_to_hamlib() derived it from -- NOT
+        self._current_mode, which only reflects this driver's own last
+        PUSHED mode and is stale by construction for reverse sync (a page
+        change the driver didn't itself push is exactly what reverse sync
+        exists to observe)."""
+        if observed_hz is None:
+            return None
+        if observed_hamlib_mode == "CW":
+            return observed_hz - self.cw_offset_hz
+        return observed_hz
+
+    def hamlib_mode_from_status(self, status: WebSDRStatus) -> Optional[str]:
+        return map_websdr_mode_to_hamlib(status.mode)
+
+    def rig_freq_from_status(self, status: WebSDRStatus) -> Optional[int]:
+        return self._reverse_effective_hz(status.freq_hz, self.hamlib_mode_from_status(status))
 
     # ------------------------------------------------------------------
     def _combined_error(self) -> Optional[str]:

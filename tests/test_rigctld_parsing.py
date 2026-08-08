@@ -1,4 +1,10 @@
-from sdrsync.rig.rigctld import is_rprt_error, parse_freq_response, parse_mode_response, parse_ptt_response
+from sdrsync.rig.rigctld import (
+    is_rprt_error,
+    parse_freq_response,
+    parse_mode_response,
+    parse_ptt_response,
+    parse_set_response,
+)
 
 
 def test_parse_freq_valid():
@@ -49,3 +55,20 @@ def test_is_rprt_error_true():
 
 def test_is_rprt_error_false_for_normal_mode_line():
     assert is_rprt_error("USB\n") is False
+
+
+def test_parse_set_response_success():
+    assert parse_set_response("RPRT 0\n") is True
+
+
+def test_parse_set_response_rejection():
+    assert parse_set_response("RPRT -11\n") is False
+
+
+def test_parse_set_response_none_input():
+    assert parse_set_response(None) is False
+
+
+def test_parse_set_response_malformed():
+    assert parse_set_response("garbage\n") is False
+    assert parse_set_response("RPRT\n") is False
