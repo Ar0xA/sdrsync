@@ -62,8 +62,10 @@ class WebViewHost:
     def __init__(self, headless: bool = False) -> None:
         self.frame = wx.Frame(
             None, title="SDRSync WebSDR",
-            style=wx.DEFAULT_FRAME_STYLE | wx.FRAME_NO_TASKBAR,
+            style=wx.DEFAULT_FRAME_STYLE | (wx.FRAME_NO_TASKBAR if headless else 0),
         )
+        self._current_webview: Optional["wx.html2.WebView"] = None
+        self.frame.Bind(wx.EVT_SIZE, self._on_frame_size)
         if ICON_PATH.exists():
             try:
                 icon = wx.Icon(str(ICON_PATH), wx.BITMAP_TYPE_ICO)
@@ -96,6 +98,11 @@ class WebViewHost:
     def _rest_pos(self) -> wx.Point:
         return OFF_SCREEN_POS if self._headless else ON_SCREEN_POS
 
+    def _on_frame_size(self, event: wx.SizeEvent) -> None:
+        if self._current_webview is not None:
+            self._current_webview.SetSize(self.frame.GetClientSize())
+        event.Skip()
+
     def set_headless(self, headless: bool) -> None:
         """GUI-thread only. Call before starting a WebSDR connection to
         pick up the current AppSettings.headless value -- picked up fresh
@@ -104,6 +111,17 @@ class WebViewHost:
         assert wx.IsMainThread()
         self._headless = headless
         self.frame.SetPosition(self._rest_pos())
+        # A shown, visible-mode window is a real, separate top-level
+        # window with its own taskbar button and Alt-Tab entry -- users
+        # need to be able to switch to it directly to click the page
+        # itself (audio-unlock, and now reverse sync). Headless keeps
+        # wx.FRAME_NO_TASKBAR (it's parked off-screen, nothing to switch
+        # to). wxMSW supports toggling this style on an already-shown
+        # frame at runtime (internally re-shows the window); confirmed
+        # live on this platform, not assumed from docs alone.
+        currently_no_taskbar = bool(self.frame.GetWindowStyleFlag() & wx.FRAME_NO_TASKBAR)
+        if currently_no_taskbar != headless:
+            self.frame.ToggleWindowStyle(wx.FRAME_NO_TASKBAR)
 
     def present(self, on_screen: bool) -> None:
         """GUI-thread only. Passed to WxPageAdapter as its
@@ -123,6 +141,17 @@ class WebViewHost:
         def do_create():
             try:
                 webview = wx.html2.WebView.New(self.frame, backend=target_backend())
+                # WebView.New() defaults to wx.DefaultSize, which does NOT
+                # fill the parent frame on its own (no sizer is used here,
+                # deliberately, since only one webview is ever live at a
+                # time) -- without this, the widget can sit at a small
+                # default size while the frame's own background shows
+                # through everywhere else, which is indistinguishable at a
+                # glance from the separate WebView2-repaint issue
+                # _nudge_repaint() addresses. _on_frame_size() keeps this
+                # in sync if the frame is resized later.
+                webview.SetSize(self.frame.GetClientSize())
+                self._current_webview = webview
                 adapter = WxPageAdapter(
                     webview, loop=loop, on_screen_presenter=self.present, on_dead=on_dead,
                 )
@@ -142,6 +171,8 @@ class WebViewHost:
         await page.close()
 
         def do_destroy():
+            if self._current_webview is page.webview:
+                self._current_webview = None
             try:
                 page.webview.Destroy()
             except Exception as e:
