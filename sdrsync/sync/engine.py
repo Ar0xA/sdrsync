@@ -53,6 +53,20 @@ logger = logging.getLogger("sdrsync.engine")
 DEFAULT_POLL_INTERVAL_S = 0.2  # see AppSettings.poll_interval_s -- now user-configurable, this is just the fallback
 FREQ_DEBOUNCE_S = 0.2          # candidate frequency must be stable this long before pushing
 FREQ_CHANGE_THRESHOLD_HZ = 10  # ignore rig jitter smaller than this
+# Belt-and-suspenders: forces a forward re-push of the rig's current
+# mode/freq onto the WebSDR every this-often, REGARDLESS of whether
+# _last_sent_mode_key/_last_sent_freq already look like a match. Purely
+# a safety net against a live-reported desync (WebSDR page and the
+# real rig's own reported state persistently disagreeing, silently, no
+# error shown) that couldn't be pinned to one exact root cause -- the
+# forward/reverse dedupe latches only re-push when THEY notice a change,
+# so any bug that leaves one of them stale forever (this codebase has
+# already had two related bugs in that family this session) leaves the
+# two sides disagreeing indefinitely with nothing to self-correct. A
+# redundant re-push of an already-correct value is a harmless no-op
+# elsewhere in this codebase; this trades a small periodic cost for
+# guaranteeing the desync can never persist longer than this interval.
+FULL_RESYNC_INTERVAL_S = 30.0
 ATTACH_RETRY_BASE_DELAY_S = 2.0
 ATTACH_RETRY_MAX_DELAY_S = 30.0
 ATTACH_CHECK_INTERVAL_S = 1.0  # how often to notice the driver dropped attachment
@@ -231,6 +245,8 @@ class SyncEngine:
         self._pending_freq_since: float = 0.0
         self._last_sent_mode_key: Optional[tuple[str, Optional[int]]] = None
         self._last_ptt: Optional[bool] = None
+        # See FULL_RESYNC_INTERVAL_S.
+        self._last_full_resync_at: float = time.monotonic()
         # "Did I just cause this WebSDR value" bookkeeping -- set only on
         # a successful FORWARD (rig -> WebSDR) push, in rig-native units
         # (hamlib mode name / Hz), so reverse sync can recognize its own
@@ -662,6 +678,7 @@ class SyncEngine:
         self._pending_freq = None
         self._last_sent_mode_key = None
         self._last_ptt = None
+        self._last_full_resync_at = time.monotonic()
         self._last_pushed_to_websdr_freq = None
         self._last_pushed_to_websdr_mode = None
         # "Just happened" rather than 0.0 -- a fresh attach gets the same
@@ -938,6 +955,14 @@ class SyncEngine:
             transmitting = bool(self._last_ptt)
 
             if not transmitting:
+                now = time.monotonic()
+                # See FULL_RESYNC_INTERVAL_S -- forces both pushes below
+                # through regardless of whether the dedupe latches think
+                # they're already up to date, as a periodic safety net
+                # against the WebSDR page and the rig silently drifting
+                # out of agreement with nothing noticing.
+                due_for_periodic_resync = now - self._last_full_resync_at >= FULL_RESYNC_INTERVAL_S
+
                 mode_key = (state.mode, state.passband_hz) if state.mode is not None else None
                 # Suppress the forward push while a reverse-sync mode
                 # ladder is actively retrying -- the rig still reports its
@@ -945,7 +970,11 @@ class SyncEngine:
                 # the WebSDR page would change obs_mode, which would then
                 # look like the user abandoned their own click and
                 # supersede the very push being retried.
-                if mode_key is not None and mode_key != self._last_sent_mode_key and self._mode_push is None:
+                if (
+                    mode_key is not None
+                    and (mode_key != self._last_sent_mode_key or due_for_periodic_resync)
+                    and self._mode_push is None
+                ):
                     # Only latch as "sent" if the driver actually applied it
                     # -- it may have been a no-op (not attached, e.g.
                     # mid-outage) or a failed page call, and either would
@@ -963,14 +992,14 @@ class SyncEngine:
                         self._reverse_reseed_due = True
 
                 if state.freq_hz is not None:
-                    now = time.monotonic()
                     if self._pending_freq is None or abs(state.freq_hz - self._pending_freq) > FREQ_CHANGE_THRESHOLD_HZ:
                         self._pending_freq = state.freq_hz
                         self._pending_freq_since = now
                     elif (
                         now - self._pending_freq_since >= FREQ_DEBOUNCE_S
                         and (self._last_sent_freq is None
-                             or abs(self._pending_freq - self._last_sent_freq) > FREQ_CHANGE_THRESHOLD_HZ)
+                             or abs(self._pending_freq - self._last_sent_freq) > FREQ_CHANGE_THRESHOLD_HZ
+                             or due_for_periodic_resync)
                         and self._freq_push is None  # see the mode ladder's identical guard above
                     ):
                         if await self._driver.tune_hz(self._pending_freq):
@@ -978,6 +1007,9 @@ class SyncEngine:
                             self._last_pushed_to_websdr_freq = self._pending_freq
                             self._forward_push_completed_at = time.monotonic()
                             self._reverse_reseed_due = True
+
+                if due_for_periodic_resync:
+                    self._last_full_resync_at = now
 
             websdr_status = await self._driver.get_status()
 

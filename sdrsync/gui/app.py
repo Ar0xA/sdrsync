@@ -101,7 +101,7 @@ class _Tooltip:
 
 class MainFrame(wx.Frame):
     def __init__(self, settings: AppSettings, webview_host: WebViewHost) -> None:
-        super().__init__(None, title="SDRSync - rigctld -> WebSDR")
+        super().__init__(None, title=f"SDRSync {__version__} - rigctld -> WebSDR")
         if ICON_PATH.exists():
             try:
                 icon = wx.Icon(str(ICON_PATH), wx.BITMAP_TYPE_ICO)

@@ -12,7 +12,7 @@ import queue
 
 from sdrsync.config import AppSettings
 from sdrsync.rig.rigctld import RigState
-from sdrsync.sync.engine import SyncEngine
+from sdrsync.sync.engine import FULL_RESYNC_INTERVAL_S, SyncEngine
 from sdrsync.websdr.base import WebSDRStatus
 
 
@@ -155,3 +155,40 @@ def test_failed_push_is_retried_not_latched_as_sent():
     # Every tick after the debounce window elapses retries the failed push.
     assert failing_driver.tuned.count(14074000) >= 2
     assert failing_driver.modes.count(("USB", 2700)) >= 2
+
+
+def test_periodic_full_resync_repushes_even_when_dedupe_latches_already_match():
+    """Safety net: even if _last_sent_mode_key/_last_sent_freq already
+    look like a match (so the normal dedupe path would skip pushing),
+    a forward re-push still fires once FULL_RESYNC_INTERVAL_S has
+    elapsed -- guards against the WebSDR page and the rig silently
+    drifting apart with nothing left to notice, regardless of the exact
+    mechanism that caused the drift."""
+    engine = make_engine()
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig = stub_rig
+    engine._rig_active = True
+    engine._driver = stub_driver
+    engine._websdr_active = True
+
+    async def run_two_ticks():
+        await engine._tick()
+        engine._pending_freq_since -= 1.0
+        await engine._tick()
+
+    asyncio.run(run_two_ticks())
+    assert stub_driver.modes == [("USB", 2700)]
+    assert stub_driver.tuned == [14074000]
+
+    # Nothing changed on the rig -- a normal tick must NOT re-push.
+    asyncio.run(engine._tick())
+    assert stub_driver.modes == [("USB", 2700)]
+    assert stub_driver.tuned == [14074000]
+
+    # Once the periodic resync interval has elapsed, the next tick
+    # re-pushes both, even though the dedupe latches still match.
+    engine._last_full_resync_at -= FULL_RESYNC_INTERVAL_S + 0.1
+    asyncio.run(engine._tick())
+    assert stub_driver.modes == [("USB", 2700), ("USB", 2700)]
+    assert stub_driver.tuned == [14074000, 14074000]
