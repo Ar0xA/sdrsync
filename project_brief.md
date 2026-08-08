@@ -1,6 +1,6 @@
 # SDRSync — project brief
 
-_Last updated: 2026-08-06 (v4 round: OpenWebRX driver, git repo init, project renamed sdrsync -> SDRSync)_
+_Last updated: 2026-08-08 (v6 round: UberSDR driver — the first one built on a documented API rather than reverse-engineered page internals)_
 
 **Catch-up note**: this file was last fully rewritten after v3. Since then,
 in the same session: two real bugs found by testing the KiwiSDR driver
@@ -141,6 +141,100 @@ common self-hosted WebSDR by receiver count):
 | R. OpenWebRX driver | New driver for the OpenWebRX/OpenWebRX+ family. Unlike the other two drivers, control is via a jQuery-widget object (`$('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator()`), frequency is offset-relative to a `center_freq` global (not absolute), and mode strings have no narrow/wide suffix convention (confirmed live via `Modes.getModes()`) | `websdr/openwebrx.py` |
 | S. Registration | `DRIVERS["openwebrx"]`; added an OpenWebRX example site to `KNOWN_SITES` and swapped the flaky KiwiSDR example for the healthy one from v3.5 | `websdr/registry.py`, `config.py` |
 | T. Tests + docs | `test_openwebrx_mode_mapping.py`; extended `test_fingerprint.py` with OpenWebRX + three-way-ambiguous cases; README + this file updated | `tests/`, `README.md`, `project_brief.md` |
+
+v6 added a fourth WebSDR family, **UberSDR** — and it is architecturally
+unlike the other three, which is the point worth recording:
+
+| Block | What | File(s) |
+|---|---|---|
+| U. UberSDR driver | Client of UberSDR's **documented v2 control API** (`static/v2/BRIDGE_API.md` in the UberSDR source), the same one its own Chrome/Firefox extensions use. Two `CustomEvent`s on `window` carrying JSON strings; every message gets exactly one reply; commands return the state they set and refuse bad input with a *reason*. No page internals are touched at all | `websdr/ubersdr.py` |
+| V. Registration | `DRIVERS["ubersdr"]`, `FINGERPRINT_MARKERS = ("dist/v2.js", "browser-extension-detector.js")` (v2's bundle and v1's own script, so a pasted root URL *or* a pasted `/v2/` URL is recognised), an example site in `KNOWN_SITES` and in `sites/websdr_sites.json` | `websdr/registry.py`, `config.py`, `sites/websdr_sites.json` |
+| W. Tests + docs | `test_ubersdr_mode_mapping.py` (mode map + rig-passband→filter-edges), `test_ubersdr_url.py` (root→`/v2/` resolution), `test_ubersdr_driver.py` (what the driver sends, via a stub page); `test_fingerprint.py` extended; README + this file | `tests/`, `README.md`, `project_brief.md` |
+
+Design decisions specific to this driver, and why:
+
+- **Identification is the API's own handshake**, not a fingerprint. `attach()`
+  installs a small in-page agent, sends `hello`, and waits for the `announce`
+  that carries the receiver's identity, protocol version and capability list —
+  exactly what the UberSDR browser extensions do. A page that answers *is* a
+  controllable UberSDR. The `<script src>` markers remain because the GUI's
+  **Detect** button identifies a pasted URL from HTML alone, without a browser.
+- **Protocol version is checked, capabilities are feature-detected.** That is
+  the API's own stated rule (check `v` and `api.major`, never branch on
+  `api.minor`); a major bump raises `WebSDRIncompatibleError` telling the user
+  to update sdrsync, rather than half-working.
+- **No readback verification, unlike the other three drivers.** It is not
+  needed and would be weaker: a command answers with the state it set, and an
+  impossible value is refused with the receiver's own explanation
+  ("frequency 40000000 is outside 10000–30000000"). The error text goes
+  straight into `WebSDRStatus.last_error`.
+- **One command for mode + filter.** `tune {mode, bandwidthLow, bandwidthHigh}`
+  rather than `mode` then `passband`, because the two-call form walks the
+  receiver audibly through the mode's default width. A refused *filter* falls
+  back to retrying the mode alone — the mode is the more important half.
+- **The rig's passband becomes real filter edges**, since UberSDR takes numbers
+  rather than narrow/wide mode strings: width added above the mode's own low
+  edge for USB, mirrored for LSB, split either side of the dial for the
+  symmetric modes (a 500 Hz CW filter is −250..+250, not ±500). The mode table
+  is read from the page's `modes` topic at attach so a receiver whose limits
+  differ from our assumptions is still driven correctly.
+- **Mute-on-TX uses `duck`, not `mute`.** UberSDR separates the operator's own
+  mute setting from transient controller-applied silence. `duck` means sdrsync
+  dying mid-transmission cannot leave a stranger's receiver muted for good, and
+  their mute button never shows a state they did not choose. Absolute, never a
+  toggle — PTT arrives as true/false and a toggle desynchronises permanently the
+  first time a message is missed.
+- **The v2 interface is where the API lives**, so `v2_page_url()` resolves a
+  pasted root URL (what operators publish) to `/v2/`, keeping any query string
+  so an UberSDR share link lands where it says.
+- **`bye` on close**, because the page holds at most 8 clients and evicts the
+  stalest; a session reconnecting repeatedly would otherwise push out somebody's
+  browser extension.
+- **The bridge can be switched off by the operator** (their SDR Control panel →
+  *Browser bridge*), in which case the page answers `disabled` rather than going
+  silent. That becomes a specific, actionable message instead of a timeout that
+  looks like a broken site.
+
+**Protocol audit (same round).** After writing the driver, its agent was run
+against UberSDR's *real* page implementation — `host.js`, `commands.js` and the
+snapshot builders bundled out of the source tree and executed in node, with only
+the DOM event channel faked. It was a one-off audit, run from a scratch directory
+and deliberately **not** committed: this repo carries nothing, not even something
+optional, that needs an UberSDR source tree to be present. Reproducing it is the
+page side bundled with esbuild plus the agent string lifted out of `ubersdr.py`.
+It found one real bug plus one missing behaviour, and both fixes carry a comment
+saying why they are the way they are:
+
+- **Re-entrancy.** `resubscribe()` did `seedIds[send(...)] = true` — but the page
+  answers *inside* the dispatch, so the reply arrived before the id was marked as
+  ours. It was then queued as though a caller were waiting, and every topic stayed
+  empty after an announce. Fixed by allocating the id first (`agent.emit(id, …)`);
+  anything that must be true before the reply has to be arranged before dispatch.
+- **Re-subscribe on announce** was missing altogether. The page sends *patches*
+  against what it last sent each client, and an announce resets that, so without
+  re-subscribing a topic that had not changed since would never be sent again —
+  the panel would read blank indefinitely. The browser extensions do this; now so
+  does the agent.
+- **`duck` is now feature-detected** on the announce's capability list (the API's
+  own rule) with a fall back to `mute`, because a receiver without transient
+  silence still has to be quiet while the rig transmits.
+
+20 checks passed in that audit: handshake, bridge-switched-off, subscribe
+snapshot, patch merging, announce re-subscribe, out-of-range refusal, mode+filter
+in one call, filter refused then mode-only retry, duck-without-mute, static `get`,
+`bye`, eviction, page closing, envelope validity for every message the agent
+sends, and junk on the channel. Committed is the half of that which needs nothing
+but Python: `test_ubersdr_driver.py` pins the commands the driver puts on the
+wire.
+
+Open for a live session: nothing in this driver has been exercised against a
+real receiver from inside the app yet — the protocol was read from its
+specification and its tests, the pure logic is unit-tested, and the command
+shapes are pinned by a stub page. First live run should confirm (a) the Start
+overlay press actually starts audio through WebView2, since that is the one
+step that depends on browser gesture policy, and (b) that `_call`'s
+synchronous-reply assumption holds in practice (it falls back to polling if
+not, so the failure mode is latency rather than breakage).
 
 Prior single-file prototypes (`websdrSync.py`, `websdrSync1.1.py`,
 `websdrSync.1.2.py`) are still in the repo root — superseded by the

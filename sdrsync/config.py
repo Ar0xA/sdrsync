@@ -61,6 +61,16 @@ KNOWN_SITES: list[WebSDRSite] = [
         url="http://oh6kk.dy.fi:8073/",
         driver_type="openwebrx",
     ),
+    WebSDRSite(
+        # UberSDR exposes a documented control API rather than requiring us to
+        # call its internals, so this driver is a client of that API -- see
+        # sdrsync/websdr/ubersdr.py. The root URL is what an operator publishes;
+        # the driver navigates to the v2 interface itself, which is where the API
+        # lives.
+        name="UberSDR example (M9PSY, full HF)",
+        url="https://m9psy.tunnel.ubersdr.org/",
+        driver_type="ubersdr",
+    ),
 ]
 
 
