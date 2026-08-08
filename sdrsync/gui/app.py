@@ -310,6 +310,23 @@ class MainFrame(wx.Frame):
         grid.Add(self.mute_on_tx_check, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
+        self.bidirectional_sync_check = wx.CheckBox(parent, label="Sync WebSDR page -> rig (reverse)")
+        self.bidirectional_sync_check.SetValue(self.settings.bidirectional_sync_enabled)
+        _Tooltip(self.bidirectional_sync_check, lambda: (
+            "When enabled, tuning/mode changes made directly on the WebSDR "
+            "page are pushed back to the transceiver. Never applies while "
+            "transmitting. Has no effect while 'Hide browser window' is "
+            "checked -- there's no visible page for a click to land on."
+        ))
+        self.bidirectional_sync_check.Bind(wx.EVT_CHECKBOX, self._on_bidirectional_sync_changed)
+        grid.Add(self.bidirectional_sync_check, pos=(row, 0), span=(1, 4), flag=wx.ALIGN_CENTER_VERTICAL)
+        row += 1
+
+        self.reverse_sync_error_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
+        self.reverse_sync_error_text.SetForegroundColour(ERROR_COLOUR)
+        grid.Add(self.reverse_sync_error_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
+        row += 1
+
         self.websdr_preflight_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
         grid.Add(self.websdr_preflight_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
         row += 1
@@ -873,6 +890,13 @@ class MainFrame(wx.Frame):
         self.settings.mute_on_tx = self.mute_on_tx_check.GetValue()
         self.settings.save()
 
+    def _on_bidirectional_sync_changed(self, _event=None) -> None:
+        # sync/engine.py reads self.settings.bidirectional_sync_enabled
+        # live every tick (same immediate-write pattern as mute_on_tx
+        # above), so this applies without a reconnect.
+        self.settings.bidirectional_sync_enabled = self.bidirectional_sync_check.GetValue()
+        self.settings.save()
+
     def _on_poll_interval_changed(self, _event=None) -> None:
         # SyncEngine reads self.settings.poll_interval_s live on every tick
         # (sync/engine.py's _poll_loop), so this applies immediately --
@@ -1014,6 +1038,7 @@ class MainFrame(wx.Frame):
             _set_wrapped(self.rig_err_text, f"Sync engine crashed: {snap.fatal_error}")
             self.websdr_conn_text.SetLabel("error")
             self.rig_conn_text.SetLabel("error")
+            _set_wrapped(self.reverse_sync_error_text, "")
             self._websdr_active = False
             self._websdr_connected = False
             self._active_websdr_site = None
@@ -1081,6 +1106,7 @@ class MainFrame(wx.Frame):
                 else:
                     self.websdr_audio_text.SetLabel("streaming" if ws.audio_active else "silent")
                 _set_wrapped(self.websdr_err_text, ws.last_error or "")
+        _set_wrapped(self.reverse_sync_error_text, snap.reverse_sync_error or "")
         self._update_websdr_controls()
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:

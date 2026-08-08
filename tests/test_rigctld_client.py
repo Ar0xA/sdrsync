@@ -50,3 +50,75 @@ def test_get_mode_rprt_error_does_not_hang_or_disconnect():
             await server.wait_closed()
 
     asyncio.run(run())
+
+
+def test_set_freq_success_applies_and_confirms():
+    async def run():
+        server, state = await start_server(port=0)
+        port = server.sockets[0].getsockname()[1]
+        client = RigctldClient("127.0.0.1", port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_freq(7074000) is True
+            assert state.freq_hz == 7074000
+            assert await client.get_freq() == 7074000
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_mode_success_applies_and_confirms():
+    async def run():
+        server, state = await start_server(port=0)
+        port = server.sockets[0].getsockname()[1]
+        client = RigctldClient("127.0.0.1", port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_mode("LSB", 1800) is True
+            assert state.mode == "LSB"
+            assert state.passband_hz == 1800
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_mode_zero_passband_means_rig_default():
+    async def run():
+        server, state = await start_server(port=0)
+        port = server.sockets[0].getsockname()[1]
+        client = RigctldClient("127.0.0.1", port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_mode("CW", None) is True
+            assert state.mode == "CW"
+            assert state.passband_hz == 0
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_freq_rejected_by_rig():
+    async def run():
+        server, state = await start_server(port=0)
+        port = server.sockets[0].getsockname()[1]
+        state.set_rejected = True
+        client = RigctldClient("127.0.0.1", port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_freq(7074000) is False
+            assert client.connected is True  # a rejection is not a disconnect
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())

@@ -24,6 +24,11 @@ class FakeRigState:
         # normal two-line mode/passband response -- lets tests exercise
         # RigctldClient.get_mode()'s handling of that case without a real rig.
         self.mode_error = False
+        # When set, 'F'/'M' (v11 reverse-sync SET commands) reply with
+        # RPRT -11 (rejected) instead of applying the change and replying
+        # RPRT 0 -- lets tests exercise RigctldClient.set_freq()/set_mode()'s
+        # rejection handling without a real rig.
+        self.set_rejected = False
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: FakeRigState) -> None:
@@ -46,6 +51,21 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 writer.write(f"{state.ptt}\n".encode())
             elif cmd == "v":
                 writer.write(b"Dummy\n")
+            elif cmd.startswith("F "):
+                parts = cmd.split()
+                if state.set_rejected or len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+                    writer.write(b"RPRT -11\n")
+                else:
+                    state.freq_hz = int(parts[1])
+                    writer.write(b"RPRT 0\n")
+            elif cmd.startswith("M "):
+                parts = cmd.split()
+                if state.set_rejected or len(parts) != 3 or not parts[2].lstrip("-").isdigit():
+                    writer.write(b"RPRT -11\n")
+                else:
+                    state.mode = parts[1]
+                    state.passband_hz = int(parts[2])
+                    writer.write(b"RPRT 0\n")
             else:
                 writer.write(b"RPRT -11\n")
             await writer.drain()

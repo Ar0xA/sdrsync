@@ -1,8 +1,13 @@
 """Async TCP client for hamlib's rigctld (network CAT control, not Omnirig).
 
-Read-only: this app only ever reads the transceiver's state
-(frequency/mode/PTT) — sync is one-way, rig -> WebSDR, so no "set
-frequency on rig" command is needed here.
+Mostly read-only: get_freq/get_mode/get_ptt/get_state drive the existing
+rig -> WebSDR forward sync. set_freq/set_mode additionally support the
+reverse direction (WebSDR -> rig, v11) via rigctld's symmetric uppercase
+SET commands ('F <hz>', 'M <mode> <passband>'), each replying with the
+same single 'RPRT <code>' line shape as the GET side's error path. Never
+add set_ptt -- PTT is explicitly excluded from reverse sync (see the v11
+plan: an unauthenticated web page must never be able to key a real
+transmitter).
 """
 from __future__ import annotations
 
@@ -49,6 +54,17 @@ def is_rprt_error(line: str) -> bool:
     a disconnect, so callers must check this after the first readline.
     """
     return line.strip().startswith("RPRT")
+
+
+def parse_set_response(line: Optional[str]) -> bool:
+    """Pure parser for a rigctld SET command's 'RPRT <code>' reply.
+
+    True only for 'RPRT 0' (success); False for any other code, malformed
+    reply, or None (I/O failure already logged by the caller)."""
+    if line is None:
+        return False
+    parts = line.strip().split()
+    return len(parts) == 2 and parts[0] == "RPRT" and parts[1] == "0"
 
 
 def parse_ptt_response(resp: Optional[str]) -> Optional[bool]:
@@ -186,6 +202,26 @@ class RigctldClient:
         if ptt is None and resp is not None:
             logger.warning("Unexpected PTT value from rigctld: %r", resp)
         return ptt
+
+    async def set_freq(self, freq_hz: int) -> bool:
+        """Reverse-sync (WebSDR -> rig): sets the rig's VFO frequency."""
+        resp = await self._send_raw(f"F {int(freq_hz)}")
+        ok = parse_set_response(resp)
+        if not ok:
+            logger.warning("rigctld rejected F %d: %r", freq_hz, resp)
+        return ok
+
+    async def set_mode(self, mode_name: str, passband_hz: Optional[int]) -> bool:
+        """Reverse-sync (WebSDR -> rig): sets the rig's mode + passband.
+
+        passband_hz=0 (or None) means "rig default for this mode" -- valid
+        hamlib/rigctld convention, not a sentinel for "unset"."""
+        pb = 0 if not passband_hz else int(passband_hz)
+        resp = await self._send_raw(f"M {mode_name} {pb}")
+        ok = parse_set_response(resp)
+        if not ok:
+            logger.warning("rigctld rejected M %s %d: %r", mode_name, pb, resp)
+        return ok
 
     async def get_state(self) -> RigState:
         """Convenience: fetch freq/mode/ptt in one call. Any of them may be None on failure."""
