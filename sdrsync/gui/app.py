@@ -310,18 +310,6 @@ class MainFrame(wx.Frame):
         grid.Add(self.mute_on_tx_check, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
-        self.bidirectional_sync_check = wx.CheckBox(parent, label="Sync WebSDR page -> rig (reverse)")
-        self.bidirectional_sync_check.SetValue(self.settings.bidirectional_sync_enabled)
-        _Tooltip(self.bidirectional_sync_check, lambda: (
-            "When enabled, tuning/mode changes made directly on the WebSDR "
-            "page are pushed back to the transceiver. Never applies while "
-            "transmitting. Has no effect while 'Hide browser window' is "
-            "checked -- there's no visible page for a click to land on."
-        ))
-        self.bidirectional_sync_check.Bind(wx.EVT_CHECKBOX, self._on_bidirectional_sync_changed)
-        grid.Add(self.bidirectional_sync_check, pos=(row, 0), span=(1, 4), flag=wx.ALIGN_CENTER_VERTICAL)
-        row += 1
-
         self.reverse_sync_error_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
         self.reverse_sync_error_text.SetForegroundColour(ERROR_COLOUR)
         grid.Add(self.reverse_sync_error_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
@@ -888,13 +876,6 @@ class MainFrame(wx.Frame):
         # edge (mirrors _on_poll_interval_changed's immediate-write pattern),
         # so this applies without a reconnect.
         self.settings.mute_on_tx = self.mute_on_tx_check.GetValue()
-        self.settings.save()
-
-    def _on_bidirectional_sync_changed(self, _event=None) -> None:
-        # sync/engine.py reads self.settings.bidirectional_sync_enabled
-        # live every tick (same immediate-write pattern as mute_on_tx
-        # above), so this applies without a reconnect.
-        self.settings.bidirectional_sync_enabled = self.bidirectional_sync_check.GetValue()
         self.settings.save()
 
     def _on_poll_interval_changed(self, _event=None) -> None:

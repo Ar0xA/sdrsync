@@ -33,6 +33,12 @@ class StubRig:
     async def close(self) -> None:
         pass
 
+    async def set_freq(self, freq_hz: int) -> bool:
+        return True
+
+    async def set_mode(self, mode_name: str, passband_hz) -> bool:
+        return True
+
 
 class StubDriver:
     def __init__(self) -> None:
@@ -50,6 +56,12 @@ class StubDriver:
 
     async def get_status(self) -> WebSDRStatus:
         return WebSDRStatus(connected=True)
+
+    def hamlib_mode_from_status(self, status: WebSDRStatus):
+        return None
+
+    def rig_freq_from_status(self, status: WebSDRStatus):
+        return None
 
     async def close(self) -> None:
         pass

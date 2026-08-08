@@ -101,11 +101,6 @@ class AppSettings:
     curated_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
     mute_on_tx: bool = True
-    # v11: WebSDR page -> rig sync (the reverse of this app's original
-    # rig -> WebSDR design). Default off -- a new rig-affecting behavior
-    # must never silently activate for existing users on upgrade. PTT is
-    # never reverse-synced regardless of this setting (see sync/engine.py).
-    bidirectional_sync_enabled: bool = False
     # Despite the name, this does NOT use Chromium's real --headless mode --
     # that has no audio output at all (confirmed: neither the lightweight
     # headless-shell binary nor the full binary's own headless mode play
@@ -183,7 +178,6 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "last_site_driver_type": str,
     "cw_offset_hz": int,
     "mute_on_tx": bool,
-    "bidirectional_sync_enabled": bool,
     "headless": bool,
     "use_mock_rig": bool,
     "poll_interval_s": (int, float),

@@ -97,9 +97,8 @@ class _UnusedWebViewHost:
         raise AssertionError("not expected to be called in these tests")
 
 
-def make_engine(bidirectional=True) -> SyncEngine:
+def make_engine() -> SyncEngine:
     settings = AppSettings()
-    settings.bidirectional_sync_enabled = bidirectional
     return SyncEngine(settings, status_queue=queue.Queue(), webview_host=_UnusedWebViewHost())
 
 
@@ -206,30 +205,6 @@ def test_transmitting_fully_suppresses_reverse_push():
     asyncio.run(engine._tick())
 
     assert stub_rig.set_freqs == []
-
-
-def test_disabled_setting_suppresses_reverse_push():
-    engine = make_engine(bidirectional=False)
-    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
-    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
-    stub_driver = StubReverseDriver(status)
-    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
-
-    _clear_holdoff(engine)
-    asyncio.run(engine._tick())
-    engine._pending_freq_since -= 1.0
-    _clear_holdoff(engine)
-    asyncio.run(engine._tick())
-
-    status.freq_hz = 14200000
-    _clear_holdoff(engine)
-    asyncio.run(engine._tick())
-    _clear_reverse_debounce(engine)
-    _clear_holdoff(engine)
-    asyncio.run(engine._tick())
-
-    assert stub_rig.set_freqs == []
-    assert engine._reverse_baseline_captured is False
 
 
 def test_genuinely_new_mode_triggers_exactly_one_push():

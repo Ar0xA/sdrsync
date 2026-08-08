@@ -236,10 +236,6 @@ class SyncEngine:
         self._last_reverse_mode_reject_key: Optional[str] = None
         self._last_reverse_freq_reject_key: Optional[int] = None
         self._reverse_sync_error: Optional[str] = None
-        # Edge-detect for the setting being toggled on mid-session (an
-        # attach/reattach isn't the only way _reverse_baseline_captured
-        # needs re-arming).
-        self._prev_bidirectional_enabled: bool = False
         # Bumped by _reset_sync_latches() -- _reverse_sync_tick() checks
         # this after each await (set_mode()/set_freq() to the rig) before
         # writing any latch, since _attach_supervisor can call
@@ -632,9 +628,9 @@ class SyncEngine:
 
     async def _reverse_sync_tick(self, websdr_status: WebSDRStatus, state: RigState) -> None:
         """WebSDR -> rig (v11). Called once per tick by _tick(), already
-        gated by the caller (bidirectional_sync_enabled, not
-        transmitting, WebSDR connected, past REVERSE_HOLDOFF_S since the
-        last successful push in either direction). At most one push
+        gated by the caller (not transmitting, WebSDR connected, past
+        REVERSE_HOLDOFF_S since the last successful push in either
+        direction). At most one push
         (mode OR freq, mode taking priority) per tick, mirroring the
         forward direction's own mode-before-frequency ordering and
         bounding tick duration -- relevant especially for flrig, where
@@ -779,14 +775,6 @@ class SyncEngine:
         snapshot) for whichever subsystem isn't active -- rig and WebSDR
         being independently startable means neither can assume the other
         is present."""
-        # v11: toggling bidirectional sync on mid-session must re-arm the
-        # baseline capture too, not just a WebSDR (re)attach -- otherwise
-        # whatever the page happens to be showing at toggle-on time could
-        # be treated as a user action instead of the pre-existing state.
-        if self.settings.bidirectional_sync_enabled and not self._prev_bidirectional_enabled:
-            self._reverse_baseline_captured = False
-        self._prev_bidirectional_enabled = self.settings.bidirectional_sync_enabled
-
         websdr_status = await self._driver.get_status() if self._websdr_active and self._driver else None
 
         if not self._rig_active or self._rig is None:
@@ -888,8 +876,7 @@ class SyncEngine:
             # self._last_ptt post-await.
             reverse_ptt = state.ptt if state.ptt is not None else last_ptt_before_awaits
             if (
-                self.settings.bidirectional_sync_enabled
-                and not reverse_ptt
+                not reverse_ptt
                 and websdr_status.connected
                 and time.monotonic() - self._forward_push_completed_at >= REVERSE_HOLDOFF_S
             ):
