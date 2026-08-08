@@ -8,6 +8,18 @@ same single 'RPRT <code>' line shape as the GET side's error path. Never
 add set_ptt -- PTT is explicitly excluded from reverse sync (see the v11
 plan: an unauthenticated web page must never be able to key a real
 transmitter).
+
+'RPRT 0' only confirms rigctld accepted the command syntactically, not
+that the physical rig actually took it -- CAT-bus commands can be
+dropped or collide, especially over serial links, and this was observed
+to happen in practice (mode pushes "often but not always" landing).
+set_freq/set_mode therefore verify via a poll-until-match readback after
+sending, resending and re-polling up to SET_VERIFY_MAX_ATTEMPTS times
+before giving up and returning False -- mirrors FlrigClient's existing
+poll-until-match verification (needed there because flrig's own RPC
+replies aren't a reliable success signal at all), just attempt-count
+bounded here instead of wall-clock bounded, since rigctld's reply
+already gives a first-pass accept/reject signal flrig's doesn't.
 """
 from __future__ import annotations
 
@@ -24,6 +36,16 @@ CMD_TIMEOUT_S = 1.0
 RECONNECT_BASE_DELAY_S = 2.0
 RECONNECT_MAX_DELAY_S = 30.0
 RECONNECT_WARN_AFTER = 5
+
+# set_freq()/set_mode() readback-verification cadence -- poll this long
+# after (re)sending the SET command, retry up to this many times total
+# before giving up. See the module docstring for why this exists at all.
+SET_VERIFY_POLL_DELAY_S = 0.2
+SET_VERIFY_MAX_ATTEMPTS = 3
+# abs(Hz) tolerance for treating a frequency readback as "confirmed" --
+# mirrors FlrigClient.FREQ_VERIFY_TOLERANCE_HZ (some rigs' CAT layers
+# round to a step size rather than echoing back the exact requested Hz).
+FREQ_VERIFY_TOLERANCE_HZ = 10
 
 # PTT values 1 (mic), 2 (data)... hamlib backends vary; all non-zero means "transmitting".
 PTT_TX_VALUES = {"1", "2", "3"}
@@ -204,24 +226,65 @@ class RigctldClient:
         return ptt
 
     async def set_freq(self, freq_hz: int) -> bool:
-        """Reverse-sync (WebSDR -> rig): sets the rig's VFO frequency."""
-        resp = await self._send_raw(f"F {int(freq_hz)}")
-        ok = parse_set_response(resp)
-        if not ok:
-            logger.warning("rigctld rejected F %d: %r", freq_hz, resp)
-        return ok
+        """Reverse-sync (WebSDR -> rig): sets the rig's VFO frequency.
+
+        'RPRT 0' only confirms rigctld accepted the command, not that the
+        physical rig actually took it -- verified via a poll-until-match
+        readback of get_freq(), resending and re-polling up to
+        SET_VERIFY_MAX_ATTEMPTS times (see module docstring)."""
+        freq_hz = int(freq_hz)
+        for attempt in range(1, SET_VERIFY_MAX_ATTEMPTS + 1):
+            resp = await self._send_raw(f"F {freq_hz}")
+            if not parse_set_response(resp):
+                logger.warning(
+                    "rigctld rejected F %d (attempt %d/%d): %r",
+                    freq_hz, attempt, SET_VERIFY_MAX_ATTEMPTS, resp,
+                )
+                continue
+            await asyncio.sleep(SET_VERIFY_POLL_DELAY_S)
+            actual = await self.get_freq()
+            if actual is not None and abs(actual - freq_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
+                return True
+            logger.debug(
+                "rigctld accepted F %d but rig reports %r after attempt %d/%d",
+                freq_hz, actual, attempt, SET_VERIFY_MAX_ATTEMPTS,
+            )
+        logger.warning(
+            "rigctld did not confirm frequency %d Hz after %d attempt(s)",
+            freq_hz, SET_VERIFY_MAX_ATTEMPTS,
+        )
+        return False
 
     async def set_mode(self, mode_name: str, passband_hz: Optional[int]) -> bool:
         """Reverse-sync (WebSDR -> rig): sets the rig's mode + passband.
 
         passband_hz=0 (or None) means "rig default for this mode" -- valid
-        hamlib/rigctld convention, not a sentinel for "unset"."""
+        hamlib/rigctld convention, not a sentinel for "unset". Verified
+        via a poll-until-match readback of get_mode(), same reasoning
+        (and cadence) as set_freq() above."""
         pb = 0 if not passband_hz else int(passband_hz)
-        resp = await self._send_raw(f"M {mode_name} {pb}")
-        ok = parse_set_response(resp)
-        if not ok:
-            logger.warning("rigctld rejected M %s %d: %r", mode_name, pb, resp)
-        return ok
+        for attempt in range(1, SET_VERIFY_MAX_ATTEMPTS + 1):
+            resp = await self._send_raw(f"M {mode_name} {pb}")
+            if not parse_set_response(resp):
+                logger.warning(
+                    "rigctld rejected M %s %d (attempt %d/%d): %r",
+                    mode_name, pb, attempt, SET_VERIFY_MAX_ATTEMPTS, resp,
+                )
+                continue
+            await asyncio.sleep(SET_VERIFY_POLL_DELAY_S)
+            confirmed = await self.get_mode()
+            actual_mode = confirmed[0] if confirmed else None
+            if actual_mode == mode_name:
+                return True
+            logger.debug(
+                "rigctld accepted M %s %d but rig reports mode %r after attempt %d/%d",
+                mode_name, pb, actual_mode, attempt, SET_VERIFY_MAX_ATTEMPTS,
+            )
+        logger.warning(
+            "rigctld did not confirm mode %s after %d attempt(s)",
+            mode_name, SET_VERIFY_MAX_ATTEMPTS,
+        )
+        return False
 
     async def get_state(self) -> RigState:
         """Convenience: fetch freq/mode/ptt in one call. Any of them may be None on failure."""

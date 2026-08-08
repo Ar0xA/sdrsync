@@ -29,6 +29,15 @@ class FakeRigState:
         # RPRT 0 -- lets tests exercise RigctldClient.set_freq()/set_mode()'s
         # rejection handling without a real rig.
         self.set_rejected = False
+        # Number of upcoming 'F'/'M' commands to ack (RPRT 0) WITHOUT
+        # actually applying the change -- simulates a CAT-bus command
+        # that rigctld accepted but the physical rig silently dropped
+        # (the real-world failure mode set_freq()/set_mode()'s readback
+        # verification exists to catch). Decremented independently per
+        # command type on each matching command received; the command
+        # once the counter reaches 0 applies normally.
+        self.freq_set_ignore_count = 0
+        self.mode_set_ignore_count = 0
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: FakeRigState) -> None:
@@ -56,15 +65,21 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 if state.set_rejected or len(parts) != 2 or not parts[1].lstrip("-").isdigit():
                     writer.write(b"RPRT -11\n")
                 else:
-                    state.freq_hz = int(parts[1])
+                    if state.freq_set_ignore_count > 0:
+                        state.freq_set_ignore_count -= 1
+                    else:
+                        state.freq_hz = int(parts[1])
                     writer.write(b"RPRT 0\n")
             elif cmd.startswith("M "):
                 parts = cmd.split()
                 if state.set_rejected or len(parts) != 3 or not parts[2].lstrip("-").isdigit():
                     writer.write(b"RPRT -11\n")
                 else:
-                    state.mode = parts[1]
-                    state.passband_hz = int(parts[2])
+                    if state.mode_set_ignore_count > 0:
+                        state.mode_set_ignore_count -= 1
+                    else:
+                        state.mode = parts[1]
+                        state.passband_hz = int(parts[2])
                     writer.write(b"RPRT 0\n")
             else:
                 writer.write(b"RPRT -11\n")
