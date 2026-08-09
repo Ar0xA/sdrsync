@@ -132,6 +132,17 @@ class AppSettings:
     # rig/band/country this app might be used in.
     reverse_sync_min_hz: Optional[int] = None
     reverse_sync_max_hz: Optional[int] = None
+    # Minutes of no rig activity (no frequency/mode/PTT change at all)
+    # after which the WebSDR session is disconnected, releasing the audio
+    # slot back to what is usually a volunteer-run public receiver with a
+    # small number of concurrent listeners. None or <= 0 disables it
+    # entirely (hold the connection forever, the pre-v14 behavior). The
+    # session reconnects automatically the moment the rig is touched
+    # again -- see sync/engine.py's _tick(). Defaults to ON (unlike the
+    # reverse-sync guards, which default off): the cost of being wrong
+    # here is a few seconds of reconnect delay, while the cost of the
+    # old always-on behavior is borne by someone else's hardware.
+    websdr_idle_disconnect_min: Optional[int] = 60
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -154,6 +165,7 @@ class AppSettings:
             _validate_rig_backend(filtered)
             _clamp_poll_interval(filtered)
             _clamp_reverse_sync_range(filtered)
+            _clamp_idle_disconnect(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
             logger.warning("Could not load %s (%s); using defaults", CONFIG_FILE, e)
@@ -196,6 +208,7 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "poll_interval_s": (int, float),
     "reverse_sync_min_hz": (int, type(None)),
     "reverse_sync_max_hz": (int, type(None)),
+    "websdr_idle_disconnect_min": (int, type(None)),
 }
 
 RIG_BACKENDS = {"rigctld", "flrig"}
@@ -280,6 +293,45 @@ def _clamp_reverse_sync_range(filtered: dict[str, Any]) -> None:
         filtered["reverse_sync_min_hz"] = new_min
     if new_max != max_hz:
         filtered["reverse_sync_max_hz"] = new_max
+
+
+def clamp_idle_disconnect_min(value: Optional[int]) -> Optional[int]:
+    """Pure sanity-check of websdr_idle_disconnect_min: takes the value,
+    returns the corrected one. Shared by _clamp_idle_disconnect() below (a
+    hand-edited config.json) and gui/app.py's entry field (typed input),
+    so the two layers can't drift apart -- same split as
+    clamp_reverse_sync_bounds().
+
+    A NEGATIVE value is dropped to None (feature OFF), which is the
+    DELIBERATELY OPPOSITE correction direction from
+    clamp_reverse_sync_bounds()'s "keep *a* guard rather than silently
+    remove it": there, loosening was the unsafe direction (that range
+    bounds what a public page may do to a real transmitter). Here the
+    unsafe direction is the other way round -- a bad value read as
+    "disconnect more eagerly" would tear down a working WebSDR session
+    under the user mid-QSO, whereas failing to idle-disconnect only
+    restores the app's previous (merely impolite) behavior. Fail toward
+    "off"."""
+    if value is not None and value < 0:
+        logger.warning(
+            "Ignoring negative websdr_idle_disconnect_min %r; idle disconnect disabled", value
+        )
+        return None
+    return value
+
+
+def _clamp_idle_disconnect(filtered: dict[str, Any]) -> None:
+    """Apply clamp_idle_disconnect_min() to a loaded config dict, in place.
+    Runs after _validate_scalars, so the value (if present) is already
+    known to be an int or None. Only writes the key back when the value
+    actually changed, so an absent key stays absent and falls through to
+    the dataclass default."""
+    if "websdr_idle_disconnect_min" not in filtered:
+        return
+    value = filtered["websdr_idle_disconnect_min"]
+    clamped = clamp_idle_disconnect_min(value)
+    if clamped != value:
+        filtered["websdr_idle_disconnect_min"] = clamped
 
 
 def _validate_rig_backend(filtered: dict[str, Any]) -> None:

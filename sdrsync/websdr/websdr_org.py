@@ -148,6 +148,14 @@ class WebsdrOrgDriver:
         # every poll tick the engine retries set_mode() (rate-limiting,
         # same pattern as openwebrx.py's _last_out_of_range_key).
         self._last_unmapped_mode: Optional[str] = None
+        # Same rate-limiting pattern, for the "outside all bands this
+        # WebSDR covers" rejection: the engine retries a rejected forward
+        # push on its own schedule, so a rig parked on a frequency this
+        # receiver simply doesn't cover would otherwise emit an identical
+        # WARNING line indefinitely. Keyed on the effective frequency
+        # alone, since the band table it's tested against only changes on
+        # attach() -- which resets this too.
+        self._last_out_of_range_hz: Optional[int] = None
 
     @property
     def attached(self) -> bool:
@@ -208,6 +216,7 @@ class WebsdrOrgDriver:
         self._last_tune_error = None
         self._last_mode_error = None
         self._last_unmapped_mode = None
+        self._last_out_of_range_hz = None
 
     async def _load_band_table(self) -> None:
         try:
@@ -274,7 +283,14 @@ class WebsdrOrgDriver:
         band_idx = self._band_for_freq(effective_hz)
         if band_idx is None:
             self._last_tune_error = f"{effective_hz/1000:.3f} kHz is outside all bands this WebSDR covers"
-            logger.warning(self._last_tune_error)
+            # Rate-limited exactly like _last_unmapped_mode below and
+            # openwebrx.py's _last_out_of_range_key: WARNING the first
+            # time a given frequency is rejected, DEBUG on exact repeats.
+            if effective_hz != self._last_out_of_range_hz:
+                logger.warning(self._last_tune_error)
+            else:
+                logger.debug("Frequency still outside all bands (unchanged): %s", effective_hz)
+            self._last_out_of_range_hz = effective_hz
             return False
 
         try:

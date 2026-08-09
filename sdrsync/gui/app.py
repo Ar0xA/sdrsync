@@ -45,6 +45,7 @@ from sdrsync.config import (
     AppSettings,
     KNOWN_SITES,
     WebSDRSite,
+    clamp_idle_disconnect_min,
     clamp_reverse_sync_bounds,
 )
 from sdrsync.gui_messages import GuiMessage
@@ -91,6 +92,24 @@ def _parse_optional_hz(text: str) -> tuple[Optional[int], bool]:
     bounds what a WebSDR page may retune a real transmitter to, so a
     typo must never be read as "no bound at all". See
     _on_reverse_sync_range_commit() for what the caller does with it."""
+    text = text.strip()
+    if not text:
+        return None, True
+    try:
+        return int(text), True
+    except ValueError:
+        return None, False
+
+
+def _parse_optional_minutes(text: str) -> tuple[Optional[int], bool]:
+    """Parse the idle-disconnect field, returning (value, is_valid).
+
+    Blank -> (None, True): "never idle-disconnect" is an intentional,
+    valid state. Anything non-numeric -> (None, False), reported as
+    INVALID and reverted rather than silently persisted -- same rule as
+    _parse_optional_hz, for the same reason (what's on screen must be
+    what's actually in force). 0 parses fine and also means disabled; see
+    config.AppSettings.websdr_idle_disconnect_min."""
     text = text.strip()
     if not text:
         return None, True
@@ -340,6 +359,35 @@ class MainFrame(wx.Frame):
         _Tooltip(self.mute_on_tx_check, lambda: "Takes effect on the next PTT transition, not instantly.")
         self.mute_on_tx_check.Bind(wx.EVT_CHECKBOX, self._on_mute_on_tx_changed)
         grid.Add(self.mute_on_tx_check, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        row += 1
+
+        grid.Add(wx.StaticText(parent, label="Idle disconnect (min):"), pos=(row, 0),
+                 flag=wx.ALIGN_CENTER_VERTICAL)
+        self.idle_disconnect_entry = wx.TextCtrl(
+            parent,
+            value=(str(self.settings.websdr_idle_disconnect_min)
+                   if self.settings.websdr_idle_disconnect_min is not None else ""),
+            size=(90, -1),
+            style=wx.TE_PROCESS_ENTER,
+        )
+        # Commits on Enter/blur only, never per keystroke -- same pattern
+        # as the reverse-sync range fields (see
+        # _on_idle_disconnect_commit), so a field momentarily blank while
+        # retyping can't be persisted as "disabled".
+        self.idle_disconnect_entry.Bind(wx.EVT_TEXT_ENTER, self._on_idle_disconnect_commit)
+        self.idle_disconnect_entry.Bind(wx.EVT_KILL_FOCUS, self._on_idle_disconnect_commit)
+        _Tooltip(
+            self.idle_disconnect_entry,
+            lambda: "Release the WebSDR audio slot after this many minutes with no rig activity "
+                    "(no frequency, mode or PTT change). Reconnects automatically as soon as you "
+                    "use the rig again. Blank or 0 = never disconnect. Public receivers are "
+                    "volunteer-run and have limited slots. Applies when you press Enter or leave "
+                    "the field.",
+        )
+        grid.Add(self.idle_disconnect_entry, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.websdr_idle_text = wx.StaticText(parent, label="")
+        self.websdr_idle_text.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        grid.Add(self.websdr_idle_text, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         self.reverse_sync_error_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
@@ -1024,6 +1072,39 @@ class MainFrame(wx.Frame):
             self.settings.save()
         self._refresh_reverse_sync_range_fields()
 
+    def _refresh_idle_disconnect_field(self) -> None:
+        """Redisplay the field from the saved setting, so what's on screen
+        is always exactly what's in force. ChangeValue(), not SetValue(),
+        so this never re-fires a text event."""
+        value = self.settings.websdr_idle_disconnect_min
+        text = "" if value is None else str(value)
+        if self.idle_disconnect_entry.GetValue() != text:
+            self.idle_disconnect_entry.ChangeValue(text)
+
+    def _on_idle_disconnect_commit(self, event=None) -> None:
+        """Commit on Enter/blur, NOT per keystroke -- mirrors
+        _on_reverse_sync_range_commit exactly. sync/engine.py reads
+        self.settings.websdr_idle_disconnect_min live on every tick, so
+        anything saved here takes effect within one poll interval; a
+        per-keystroke save would briefly enforce every mid-edit state
+        (e.g. a lone "6" while typing "60" would arm a 6-minute
+        disconnect). An unparseable value saves nothing and reverts,
+        rather than silently collapsing to "disabled"."""
+        if event is not None:
+            event.Skip()  # EVT_KILL_FOCUS must keep propagating
+        minutes, valid = _parse_optional_minutes(self.idle_disconnect_entry.GetValue())
+        if not valid:
+            logger.warning("Ignoring unparseable idle-disconnect input; reverting to the saved value")
+            self._refresh_idle_disconnect_field()
+            return
+        minutes = clamp_idle_disconnect_min(minutes)
+        # Blur fires on every tab-through, so skip the disk write when
+        # nothing actually changed.
+        if minutes != self.settings.websdr_idle_disconnect_min:
+            self.settings.websdr_idle_disconnect_min = minutes
+            self.settings.save()
+        self._refresh_idle_disconnect_field()
+
     def _update_mock_rig_panel_visibility(self) -> None:
         # Gate on the *running rig session's* mode, not the live checkbox
         # -- the checkbox is disabled while the rig is connected so they
@@ -1162,6 +1243,7 @@ class MainFrame(wx.Frame):
             _set_wrapped(self.reverse_sync_error_text, "")
             _set_wrapped(self.reverse_sync_pending_text, "")
             self.reverse_sync_held_text.SetLabel("")
+            self.websdr_idle_text.SetLabel("")
             self.reverse_sync_hold_btn.Enable(False)
             self._websdr_active = False
             self._websdr_connected = False
@@ -1206,9 +1288,13 @@ class MainFrame(wx.Frame):
         self._websdr_active = snap.websdr_active
         if not snap.websdr_active:
             self._active_websdr_site = None
-            self._websdr_conn_text = "not connected"
+            # v14: an idle release is a deliberate, healthy state -- it
+            # must read as such, not as "not connected" (which looks like
+            # the user never connected) and certainly not through the red
+            # error label below.
+            self._websdr_conn_text = "disconnected (idle)" if snap.websdr_idle_stopped else "not connected"
             self._websdr_connected = False
-            self.websdr_conn_text.SetLabel("not connected")
+            self.websdr_conn_text.SetLabel(self._websdr_conn_text)
             self.websdr_driver_text.SetLabel("-")
             self.websdr_freq_text.SetLabel("-")
             self.websdr_mode_text.SetLabel("-")
@@ -1239,6 +1325,10 @@ class MainFrame(wx.Frame):
         self.reverse_sync_hold_btn.Enable(True)
         self.reverse_sync_hold_btn.SetValue(snap.reverse_sync_held)
         self.reverse_sync_held_text.SetLabel("Reverse sync held" if snap.reverse_sync_held else "")
+        self.websdr_idle_text.SetLabel(
+            "Idle -- slot released, will reconnect when you use the rig"
+            if snap.websdr_idle_stopped else ""
+        )
         self._update_websdr_controls()
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:

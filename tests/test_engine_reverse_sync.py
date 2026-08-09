@@ -29,6 +29,7 @@ from sdrsync.sync.engine import (
     REVERSE_MIN_RIG_WRITE_GAP_S,
     REVERSE_MODE_DEBOUNCE_S,
     REVERSE_PUSH_MAX_ATTEMPTS,
+    WEBSDR_MIN_WRITE_GAP_S,
     SyncEngine,
 )
 from sdrsync.websdr.base import WebSDRStatus
@@ -140,12 +141,21 @@ def _clear_rig_write_gap(engine: SyncEngine) -> None:
     engine._last_rig_write_at -= REVERSE_MIN_RIG_WRITE_GAP_S + 0.1
 
 
+def _clear_websdr_write_gap(engine: SyncEngine) -> None:
+    """Same idea as _clear_rig_write_gap, for the v14 FORWARD-direction
+    floor (WEBSDR_MIN_WRITE_GAP_S) -- these tests drive consecutive ticks
+    with no real wall-clock delay, so the mode push in one tick would
+    otherwise throttle the freq push in the next."""
+    engine._last_websdr_write_at -= WEBSDR_MIN_WRITE_GAP_S + 0.1
+
+
 def _settle_and_capture_baseline(engine: SyncEngine) -> None:
     """Drives ticks until the initial forward push(es) are done and the
     reverse baseline has been captured -- see module docstring."""
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # mode forward-pushes; freq only arms
     engine._pending_freq_since -= 1.0
+    _clear_websdr_write_gap(engine)
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # freq forward-pushes now
     _clear_holdoff(engine)
@@ -209,6 +219,7 @@ def test_echo_of_own_pushed_value_does_not_trigger_a_reverse_push():
     # forward pushes below, reverse sync must stay suppressed.
     asyncio.run(engine._tick())  # mode forward-pushes
     engine._pending_freq_since -= 1.0
+    _clear_websdr_write_gap(engine)
     asyncio.run(engine._tick())  # freq forward-pushes
     assert stub_driver.modes == [("USB", 2700)]
     assert stub_driver.tuned == [14074000]
@@ -390,6 +401,7 @@ def test_forward_push_echo_with_collapsed_mode_does_not_bounce_back():
     # "PKTUSB", not "USB".
     stub_rig.state.mode = "PKTUSB"
     _clear_holdoff(engine)
+    _clear_websdr_write_gap(engine)
     asyncio.run(engine._tick())  # forward push applies PKTUSB; page stays "USB"
     assert stub_driver.modes[-1] == ("PKTUSB", 2700)
 

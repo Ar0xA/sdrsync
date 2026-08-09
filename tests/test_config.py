@@ -326,3 +326,60 @@ def test_save_then_load_round_trips_imported_and_curated_sites(monkeypatch, tmp_
 
     assert reloaded.imported_sites == [{"name": "I", "url": "http://i.example/", "driver_type": "kiwisdr"}]
     assert reloaded.curated_sites == [{"name": "C", "url": "http://c.example/", "driver_type": "openwebrx"}]
+
+
+
+# --- v14: websdr_idle_disconnect_min -----------------------------------
+
+
+def test_idle_disconnect_defaults_to_sixty_minutes(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().websdr_idle_disconnect_min == 60
+
+
+def test_load_accepts_a_valid_idle_disconnect(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": 15}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min == 15
+
+
+def test_load_accepts_null_idle_disconnect_as_disabled(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": None}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min is None
+
+
+def test_load_keeps_zero_idle_disconnect_as_disabled(monkeypatch, tmp_path):
+    """0 is a valid way to say 'never' -- it must survive load() unchanged
+    (the engine treats <= 0 as off), not be corrected to the default."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": 0}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min == 0
+
+
+def test_load_rejects_wrong_type_idle_disconnect(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": "60"}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min == 60  # falls back to the default
+
+
+def test_load_clamps_negative_idle_disconnect_to_disabled(monkeypatch, tmp_path):
+    """Fails toward OFF, deliberately the opposite direction from
+    clamp_reverse_sync_bounds' inverted-range swap: over-eager
+    disconnecting tears down a working session under the user, whereas
+    not idle-disconnecting merely restores the old behavior."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": -5}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min is None
+
+
+def test_clamp_idle_disconnect_min_passes_through_valid_values():
+    assert config_module.clamp_idle_disconnect_min(30) == 30
+    assert config_module.clamp_idle_disconnect_min(0) == 0
+    assert config_module.clamp_idle_disconnect_min(None) is None
+
+
+def test_save_then_load_round_trips_idle_disconnect(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    AppSettings(websdr_idle_disconnect_min=45).save()
+    assert AppSettings.load().websdr_idle_disconnect_min == 45

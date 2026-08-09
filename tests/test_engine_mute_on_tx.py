@@ -13,7 +13,7 @@ import queue
 
 from sdrsync.config import AppSettings
 from sdrsync.rig.rigctld import RigState
-from sdrsync.sync.engine import SyncEngine
+from sdrsync.sync.engine import WEBSDR_MIN_WRITE_GAP_S, SyncEngine
 from sdrsync.websdr.base import WebSDRStatus
 
 
@@ -88,6 +88,12 @@ def test_unmute_still_fires_after_mute_on_tx_disabled_mid_transmission():
         await engine._tick()  # PTT rising edge, mute_on_tx True -> mutes
         settings.mute_on_tx = False  # user unchecks the box mid-TX
         engine._rig.state = RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False)
+        # v14: mute/unmute are writes to the WebSDR page and share the
+        # global WEBSDR_MIN_WRITE_GAP_S floor, so back-to-back ticks with
+        # no wall-clock delay between them would otherwise be throttled.
+        # (That the deferred unmute is not LOST is covered separately, by
+        # test_ptt_edge_deferred_by_write_gap_still_fires_on_a_later_tick.)
+        engine._last_websdr_write_at -= WEBSDR_MIN_WRITE_GAP_S + 0.1
         await engine._tick()  # PTT falling edge -- must still unmute
 
     asyncio.run(run())
@@ -108,3 +114,36 @@ def test_mute_stays_gated_off_when_mute_on_tx_disabled_before_transmission():
 
     # mute_on_tx was already off before the rising edge -- must not mute.
     assert stub_driver.mute_calls == []
+
+
+
+def test_ptt_edge_deferred_by_write_gap_still_fires_on_a_later_tick():
+    """v14: mute/unmute are real writes into the WebSDR page, so they sit
+    behind the same WEBSDR_MIN_WRITE_GAP_S floor as the forward pushes.
+    A PTT edge that arrives inside that window must be DEFERRED, never
+    dropped -- _last_ptt is deliberately not latched unless the call
+    actually goes out. Dropping it would resurrect exactly the bug this
+    module exists for: a WebSDR left muted forever with no future edge
+    able to clear it."""
+    settings = AppSettings(mute_on_tx=True)
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=_UnusedWebViewHost())
+    stub_driver = StubDriver()
+    engine._rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=True))
+    engine._rig_active = True
+    engine._driver = stub_driver
+    engine._websdr_active = True
+
+    asyncio.run(engine._tick())  # rising edge -> mutes, and stamps the write gap
+    assert stub_driver.mute_calls == [True]
+
+    # Falling edge arrives while the gap is still closed.
+    engine._rig.state = RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False)
+    asyncio.run(engine._tick())
+    assert stub_driver.mute_calls == [True]  # deferred...
+    assert engine._last_ptt is True  # ...and NOT latched away
+
+    # Next tick past the gap: the unmute still happens.
+    engine._last_websdr_write_at -= WEBSDR_MIN_WRITE_GAP_S + 0.1
+    asyncio.run(engine._tick())
+    assert stub_driver.mute_calls == [True, False]
+    assert engine._last_ptt is False
