@@ -5,9 +5,34 @@ shortwave receiver you tune through a website) in sync with a real
 transceiver over the network, via either hamlib's `rigctld` or `flrig`'s
 own XML-RPC interface — **not** Omnirig.
 
-**Sync direction is one-way only: transceiver → WebSDR.** Turning the dial
-or changing mode on your radio retunes the WebSDR; the reverse (tuning the
-WebSDR to move your radio) is not implemented.
+**Sync is bidirectional.** Turning the dial or changing mode on your radio
+retunes the WebSDR, and clicking/tuning directly on the WebSDR page moves
+your radio's frequency and mode right back. **This means the WebSDR page
+can retune your transmitter.** PTT/transmit always wins (rig state is
+never overridden while you're transmitting), but there is currently no
+other safety bound (e.g. a band-plan check) — read the "Reverse sync"
+section below before connecting a real transceiver to a public WebSDR you
+don't control.
+
+## Reverse sync (WebSDR → rig)
+
+Changing frequency or mode on the WebSDR page itself (clicking the
+waterfall, using the page's own mode buttons) pushes that change to your
+rig via `rigctld`/`flrig`'s SET commands, verified by reading the change
+back from the rig before trusting it. This is suppressed the whole time
+you're transmitting, so PTT always wins — the WebSDR can't move your VFO
+mid-transmission.
+
+Beyond that, there is currently **no other bound** on what gets sent: no
+band-plan check, no legality check for your licence or country, no "is
+this frequency even valid for my rig" check, no confirmation before a
+large jump. If you're pointing a real transceiver at a public WebSDR you
+don't control, be aware of this before leaving it connected unattended.
+
+**Testing status, plainly**: reverse sync has been live-tested against
+real hardware on websdr.org and KiwiSDR, through both the `rigctld` and
+`flrig` backends. It has **not** yet been tested against real hardware
+on OpenWebRX — that's the one remaining untested combination.
 
 ## How it works
 
@@ -184,5 +209,11 @@ GPL-3.0-only — see [LICENSE](LICENSE).
 
 ## Platform support
 
-Windows only for now (the embedded browser is Edge WebView2). Linux/macOS
-support is a known, tracked gap — not yet started.
+- **Windows**: fully supported, packaged builds released as zips (Edge
+  WebView2 as the embedded browser).
+- **Linux**: supported, packaged builds also released as tarballs
+  (WebKitGTK as the embedded browser). Live-verified inside WSL2/WSLg
+  only — not yet run on a bare-metal Linux desktop or a non-GNOME/non-
+  XWayland compositor.
+- **macOS**: best-effort code path only, **never run on an actual Mac**
+  — no Mac has been available during development. Treat as unverified.

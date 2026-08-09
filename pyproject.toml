@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sdrsync"
 dynamic = ["version"]
-description = "Keeps a WebSDR in sync with a real transceiver over hamlib's rigctld (one-way: rig -> WebSDR)."
+description = "Keeps a WebSDR in sync with a real transceiver over hamlib's rigctld or flrig (bidirectional: rig <-> WebSDR)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-only" }
@@ -13,9 +13,12 @@ authors = [{ name = "Ar0xA" }]
 classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
+    # Fully supported, packaged builds released for both.
     "Operating System :: Microsoft :: Windows",
-    "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
+    # Best-effort code path only -- never run on a real Mac, no packaged
+    # build released. See README.md's "Platform support" section.
+    "Operating System :: MacOS",
 ]
 dependencies = [
     # PyPI ships no manylinux wheels for wxPython -- a bare `pip install`
