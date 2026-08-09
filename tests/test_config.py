@@ -85,6 +85,109 @@ def test_load_clamps_out_of_range_poll_interval(monkeypatch, tmp_path):
     assert AppSettings.load().poll_interval_s == config_module.MAX_POLL_INTERVAL_S
 
 
+def test_load_accepts_valid_reverse_sync_range(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"reverse_sync_min_hz": 1_800_000, "reverse_sync_max_hz": 30_000_000}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz == 1_800_000
+    assert settings.reverse_sync_max_hz == 30_000_000
+
+
+def test_load_defaults_reverse_sync_range_to_unrestricted(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz is None
+    assert settings.reverse_sync_max_hz is None
+
+
+def test_load_accepts_reverse_sync_range_with_only_one_bound_set(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"reverse_sync_min_hz": 100_000}), encoding="utf-8")
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz == 100_000
+    assert settings.reverse_sync_max_hz is None
+
+
+def test_load_rejects_wrong_type_reverse_sync_range(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"reverse_sync_min_hz": "not a number", "reverse_sync_max_hz": True}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz is None
+    assert settings.reverse_sync_max_hz is None
+
+
+def test_load_clamps_negative_reverse_sync_bounds_to_unrestricted(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"reverse_sync_min_hz": -100}), encoding="utf-8")
+    assert AppSettings.load().reverse_sync_min_hz is None
+
+    config_file.write_text(json.dumps({"reverse_sync_max_hz": -1}), encoding="utf-8")
+    assert AppSettings.load().reverse_sync_max_hz is None
+
+
+def test_load_swaps_inverted_reverse_sync_range():
+    """An inverted range (min > max) is almost always a transposition of
+    the intended bounds. It must be SWAPPED, not reset to unrestricted:
+    unlike poll_interval_s (where the safe correction is the permissive
+    one), LOOSENING is the unsafe direction for this guard -- it bounds
+    what a public WebSDR page may retune a real transmitter to, so
+    dropping both bounds would silently leave no guard at all while the
+    user still believes reverse sync is confined to, say, HF."""
+    filtered = {"reverse_sync_min_hz": 30_000_000, "reverse_sync_max_hz": 1_800_000}
+    config_module._clamp_reverse_sync_range(filtered)
+    assert filtered["reverse_sync_min_hz"] == 1_800_000
+    assert filtered["reverse_sync_max_hz"] == 30_000_000
+
+
+def test_load_swaps_inverted_reverse_sync_range_end_to_end(monkeypatch, tmp_path):
+    """The swap must survive the full load() path, not just the helper --
+    a hand-edited config.json with min/max transposed still ends up with
+    an enforced (corrected) range on the AppSettings instance."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"reverse_sync_min_hz": 30_000_000, "reverse_sync_max_hz": 1_800_000}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz == 1_800_000
+    assert settings.reverse_sync_max_hz == 30_000_000
+
+
+def test_clamp_reverse_sync_bounds_passes_through_a_valid_range():
+    """The shared helper (used by both config.load() and gui/app.py's
+    range fields) must leave a sane range completely alone, including the
+    one-bound-only and both-unset cases."""
+    assert config_module.clamp_reverse_sync_bounds(1_800_000, 30_000_000) == (1_800_000, 30_000_000)
+    assert config_module.clamp_reverse_sync_bounds(1_800_000, None) == (1_800_000, None)
+    assert config_module.clamp_reverse_sync_bounds(None, 30_000_000) == (None, 30_000_000)
+    assert config_module.clamp_reverse_sync_bounds(None, None) == (None, None)
+
+
+def test_clamp_reverse_sync_bounds_allows_an_equal_min_and_max():
+    """min == max is a degenerate but legitimate single-frequency lock,
+    not an inverted range -- must pass through untouched (engine.py's own
+    check is a strict inequality, so that exact value is still allowed)."""
+    assert config_module.clamp_reverse_sync_bounds(14_074_000, 14_074_000) == (14_074_000, 14_074_000)
+
+
+def test_clamp_reverse_sync_bounds_drops_only_the_negative_bound():
+    """A negative bound can't be satisfied by any real frequency, so it
+    goes to None (unrestricted on that side only) -- the OTHER, valid
+    bound must survive rather than being collateral damage."""
+    assert config_module.clamp_reverse_sync_bounds(-100, 30_000_000) == (None, 30_000_000)
+    assert config_module.clamp_reverse_sync_bounds(1_800_000, -1) == (1_800_000, None)
+    assert config_module.clamp_reverse_sync_bounds(-5, -9) == (None, None)
+
+
+def test_clamp_reverse_sync_bounds_does_not_swap_when_a_bound_was_dropped():
+    """A negative min is dropped BEFORE the inversion check, so the pair
+    can't then be 'swapped' into resurrecting the discarded value."""
+    assert config_module.clamp_reverse_sync_bounds(-30_000_000, 1_800_000) == (None, 1_800_000)
+
+
 def test_load_does_not_crash_on_non_object_top_level_json(monkeypatch, tmp_path):
     """config.json containing valid JSON that isn't an object (a list,
     string, number, or null) must fall back to defaults, not raise --

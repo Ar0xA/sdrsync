@@ -45,6 +45,7 @@ from sdrsync.config import (
     AppSettings,
     KNOWN_SITES,
     WebSDRSite,
+    clamp_reverse_sync_bounds,
 )
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
@@ -79,6 +80,24 @@ RIG_BACKEND_CHOICES = ["rigctld", "flrig"]
 def _set_wrapped(static_text: wx.StaticText, text: str, width: int = LABEL_WRAP_PX) -> None:
     static_text.SetLabel(text)
     static_text.Wrap(width)
+
+
+def _parse_optional_hz(text: str) -> tuple[Optional[int], bool]:
+    """Parse a reverse-sync range field, returning (value, is_valid).
+
+    Blank -> (None, True): unrestricted is an intentional, valid state,
+    not an error. Anything non-numeric -> (None, False), reported as
+    INVALID rather than silently collapsing to unrestricted -- this field
+    bounds what a WebSDR page may retune a real transmitter to, so a
+    typo must never be read as "no bound at all". See
+    _on_reverse_sync_range_commit() for what the caller does with it."""
+    text = text.strip()
+    if not text:
+        return None, True
+    try:
+        return int(text), True
+    except ValueError:
+        return None, False
 
 
 class _Tooltip:
@@ -271,6 +290,19 @@ class MainFrame(wx.Frame):
         self.websdr_disconnect_btn.Bind(wx.EVT_BUTTON, self._on_websdr_disconnect_clicked)
         _Tooltip(self.websdr_disconnect_btn, self._websdr_disconnect_tooltip_text)
         grid.Add(self.websdr_disconnect_btn, pos=(row, 1), flag=wx.ALIGN_LEFT)
+
+        self.reverse_sync_hold_btn = wx.ToggleButton(parent, label="Hold (WebSDR read-only)")
+        self.reverse_sync_hold_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_reverse_sync_hold_toggled)
+        _Tooltip(
+            self.reverse_sync_hold_btn,
+            lambda: "Pause the WebSDR page from moving your rig. Forward sync (rig -> WebSDR) "
+                    "keeps working. Can be toggled before connecting. A write already on its "
+                    "way to the rig may still complete once -- it can't be recalled mid-send.",
+        )
+        grid.Add(self.reverse_sync_hold_btn, pos=(row, 2), flag=wx.ALIGN_LEFT)
+        self.reverse_sync_held_text = wx.StaticText(parent, label="")
+        self.reverse_sync_held_text.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        grid.Add(self.reverse_sync_held_text, pos=(row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         grid.Add(wx.StaticText(parent, label="Custom URL:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -379,6 +411,43 @@ class MainFrame(wx.Frame):
         self.poll_interval_ctrl.SetDigits(2)
         self.poll_interval_ctrl.Bind(wx.EVT_SPINCTRLDOUBLE, self._on_poll_interval_changed)
         grid.Add(self.poll_interval_ctrl, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        row += 1
+
+        grid.Add(wx.StaticText(parent, label="Reverse-sync range (Hz):"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.reverse_sync_min_entry = wx.TextCtrl(
+            parent,
+            value=str(self.settings.reverse_sync_min_hz) if self.settings.reverse_sync_min_hz is not None else "",
+            size=(90, -1),
+            style=wx.TE_PROCESS_ENTER,
+        )
+        _Tooltip(
+            self.reverse_sync_min_entry,
+            lambda: "Lowest Hz reverse sync (WebSDR -> rig) may write to your rig. Blank = no lower bound. "
+                    "Applies when you press Enter or leave the field.",
+        )
+        grid.Add(self.reverse_sync_min_entry, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(wx.StaticText(parent, label="to:"), pos=(row, 2), flag=wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+        self.reverse_sync_max_entry = wx.TextCtrl(
+            parent,
+            value=str(self.settings.reverse_sync_max_hz) if self.settings.reverse_sync_max_hz is not None else "",
+            size=(90, -1),
+            style=wx.TE_PROCESS_ENTER,
+        )
+        # Both fields commit on Enter/blur only, never per keystroke (see
+        # _on_reverse_sync_range_commit). Bound only now that BOTH
+        # controls exist -- the handler reads them as a pair, so binding
+        # the min field earlier would leave a window where a kill-focus
+        # event (wx can move focus as later controls are created) reaches
+        # a handler whose max field isn't assigned yet.
+        for entry in (self.reverse_sync_min_entry, self.reverse_sync_max_entry):
+            entry.Bind(wx.EVT_TEXT_ENTER, self._on_reverse_sync_range_commit)
+            entry.Bind(wx.EVT_KILL_FOCUS, self._on_reverse_sync_range_commit)
+        _Tooltip(
+            self.reverse_sync_max_entry,
+            lambda: "Highest Hz reverse sync (WebSDR -> rig) may write to your rig. Blank = no upper bound. "
+                    "Applies when you press Enter or leave the field.",
+        )
+        grid.Add(self.reverse_sync_max_entry, pos=(row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         self.mock_rig_check = wx.CheckBox(parent, label="Use mock rig (embedded, for testing)")
@@ -545,6 +614,12 @@ class MainFrame(wx.Frame):
         self.websdr_disconnect_btn.Enable(False)
         self.websdr_disconnect_btn.SetLabel("Disconnecting...")
         self.engine.stop_websdr_from_other_thread()
+
+    def _on_reverse_sync_hold_toggled(self, _event=None) -> None:
+        # Not gated on _websdr_active -- deliberately toggleable before
+        # connecting, so it can be pre-armed (see engine.set_reverse_sync_held's
+        # docstring for why setting it before the engine loop exists is safe).
+        self.engine.set_reverse_sync_held(self.reverse_sync_hold_btn.GetValue())
 
     def _websdr_connect_tooltip_text(self) -> Optional[str]:
         # The only reason Connect is ever disabled (as opposed to clickable
@@ -898,6 +973,57 @@ class MainFrame(wx.Frame):
         self.settings.poll_interval_s = self.poll_interval_ctrl.GetValue()
         self.settings.save()
 
+    def _refresh_reverse_sync_range_fields(self) -> None:
+        """Redisplay both range fields from the saved settings, so what's
+        on screen is always exactly what's being enforced. ChangeValue(),
+        not SetValue(), so this never re-fires a text event."""
+        for entry, value in (
+            (self.reverse_sync_min_entry, self.settings.reverse_sync_min_hz),
+            (self.reverse_sync_max_entry, self.settings.reverse_sync_max_hz),
+        ):
+            text = "" if value is None else str(value)
+            if entry.GetValue() != text:
+                entry.ChangeValue(text)
+
+    def _on_reverse_sync_range_commit(self, event=None) -> None:
+        """Commit on Enter/blur, NOT per keystroke. sync/engine.py reads
+        self.settings.reverse_sync_min_hz/max_hz live on every reverse-sync
+        tick, so anything saved here is enforced within one poll interval
+        -- and this range is what bounds the frequencies a public WebSDR
+        page may write to a real transmitter. A per-keystroke save would
+        therefore persist and enforce every mid-edit state (a field
+        momentarily blank while retyping, a half-typed number, a pasted
+        "14,000,000"), most of which read as "unrestricted". That's fine
+        for a cosmetic field and not fine for this one.
+
+        Blank stays a valid, intentional state (None/unrestricted). A
+        genuinely unparseable value saves nothing and reverts the fields
+        to the last saved values, so the screen never shows a bound that
+        isn't actually in force. Otherwise the values go through
+        config.clamp_reverse_sync_bounds() -- the same negative-drop /
+        inverted-swap rules load() applies to a hand-edited config.json,
+        called rather than reimplemented so the two layers can't drift --
+        and the fields are redisplayed from what was actually saved, so a
+        corrected (swapped) range doesn't leave the raw typed text on
+        screen misrepresenting what's enforced."""
+        if event is not None:
+            event.Skip()  # EVT_KILL_FOCUS must keep propagating
+        min_hz, min_valid = _parse_optional_hz(self.reverse_sync_min_entry.GetValue())
+        max_hz, max_valid = _parse_optional_hz(self.reverse_sync_max_entry.GetValue())
+        if not (min_valid and max_valid):
+            logger.warning("Ignoring unparseable reverse-sync range input; reverting to the saved values")
+            self._refresh_reverse_sync_range_fields()
+            return
+        min_hz, max_hz = clamp_reverse_sync_bounds(min_hz, max_hz)
+        # Blur fires on every tab-through, so skip the disk write when
+        # nothing actually changed; the redisplay below still runs, which
+        # is what normalizes e.g. surrounding whitespace.
+        if (min_hz, max_hz) != (self.settings.reverse_sync_min_hz, self.settings.reverse_sync_max_hz):
+            self.settings.reverse_sync_min_hz = min_hz
+            self.settings.reverse_sync_max_hz = max_hz
+            self.settings.save()
+        self._refresh_reverse_sync_range_fields()
+
     def _update_mock_rig_panel_visibility(self) -> None:
         # Gate on the *running rig session's* mode, not the live checkbox
         # -- the checkbox is disabled while the rig is connected so they
@@ -1035,6 +1161,8 @@ class MainFrame(wx.Frame):
             self.rig_conn_text.SetLabel("error")
             _set_wrapped(self.reverse_sync_error_text, "")
             _set_wrapped(self.reverse_sync_pending_text, "")
+            self.reverse_sync_held_text.SetLabel("")
+            self.reverse_sync_hold_btn.Enable(False)
             self._websdr_active = False
             self._websdr_connected = False
             self._active_websdr_site = None
@@ -1108,6 +1236,9 @@ class MainFrame(wx.Frame):
                 _set_wrapped(self.websdr_err_text, ws.last_error or "")
         _set_wrapped(self.reverse_sync_error_text, snap.reverse_sync_error or "")
         _set_wrapped(self.reverse_sync_pending_text, snap.reverse_sync_pending or "")
+        self.reverse_sync_hold_btn.Enable(True)
+        self.reverse_sync_hold_btn.SetValue(snap.reverse_sync_held)
+        self.reverse_sync_held_text.SetLabel("Reverse sync held" if snap.reverse_sync_held else "")
         self._update_websdr_controls()
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:

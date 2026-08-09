@@ -29,13 +29,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Protocol
 
 from sdrsync.config import AppSettings, WebSDRSite
 from sdrsync.gui_messages import GuiMessage
+from sdrsync.preflight import check_websdr_url
 from sdrsync.rig.base import RigState
 from sdrsync.rig.fake_flrig import FakeFlrigState
 from sdrsync.rig.fake_flrig import start_server as start_mock_flrig
@@ -224,6 +226,10 @@ class StatusSnapshot(GuiMessage):
     # routine CAT-bus latency on some rigs, not worth surfacing.
     reverse_sync_error: Optional[str] = None
     reverse_sync_pending: Optional[str] = None
+    # v13: True while the user has paused the WebSDR -> rig direction via
+    # the Hold toggle -- distinct from both fields above (this is a
+    # deliberate, ongoing choice, not an error or an in-progress retry).
+    reverse_sync_held: bool = False
 
 
 class SyncEngine:
@@ -348,6 +354,13 @@ class SyncEngine:
         # post-await write would resurrect pre-reattach bookkeeping over
         # a reset that already superseded it.
         self._sync_latch_generation: int = 0
+        # Session-only pause on the WebSDR -> rig direction (v13's
+        # "Hold" toggle) -- deliberately NOT reset by
+        # _reset_sync_latches()/a WebSDR reattach, and NOT persisted to
+        # AppSettings: always starts False on a fresh launch, so the app
+        # never silently starts up already holding reverse sync from a
+        # forgotten previous session. See set_reverse_sync_held().
+        self._reverse_sync_held: bool = False
 
     # ------------------------------------------------------------------
     # Thread-safe entry points -- call these from the GUI thread.
@@ -413,6 +426,7 @@ class SyncEngine:
             websdr_active=self._websdr_active,
             reverse_sync_error=self._reverse_sync_error,
             reverse_sync_pending=self._reverse_sync_pending_text(),
+            reverse_sync_held=self._reverse_sync_held,
             **overrides,
         )
         try:
@@ -713,6 +727,57 @@ class SyncEngine:
         if state is not None:
             self._push_to_mock(lambda: setattr(state, "ptt", "1" if is_tx else "0"))
 
+    # ------------------------------------------------------------------ Hold / rig-is-master (GUI-driven)
+    def set_reverse_sync_held(self, held: bool) -> None:
+        """Thread-safe. Pauses/resumes the WebSDR -> rig direction only --
+        forward sync and both connections (rig, WebSDR) are completely
+        untouched. If the engine loop hasn't started yet, sets the field
+        directly (safe: nothing is reading it concurrently before the
+        loop exists); once it's running, dispatches onto the loop so the
+        accompanying ladder-state clear (see _apply_reverse_sync_held)
+        can't race a concurrent _reverse_sync_tick()."""
+        loop = self._loop
+        if loop is None:
+            self._reverse_sync_held = held
+            return
+        try:
+            loop.call_soon_threadsafe(self._apply_reverse_sync_held, held)
+        except RuntimeError:
+            pass  # loop already closed
+
+    def _apply_reverse_sync_held(self, held: bool) -> None:
+        """Runs on the engine loop thread. Clears in-flight reverse-sync
+        ladder/pending state on every transition (engaging OR releasing
+        Hold) -- reuses the same fields _reset_sync_latches() already
+        resets for exactly this reason: don't resume chasing a target
+        that went stale while paused, and don't let a page click made
+        while held get treated as a fresh edit the instant Hold is
+        released. Scoped to just the reverse-side fields, so forward-sync
+        bookkeeping is untouched.
+
+        Also bumps _sync_latch_generation, for the same reason
+        _reset_sync_latches() does: a push suspended mid-await inside
+        rig.set_freq()/set_mode() (the verify-readback loop) would
+        otherwise pass the generation check on return and write
+        bookkeeping -- including a give-up _reverse_sync_error -- for a
+        push the user just cancelled with Hold, leaving the GUI showing
+        both "Reverse sync held" and a stale failure that only clears on
+        release or WebSDR reattach. Bumping here makes any such in-flight
+        push count as superseded, exactly like a concurrent reset. Note
+        this cancels only the BOOKKEEPING: a write already on the wire to
+        the rig still completes, which is unavoidable -- it can't be
+        recalled mid-transmission."""
+        self._reverse_sync_held = held
+        self._mode_push = None
+        self._freq_push = None
+        self._pending_reverse_mode = None
+        self._pending_reverse_mode_since = 0.0
+        self._pending_reverse_freq = None
+        self._pending_reverse_freq_since = 0.0
+        self._reverse_baseline_captured = False
+        self._reverse_sync_error = None
+        self._sync_latch_generation += 1
+
     # ------------------------------------------------------------------
     def _reset_sync_latches(self) -> None:
         self._last_sent_freq = None
@@ -742,7 +807,7 @@ class SyncEngine:
         self._sync_latch_generation += 1
 
     async def _poll_loop(self) -> None:
-        logger.info("Sync engine started (rig -> WebSDR, one-way)")
+        logger.info("Sync engine started (bidirectional: rig <-> WebSDR)")
         while not self.stop_event.is_set():
             try:
                 await self._tick()
@@ -843,6 +908,23 @@ class SyncEngine:
                         self._mode_push = _ReversePush(target=obs_mode)
                 push = self._mode_push
                 if push is not None and can_write_rig and time.monotonic() >= push.next_attempt_at:
+                    # CW is the one mode family where multiple rig-native
+                    # names (CW, CWR, CW-U, CW-L) all collapse to the same
+                    # WebSDR-observable value ("CW") -- the page has no way
+                    # to tell us which variant it wants. Some rigctld
+                    # backends/rig models only accept "CW-U"/"CW-L" as valid
+                    # SET-mode strings and reject a bare "CW" outright
+                    # (confirmed live: KiwiSDR + a rig with no plain CW
+                    # mode). So when the rig is ALREADY in some CW-family
+                    # mode, echo its own current name back instead of
+                    # forcing it to "CW" -- only a genuine transition INTO
+                    # CW from a different mode family falls back to the
+                    # canonical "CW", since there's no rig-native value to
+                    # echo in that case. No other standard hamlib mode name
+                    # starts with "CW", so this check is safe.
+                    mode_to_send = obs_mode
+                    if obs_mode == "CW" and state.mode is not None and state.mode.upper().startswith("CW"):
+                        mode_to_send = state.mode
                     # Preserve the rig's current filter width when only the
                     # page's narrow/wide variant changed within the same base
                     # mode (the page can't tell us which variant it wants --
@@ -851,8 +933,8 @@ class SyncEngine:
                     # changed. Recomputed fresh each attempt from this
                     # tick's state, not captured once at ladder start -- the
                     # rig may have partially moved between attempts.
-                    passband_hz = state.passband_hz if obs_mode == state.mode else None
-                    ok = await self._rig.set_mode(obs_mode, passband_hz, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
+                    passband_hz = state.passband_hz if mode_to_send == state.mode else None
+                    ok = await self._rig.set_mode(mode_to_send, passband_hz, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
                     # Stamp unconditionally, before the generation guard --
                     # the write physically happened on the wire regardless
                     # of whether a concurrent reset superseded our own
@@ -877,13 +959,20 @@ class SyncEngine:
                         # direction to re-assert it on the very next tick)
                         # instead of waiting indefinitely for a click that
                         # isn't sticking.
+                        # User-visible text names mode_to_send, the string
+                        # actually written to the rig, not the canonical
+                        # obs_mode -- with the CW echo above those differ
+                        # (page says "CW", the rig was sent "CW-L"), and
+                        # naming a value that was never sent misleads
+                        # anyone diagnosing a real rejection. Internal
+                        # bookkeeping below stays keyed on obs_mode.
                         logger.warning(
                             "Rig did not confirm mode %r after %d attempts -- "
                             "reverting WebSDR to match the rig's actual mode %r",
-                            obs_mode, push.attempts, state.mode,
+                            mode_to_send, push.attempts, state.mode,
                         )
                         self._reverse_sync_error = (
-                            f"Could not set mode {obs_mode!r} on the rig -- WebSDR reverted to match the rig"
+                            f"Could not set mode {mode_to_send!r} on the rig -- WebSDR reverted to match the rig"
                         )
                         self._last_observed_mode_key = obs_mode
                         self._last_sent_mode_key = None
@@ -923,6 +1012,30 @@ class SyncEngine:
             return
 
         pending_freq = self._pending_reverse_freq
+        min_hz = self.settings.reverse_sync_min_hz
+        max_hz = self.settings.reverse_sync_max_hz
+        if (min_hz is not None and pending_freq < min_hz) or (max_hz is not None and pending_freq > max_hz):
+            # Reject immediately -- skip the retry ladder entirely, since
+            # retrying can never make an out-of-range value pass. Same
+            # rig-is-master revert the ladder's own give-up path uses
+            # (force the forward direction to re-assert the rig's real
+            # frequency on the next tick) rather than leaving the WebSDR
+            # page sitting on an unreachable value.
+            logger.warning(
+                "Reverse-sync frequency %d Hz is outside the configured range [%s, %s] Hz -- "
+                "rejected, reverting WebSDR to match the rig",
+                pending_freq,
+                min_hz if min_hz is not None else "-inf",
+                max_hz if max_hz is not None else "+inf",
+            )
+            self._reverse_sync_error = (
+                f"Frequency {pending_freq} Hz is outside the configured reverse-sync range -- "
+                "WebSDR reverted to match the rig"
+            )
+            self._last_observed_freq = pending_freq
+            self._last_sent_freq = None
+            self._freq_push = None
+            return
         if self._freq_push is None or self._freq_push.target != pending_freq:
             self._freq_push = _ReversePush(target=pending_freq)
         push = self._freq_push
@@ -1119,6 +1232,7 @@ class SyncEngine:
             if (
                 not reverse_ptt
                 and websdr_status.connected
+                and not self._reverse_sync_held
                 and time.monotonic() - self._forward_push_completed_at >= REVERSE_HOLDOFF_S
             ):
                 await self._reverse_sync_tick(websdr_status, state)

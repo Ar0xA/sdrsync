@@ -120,6 +120,18 @@ class AppSettings:
     # in the GUI widget -- a hand-edited 0 or negative value would
     # otherwise reach asyncio.wait_for(timeout=...) as a busy loop.
     poll_interval_s: float = 0.2
+    # Reverse sync (WebSDR -> rig, v11) frequency safety bound. None means
+    # unrestricted on that side -- either can be set independently (e.g.
+    # min_hz alone rejects anything below it with no upper bound). Any
+    # frequency the WebSDR page reports outside this range is rejected
+    # rather than written to the rig; see sync/engine.py's
+    # _reverse_sync_tick(). Default unrestricted on both, matching every
+    # other reverse-sync safety control in this app (Hold toggle
+    # defaults off too) -- this is an opt-in guard, not a forced-on
+    # restriction, since a sane default range doesn't exist across every
+    # rig/band/country this app might be used in.
+    reverse_sync_min_hz: Optional[int] = None
+    reverse_sync_max_hz: Optional[int] = None
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -141,6 +153,7 @@ class AppSettings:
             _validate_site_list(filtered, "curated_sites")
             _validate_rig_backend(filtered)
             _clamp_poll_interval(filtered)
+            _clamp_reverse_sync_range(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
             logger.warning("Could not load %s (%s); using defaults", CONFIG_FILE, e)
@@ -181,6 +194,8 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "headless": bool,
     "use_mock_rig": bool,
     "poll_interval_s": (int, float),
+    "reverse_sync_min_hz": (int, type(None)),
+    "reverse_sync_max_hz": (int, type(None)),
 }
 
 RIG_BACKENDS = {"rigctld", "flrig"}
@@ -209,6 +224,62 @@ def _clamp_poll_interval(filtered: dict[str, Any]) -> None:
             CONFIG_FILE, value, clamped, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S,
         )
         filtered["poll_interval_s"] = clamped
+
+
+def clamp_reverse_sync_bounds(
+    min_hz: Optional[int], max_hz: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Pure sanity-check of a reverse-sync min/max Hz pair: takes the two
+    bounds, returns the corrected pair. Shared by _clamp_reverse_sync_range()
+    below (a hand-edited config.json) and gui/app.py's range entry fields
+    (typed input), so the two layers enforcing this safety bound can't
+    drift apart.
+
+    A NEGATIVE bound can never be satisfied by a real frequency, so it
+    would silently reject every reverse-sync push forever with no way for
+    the user to tell why -- that one bound is dropped to None
+    (unrestricted) rather than left as a value nothing can pass.
+
+    An INVERTED range (min > max, both otherwise valid) is SWAPPED, not
+    dropped. This is deliberately the opposite correction direction from
+    _clamp_poll_interval's fail-open philosophy, because the risk is
+    reversed: for poll_interval_s a too-tight value breaks the app, so
+    the safe direction is permissive; here LOOSENING is the unsafe
+    direction, since this range bounds what a public WebSDR page may
+    retune a real transmitter to. Resetting both bounds to None would
+    silently leave NO guard at all -- with only a log warning nobody
+    reads -- while the user still believes reverse sync is confined to,
+    say, HF. An honest transposition (30000000/1800000 for a meant
+    1.8-30 MHz) is overwhelmingly the likely cause, so swapping keeps
+    *a* range enforced instead of quietly removing the guard."""
+    if min_hz is not None and min_hz < 0:
+        logger.warning("Ignoring negative reverse-sync minimum %r; unrestricted on that side", min_hz)
+        min_hz = None
+    if max_hz is not None and max_hz < 0:
+        logger.warning("Ignoring negative reverse-sync maximum %r; unrestricted on that side", max_hz)
+        max_hz = None
+    if min_hz is not None and max_hz is not None and min_hz > max_hz:
+        logger.warning(
+            "Reverse-sync range %r..%r is inverted -- swapping to %r..%r rather than dropping the guard",
+            min_hz, max_hz, max_hz, min_hz,
+        )
+        min_hz, max_hz = max_hz, min_hz
+    return min_hz, max_hz
+
+
+def _clamp_reverse_sync_range(filtered: dict[str, Any]) -> None:
+    """Apply clamp_reverse_sync_bounds() to a loaded config dict, in
+    place. Runs after _validate_scalars, so by this point each bound (if
+    present) is already known to be an int or None. Only writes a key
+    back when its value actually changed, so an absent key stays absent
+    and falls through to the dataclass default."""
+    min_hz = filtered.get("reverse_sync_min_hz")
+    max_hz = filtered.get("reverse_sync_max_hz")
+    new_min, new_max = clamp_reverse_sync_bounds(min_hz, max_hz)
+    if new_min != min_hz:
+        filtered["reverse_sync_min_hz"] = new_min
+    if new_max != max_hz:
+        filtered["reverse_sync_max_hz"] = new_max
 
 
 def _validate_rig_backend(filtered: dict[str, Any]) -> None:

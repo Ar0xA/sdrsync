@@ -652,3 +652,444 @@ def test_rig_write_rate_limiter_blocks_a_different_axis_write_after_a_failed_pus
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # gap elapsed -- now goes through (mode's own backoff still blocks it separately)
     assert stub_rig.set_freqs == [14_200_000]
+
+
+def test_reverse_cw_push_echoes_rigs_own_cw_variant_instead_of_canonical_cw():
+    """v13: some rigctld backends/rig models only accept 'CW-U'/'CW-L' as
+    valid SET-mode strings and reject a bare 'CW' outright (confirmed
+    live: KiwiSDR + a rig with no plain CW mode) -- the WebSDR page has
+    no way to signal which CW variant it means (its observable mode is
+    always the canonical 'CW'), so when the rig is ALREADY in some
+    CW-family mode, the push must echo the rig's own current mode name
+    back instead of forcing it to 'CW'. Also confirms the passband is
+    preserved in this case (mirrors the narrow/wide-variant preservation
+    this logic is modeled on)."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW-L", passband_hz=500, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "CW"  # user clicks CW on the WebSDR page
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # pushes -- must echo "CW-L", not "CW"
+
+    assert stub_rig.set_modes == [("CW-L", 500)]
+
+
+def test_reverse_cw_push_falls_back_to_canonical_cw_when_rig_has_no_cw_family_mode():
+    """Contrast case: the rig is NOT already in a CW-family mode (a
+    genuine transition into CW from a different mode family) -- there's
+    no rig-native CW variant to echo, so it must fall back to the
+    canonical 'CW', same as before v13's fix."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "CW"  # user clicks CW on the WebSDR page; rig is still reporting USB
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # pushes -- no CW-family value to echo, sends canonical "CW"
+
+    assert stub_rig.set_modes == [("CW", None)]
+
+
+def test_mode_giveup_error_names_the_string_actually_sent_not_the_canonical_mode():
+    """v13: when an echoed CW-variant push exhausts its retry ladder, the
+    user-visible error must name the value really written to the rig
+    ("CW-L"), not the canonical page mode ("CW"). If the CW echo itself
+    starts failing on some rig, naming a string that was never sent
+    misleads whoever is diagnosing the real hardware rejection. Internal
+    bookkeeping stays keyed on the canonical mode regardless."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW-L", passband_hz=500, ptt=False))
+    stub_rig.set_mode_result = False  # the rig never confirms the echoed CW variant
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "CW"  # user clicks CW on the WebSDR page
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+
+    for _ in range(REVERSE_PUSH_MAX_ATTEMPTS):
+        _clear_reverse_mode_debounce(engine)
+        _clear_push_backoff(engine)
+        _clear_rig_write_gap(engine)
+        _clear_holdoff(engine)
+        asyncio.run(engine._tick())
+
+    # Every attempt really did send the echoed variant, not bare "CW".
+    assert stub_rig.set_modes.count(("CW-L", 500)) == REVERSE_PUSH_MAX_ATTEMPTS
+    assert engine._reverse_sync_error is not None
+    assert "CW-L" in engine._reverse_sync_error
+    # Bookkeeping unchanged: still keyed on the canonical, page-observable mode.
+    assert engine._last_observed_mode_key == "CW"
+
+
+def test_reverse_sync_held_suppresses_the_whole_reverse_tick():
+    """v13 Hold toggle: while held, _reverse_sync_tick() must not run at
+    all -- no push, no baseline capture, no bookkeeping churn. Forward
+    sync is untouched (not exercised here, but nothing in this gate
+    touches it -- it's checked at the _tick() call site, alongside the
+    existing PTT/connected/holdoff gates, not inside the reverse tick)."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    engine._apply_reverse_sync_held(True)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == []
+    assert stub_rig.set_modes == []
+    assert engine._reverse_baseline_captured is False  # never even seeded while held
+
+
+def test_reverse_sync_held_blocks_an_already_debounced_eligible_push():
+    """A push that was already fully armed and ready to fire (baseline
+    captured, debounce elapsed) must still be blocked once Hold engages
+    -- confirms the gate is checked fresh every tick, not just at
+    baseline-capture time."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+
+    engine._apply_reverse_sync_held(True)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # would have pushed -- held instead
+
+    assert stub_rig.set_modes == []
+
+
+def test_reverse_sync_held_clears_in_flight_ladder_on_release_and_resumes_cleanly():
+    """Releasing Hold must not resume chasing a target that went stale
+    while paused -- the in-flight ladder and baseline are cleared on
+    every transition (both engaging and releasing), so the next tick
+    re-seeds a fresh baseline (no push) rather than immediately firing
+    a possibly-outdated push."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_rig.set_mode_result = False  # ladder stays in-flight, never succeeds
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # attempt 1: fails, ladder now in flight
+    assert engine._mode_push is not None
+
+    engine._apply_reverse_sync_held(True)
+    assert engine._mode_push is None  # cleared on engaging Hold
+    assert engine._reverse_baseline_captured is False
+
+    engine._apply_reverse_sync_held(False)
+    assert engine._mode_push is None  # still clear on release -- nothing to resume
+    assert engine._reverse_baseline_captured is False
+
+    # Next tick re-seeds a fresh baseline rather than immediately pushing.
+    # (set_modes already holds one entry from the failed attempt 1 above --
+    # StubReverseRig.set_mode() records every call regardless of the
+    # configured result -- so the check here is that nothing NEW got
+    # appended after Hold was released, not that the list is empty.)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    assert engine._reverse_baseline_captured is True
+    assert stub_rig.set_modes == [("LSB", None)]
+
+
+def test_reverse_sync_range_guard_rejects_frequency_above_max():
+    """v13: a reverse-sync frequency above the configured max must be
+    rejected without ever calling set_freq() (retrying can't help), must
+    set reverse_sync_error, and must revert the WebSDR to match the rig
+    (same as the retry ladder's own give-up path)."""
+    engine = make_engine()
+    engine.settings.reverse_sync_max_hz = 30_000_000
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 35_000_000  # above the configured max
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the freq debounce
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # debounce elapsed -- rejected by the range guard, not pushed
+
+    assert stub_rig.set_freqs == []
+    assert engine._freq_push is None
+    assert engine._reverse_sync_error is not None
+    assert "35000000" in engine._reverse_sync_error or "35_000_000" in engine._reverse_sync_error \
+        or "outside" in engine._reverse_sync_error.lower()
+    # Reverted: forward direction will re-assert the rig's real frequency.
+    assert engine._last_observed_freq == 35_000_000
+    assert engine._last_sent_freq is None
+
+
+def test_reverse_sync_range_guard_rejects_frequency_below_min():
+    engine = make_engine()
+    engine.settings.reverse_sync_min_hz = 1_800_000
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 500_000  # below the configured min
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == []
+    assert engine._reverse_sync_error is not None
+
+
+def test_reverse_sync_range_guard_allows_in_range_frequency():
+    """A configured range must not block a value that's actually inside
+    it -- confirms the guard is a bound, not an accidental full block."""
+    engine = make_engine()
+    engine.settings.reverse_sync_min_hz = 1_800_000
+    engine.settings.reverse_sync_max_hz = 30_000_000
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 14_200_000  # well inside the configured range
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == [14_200_000]
+    assert engine._reverse_sync_error is None
+
+
+def test_reverse_sync_range_guard_unrestricted_by_default():
+    """Both bounds default to None -- must never restrict anything unless
+    the user has explicitly configured a range."""
+    engine = make_engine()
+    assert engine.settings.reverse_sync_min_hz is None
+    assert engine.settings.reverse_sync_max_hz is None
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 1_000_000_000  # absurdly high -- still allowed, no range configured
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == [1_000_000_000]
+
+
+def test_hold_engaged_mid_await_discards_the_stale_pushs_giveup_error():
+    """Regression: Hold must bump _sync_latch_generation, exactly as
+    _reset_sync_latches() does. A push suspended mid-await inside
+    rig.set_mode()'s verify-readback loop when the user presses Hold
+    would otherwise still pass the generation check on return and write a
+    give-up reverse_sync_error for a push Hold just cancelled -- leaving
+    the GUI showing "Reverse sync held" AND a stale red failure that only
+    clears on release or WebSDR reattach.
+
+    Uses a real suspension point (asyncio.sleep inside the stub) with the
+    toggle applied from another task on the same loop, which is how the
+    GUI's call_soon_threadsafe(_apply_reverse_sync_held) actually lands."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_rig.set_mode_result = False  # ladder never confirms
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+
+    # Burn all but the final attempt, so the next one is precisely the
+    # attempt that would otherwise write the give-up error.
+    for _ in range(REVERSE_PUSH_MAX_ATTEMPTS - 1):
+        _clear_reverse_mode_debounce(engine)
+        _clear_push_backoff(engine)
+        _clear_rig_write_gap(engine)
+        _clear_holdoff(engine)
+        asyncio.run(engine._tick())
+    assert engine._mode_push is not None
+    assert engine._mode_push.attempts == REVERSE_PUSH_MAX_ATTEMPTS - 1
+    assert engine._reverse_sync_error is None  # not final yet
+
+    async def hold_during_the_final_attempt() -> None:
+        entered_set_mode = asyncio.Event()
+
+        async def slow_set_mode(mode_name, passband_hz, verify_budget_s=None):
+            stub_rig.set_modes.append((mode_name, passband_hz))
+            entered_set_mode.set()
+            await asyncio.sleep(0.02)  # real suspension, like the verify-readback loop
+            return False
+
+        stub_rig.set_mode = slow_set_mode
+        tick = asyncio.create_task(engine._tick())
+        await entered_set_mode.wait()
+        engine._apply_reverse_sync_held(True)  # user presses Hold mid-write
+        await tick
+
+    _clear_reverse_mode_debounce(engine)
+    _clear_push_backoff(engine)
+    _clear_rig_write_gap(engine)
+    _clear_holdoff(engine)
+    asyncio.run(hold_during_the_final_attempt())
+
+    assert engine._reverse_sync_held is True
+    assert engine._mode_push is None  # cancelled, not resurrected by the stale continuation
+    assert engine._reverse_sync_error is None  # no give-up message for a push the user cancelled
+
+
+def test_reset_sync_latches_does_not_release_hold():
+    """Hold is session state owned by the user, not sync bookkeeping: a
+    WebSDR reattach (which runs _reset_sync_latches()) must never quietly
+    re-enable the WebSDR page's ability to move the rig. This invariant
+    currently holds by omission, so it's pinned here."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    engine._apply_reverse_sync_held(True)
+    engine._reset_sync_latches()
+
+    assert engine._reverse_sync_held is True
+    # And it's still actually enforced, not just still set on the field.
+    status.freq_hz = 14_200_000
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    assert stub_rig.set_freqs == []
+
+
+CW_OFFSET_HZ = 700
+
+
+class CWOffsetReverseDriver(StubReverseDriver):
+    """rig_freq_from_status() applies a non-trivial offset, the way a real
+    driver's CW-offset conversion does, so the page frequency and the
+    rig-native frequency are distinguishable values. StubReverseDriver's
+    identity passthrough can't tell those apart, which means the plain
+    range-guard tests above would not catch a regression that checked the
+    raw page frequency instead."""
+
+    def rig_freq_from_status(self, status: WebSDRStatus):
+        if status.freq_hz is None:
+            return None
+        return status.freq_hz - CW_OFFSET_HZ
+
+
+def test_range_guard_checks_the_rig_native_frequency_not_the_page_frequency():
+    """The bound the user configures is what may be written to the RIG,
+    so the guard must run on the post-CW-offset, rig-native value. Both
+    directions are checked: a page frequency just ABOVE max whose
+    rig-native value is inside the range must be allowed, and a page
+    frequency just above min whose rig-native value falls BELOW it must
+    be rejected. A guard reading the page value would get both backwards."""
+    # Allowed: page value is above max, rig-native value is not.
+    engine = make_engine()
+    engine.settings.reverse_sync_max_hz = 30_000_000
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    engine._rig, engine._rig_active = stub_rig, True
+    engine._driver, engine._websdr_active = CWOffsetReverseDriver(status), True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 30_000_500  # rig-native: 29_999_800, inside the range
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == [30_000_500 - CW_OFFSET_HZ]
+    assert engine._reverse_sync_error is None
+
+    # Rejected: page value is above min, rig-native value is below it.
+    engine = make_engine()
+    engine.settings.reverse_sync_min_hz = 1_800_000
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    engine._rig, engine._rig_active = stub_rig, True
+    engine._driver, engine._websdr_active = CWOffsetReverseDriver(status), True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 1_800_300  # rig-native: 1_799_600, below the configured min
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == []
+    assert engine._reverse_sync_error is not None
+    # The rejection reports the rig-native value too -- that's the one
+    # that was actually out of bounds.
+    assert str(1_800_300 - CW_OFFSET_HZ) in engine._reverse_sync_error
+
+
+def test_range_guard_allows_a_frequency_exactly_on_both_bounds():
+    """min == max is a legitimate single-frequency lock, and the bounds
+    themselves are inclusive (engine.py uses strict < / >). A frequency
+    exactly equal to both must be allowed, not rejected off-by-one."""
+    engine = make_engine()
+    engine.settings.reverse_sync_min_hz = 14_200_000
+    engine.settings.reverse_sync_max_hz = 14_200_000
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.freq_hz = 14_200_000  # exactly on both bounds
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == [14_200_000]
+    assert engine._reverse_sync_error is None

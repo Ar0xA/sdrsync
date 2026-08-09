@@ -9,10 +9,12 @@ own XML-RPC interface — **not** Omnirig.
 retunes the WebSDR, and clicking/tuning directly on the WebSDR page moves
 your radio's frequency and mode right back. **This means the WebSDR page
 can retune your transmitter.** PTT/transmit always wins (rig state is
-never overridden while you're transmitting), but there is currently no
-other safety bound (e.g. a band-plan check) — read the "Reverse sync"
-section below before connecting a real transceiver to a public WebSDR you
-don't control.
+never overridden while you're transmitting), and there are two controls
+over the reverse direction: a **Hold** toggle that pauses it for the
+session, and an optional **frequency range guard** that rejects anything
+outside a min/max you set. Both are described under "Reverse sync" below
+— read it before connecting a real transceiver to a public WebSDR you
+don't control, because neither of them is a band-plan or legality check.
 
 ## Reverse sync (WebSDR → rig)
 
@@ -23,11 +25,33 @@ back from the rig before trusting it. This is suppressed the whole time
 you're transmitting, so PTT always wins — the WebSDR can't move your VFO
 mid-transmission.
 
-Beyond that, there is currently **no other bound** on what gets sent: no
+Two controls sit on top of that, both in your hands:
+
+- **Hold (WebSDR read-only)** — a toggle in the WebSDR panel that pauses
+  the reverse direction outright. Forward sync (rig → WebSDR) keeps
+  working and nothing disconnects; the page simply stops being able to
+  move your rig. It's session-only: it does **not** persist, and every
+  launch starts with it off, so it's a deliberate "for right now" control,
+  not a setting you can configure once and forget. A write already on its
+  way to the rig when you press it may still complete once — it can't be
+  recalled mid-send.
+- **Reverse-sync range (Hz)** — an optional min/max in the Transceiver
+  panel. A reverse push whose rig-side frequency falls outside it is
+  rejected outright (no retries) and the WebSDR is reverted to match the
+  rig. It's opt-in and **defaults to unrestricted**: leave either box
+  blank for no bound on that side, so unless you fill it in, nothing is
+  restricted. Setting it to your rig's usable range (e.g. 1800000 to
+  30000000) is a reasonable precaution against a stray waterfall click on
+  a wideband receiver.
+
+Beyond those, there is still **no other bound** on what gets sent: no
 band-plan check, no legality check for your licence or country, no "is
 this frequency even valid for my rig" check, no confirmation before a
-large jump. If you're pointing a real transceiver at a public WebSDR you
-don't control, be aware of this before leaving it connected unattended.
+large jump inside an allowed range. Neither control makes reverse sync
+safe by itself — Hold is off unless you press it, and the range guard is
+only as good as the numbers you enter. If you're pointing a real
+transceiver at a public WebSDR you don't control, be aware of this before
+leaving it connected unattended.
 
 **Testing status, plainly**: reverse sync has been live-tested against
 real hardware on websdr.org and KiwiSDR, through both the `rigctld` and
