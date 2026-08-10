@@ -379,7 +379,13 @@ class MainFrame(wx.Frame):
         if not self._state.rig_connected:
             self._on_transceiver_connect_clicked()
         else:
-            self._open_settings_panel("sites")
+            # "Connect WebSDR" -- launches the site currently selected in
+            # the strip's own dropdown, exactly like clicking the strip's
+            # Connect button (top right) would. Previously just opened
+            # the Sites panel, which needed a second click on Load to
+            # actually connect -- confirmed as a real bug live, not the
+            # intended behavior.
+            self._on_strip_connect_clicked()
 
     def _open_settings_panel(self, key: Optional[str]) -> None:
         self._state.open_panel = key
@@ -709,6 +715,7 @@ class MainFrame(wx.Frame):
             self._state.sdr_connected = False
             self._state.sdr_active = False
             self.transceiver_panel.set_connection_state(False)
+            self.transceiver_panel.mock_panel.set_enabled(False)
             self.status_bar_panel.set_text(f"Sync engine crashed: {snap.fatal_error}")
             self.status_bar_panel.set_dot_mode("disconnected")
             self._refresh_chrome()
@@ -757,6 +764,8 @@ class MainFrame(wx.Frame):
                 self._state.sdr_hz = ws.freq_hz or 0
                 if self._active_websdr_site is not None:
                     self._state.site = self._active_websdr_site.name
+
+        self.transceiver_panel.mock_panel.set_enabled(self._state.sdr_connected)
 
         text, dot_mode = self._resolve_status_bar_text(snap)
         self.status_bar_panel.set_text(text)

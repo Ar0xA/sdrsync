@@ -138,10 +138,17 @@ class _PttTag(_OwnerDrawnMixin, wx.Control):
         return {"offline": "OFFLINE", "receive": "RECEIVE", "transmit": "TRANSMIT"}[self._ptt_state]
 
     def _colour(self) -> wx.Colour:
-        base = theme.ACCENT_TEXT if self._ptt_state == "transmit" else theme.FAINT
-        if self._ptt_state == "transmit" and not self._blink_on:
-            return theme.with_alpha(base, 102)  # 40%
-        return base
+        # User-requested semantic colouring (a deliberate deviation from
+        # spec §3 item 5's literal FAINT/FAINT/ACCENT_TEXT treatment,
+        # confirmed live): grey while offline, green while actually
+        # receiving, red while transmitting.
+        if self._ptt_state == "transmit":
+            if not self._blink_on:
+                return theme.with_alpha(theme.TRANSMIT, 102)  # 40%
+            return theme.TRANSMIT
+        if self._ptt_state == "receive":
+            return theme.RECEIVE
+        return theme.FAINT
 
     def _recompute_min_size(self) -> None:
         dc = wx.ClientDC(self)

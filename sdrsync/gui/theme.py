@@ -21,6 +21,13 @@ ACCENT = wx.Colour(0xB6, 0x82, 0x35)
 ACCENT_TEXT = wx.Colour(0x7D, 0x54, 0x11)
 ACCENT_TINT = wx.Colour(0xFF, 0xF3, 0xE4)
 PANEL_ALT = wx.Colour(0xF8, 0xF4, 0xF4)
+# Not in spec §1's literal palette (which treats OFFLINE/RECEIVE as the
+# same FAINT grey) -- added at the user's explicit request for a
+# semantic RX/TX indicator: green while actually receiving, red while
+# transmitting, keeping the app's muted/low-saturation tonal weight
+# rather than a bright/saturated red or green.
+RECEIVE = wx.Colour(0x3F, 0x8C, 0x4A)
+TRANSMIT = wx.Colour(0xB0, 0x3A, 0x2E)
 
 # Spacing scale (spec §1) and control corner radius (spec §1: "4 px").
 SPACING = (5, 9, 14, 18, 28)

@@ -275,8 +275,19 @@ class _MockRigPanel(wx.Panel):
         self.on_ptt_toggled: Optional[Callable[[bool], None]] = None
 
         outer = wx.BoxSizer(wx.VERTICAL)
-        header = _labeled(self, "Mock rig control")
-        outer.Add(header, 0, wx.ALL, self.FromDIP(9))
+        header_row = wx.BoxSizer(wx.HORIZONTAL)
+        header_row.Add(_labeled(self, "Mock rig control"), 0, wx.ALIGN_CENTER_VERTICAL)
+        # Native TextCtrl/Choice's default disabled rendering is too
+        # subtle against this theme's near-white PANEL_ALT background to
+        # read as "disabled" at a glance (user-reported live) -- this
+        # hint plus set_enabled()'s explicit foreground-colour dimming
+        # below make the state legible without fighting the OS-native
+        # disabled style further.
+        self.hint_text = wx.StaticText(self, label="connect a WebSDR to enable")
+        self.hint_text.SetFont(label_font())
+        self.hint_text.SetForegroundColour(theme.FAINT)
+        header_row.Add(self.hint_text, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(9))
+        outer.Add(header_row, 0, wx.ALL, self.FromDIP(9))
 
         row = wx.BoxSizer(wx.HORIZONTAL)
         self.freq_entry = wx.TextCtrl(self, value="14074000", size=(self.FromDIP(110), -1))
@@ -307,3 +318,33 @@ class _MockRigPanel(wx.Panel):
 
         outer.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, self.FromDIP(9))
         self.SetSizer(outer)
+        self.set_enabled(False)
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Greys out the freq/mode/PTT controls while no WebSDR is
+        connected -- pushing a mock rig frequency/mode/PTT has nothing
+        to reach until then, so an enabled control here would just look
+        broken (user-reported live: "why isn't anything happening").
+
+        Also explicitly dims the native TextCtrl/Choice foreground text
+        and shows a hint -- their default OS-native disabled rendering
+        was reported as too subtle to notice against this theme's
+        near-white background (FlatButton/CheckBox's own 45%-opacity
+        disabled style, spec §7, is unaffected and already clear)."""
+        for w in (self.freq_entry, self.mode_choice, self.passband_entry, self.ptt_check):
+            w.Enable(enabled)
+        for child in self.GetChildren():
+            if isinstance(child, FlatButton):
+                child.Enable(enabled)
+        text_colour = theme.TEXT if enabled else theme.FAINT
+        # wx.Choice's own disabled background didn't read as "disabled"
+        # in this theme either (user-reported live) -- SURFACE while
+        # disabled, plain white (its normal native background) once
+        # re-enabled.
+        bg_colour = wx.WHITE if enabled else theme.SURFACE
+        for w in (self.freq_entry, self.mode_choice, self.passband_entry):
+            w.SetForegroundColour(text_colour)
+            w.SetBackgroundColour(bg_colour)
+            w.Refresh()
+        self.hint_text.Show(not enabled)
+        self.Layout()
