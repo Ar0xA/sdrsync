@@ -22,13 +22,14 @@ class _Dot(wx.Window):
     syncing, filled MUTED while connected but paused, unfilled FAINT
     outline while disconnected."""
 
-    SIZE_DIP = 6
+    SIZE_DIP = 6  # spec §3 default; StatusBarPanel passes size_dip=5 (spec §8)
 
-    def __init__(self, parent: wx.Window) -> None:
+    def __init__(self, parent: wx.Window, size_dip: float = SIZE_DIP) -> None:
         super().__init__(parent, size=wx.Size(-1, -1), style=wx.BORDER_NONE)
         self._mode = "disconnected"  # "syncing" | "paused" | "disconnected"
+        self._size_dip = size_dip
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
-        self.SetMinSize(wx.Size(self.FromDIP(self.SIZE_DIP + 4), self.FromDIP(self.SIZE_DIP + 4)))
+        self.SetMinSize(wx.Size(self.FromDIP(size_dip + 4), self.FromDIP(size_dip + 4)))
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_ERASE_BACKGROUND, lambda evt: None)
 
@@ -45,7 +46,7 @@ class _Dot(wx.Window):
         gc = wx.GraphicsContext.Create(dc)
         if gc is None:
             return
-        size = self.FromDIP(self.SIZE_DIP)
+        size = self.FromDIP(self._size_dip)
         rect = self.GetClientRect()
         cx, cy = rect.width / 2, rect.height / 2
         path = gc.CreatePath()

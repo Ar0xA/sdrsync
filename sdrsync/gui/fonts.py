@@ -103,6 +103,14 @@ def value_font() -> wx.Font:
     return _cached(("value",), lambda: wx.Font(wx.FontInfo(10).FaceName(_value_face)))
 
 
+def value_font_at(point_size: float) -> wx.Font:
+    """Value-role (tabular-figure-resolved) face at a non-default size --
+    e.g. StatusBarPanel's 8pt line (spec §8)."""
+    if not _loaded:
+        load_fonts()
+    return _cached(("value", point_size), lambda: wx.Font(wx.FontInfo(point_size).FaceName(_value_face)))
+
+
 def big_freq_font() -> wx.Font:
     """22pt Cormorant Garamond, regular weight — compact-bar big frequency."""
     if not _loaded:

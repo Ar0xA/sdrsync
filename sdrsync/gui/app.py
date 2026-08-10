@@ -52,6 +52,7 @@ from sdrsync.config import (
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui import theme
 from sdrsync.gui.fonts import load_fonts
+from sdrsync.gui.format import fmt_hz
 from sdrsync.gui.receiver_host import ReceiverHost
 from sdrsync.gui.section_bar import SectionBar
 from sdrsync.gui.settings_host import SettingsHost
@@ -59,6 +60,7 @@ from sdrsync.gui.settings_panels.behaviour_panel import BehaviourPanel
 from sdrsync.gui.settings_panels.sites_panel import SitesPanel
 from sdrsync.gui.settings_panels.transceiver_panel import TransceiverPanel
 from sdrsync.gui.state import AppState
+from sdrsync.gui.status_bar_panel import StatusBarPanel
 from sdrsync.gui.strip_panel import StripPanel
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
 from sdrsync.gui.webview_host import WebViewHost, bring_pair_to_front, has_display_at
@@ -475,9 +477,12 @@ class MainFrame(wx.Frame):
         self.receiver_host.idle.on_primary = self._on_idle_primary_clicked
         self.receiver_host.idle.on_secondary = lambda: self._open_settings_panel("transceiver")
 
-        self.status_bar_panel = _PlaceholderBand(
-            self, "StatusBarPanel", height=theme.STATUS_BAR_HEIGHT, fill=theme.PANEL_ALT, hairline_edge="top",
-        )
+        self.status_bar_panel = StatusBarPanel(self)
+        self.status_bar_panel.on_open_log_folder = self._on_open_log_folder_clicked
+        # Before the first real StatusSnapshot arrives (engine starts
+        # after _build_widgets() returns) -- avoids a blank line.
+        self.status_bar_panel.set_text("rig not connected")
+        self.status_bar_panel.set_dot_mode("disconnected")
         root.Add(self.status_bar_panel, 0, wx.EXPAND)
 
         self.SetSizer(root)
@@ -1798,6 +1803,8 @@ class MainFrame(wx.Frame):
             self._state.sdr_connected = False
             self._state.sdr_active = False
             self.transceiver_panel.set_connection_state(False)
+            self.status_bar_panel.set_text(f"Sync engine crashed: {snap.fatal_error}")
+            self.status_bar_panel.set_dot_mode("disconnected")
             self._refresh_chrome()
             return
 
@@ -1841,7 +1848,54 @@ class MainFrame(wx.Frame):
                 if self._active_websdr_site is not None:
                     self._state.site = self._active_websdr_site.name
 
+        text, dot_mode = self._resolve_status_bar_text(snap)
+        self.status_bar_panel.set_text(text)
+        self.status_bar_panel.set_dot_mode(dot_mode)
+
         self._refresh_chrome()
+
+    def _rig_status_text(self) -> str:
+        if not self._state.rig_connected:
+            return "rig not connected"
+        if self.settings.use_mock_rig:
+            return "mock rig connected"
+        backend = self.settings.rig_backend
+        if backend == "flrig":
+            host, port = self.settings.flrig_host, self.settings.flrig_port
+        else:
+            host, port = self.settings.rigctld_host, self.settings.rigctld_port
+        return f"{backend} connected — {host}:{port}"
+
+    def _resolve_status_bar_text(self, snap: StatusSnapshot) -> tuple[str, str]:
+        """spec §8's single-priority status line: exactly one message
+        wins, in this order (per the plan's agreed precedence): fatal >
+        rig error > WebSDR error > reverse-sync error > paused >
+        reverse-sync pending > syncing. Anything that loses stays
+        log-file-only (Open log folder), not shown here -- a deliberate
+        scope reduction from the old up-to-four-simultaneous message
+        rows."""
+        if snap.rig_error:
+            return f"rig error: {snap.rig_error}", "disconnected"
+        if snap.websdr_active and snap.websdr is not None and snap.websdr.last_error:
+            return f"WebSDR error: {snap.websdr.last_error}", "paused"
+        if snap.reverse_sync_error:
+            return f"reverse sync: {snap.reverse_sync_error}", "paused"
+
+        segments = [self._rig_status_text()]
+        if self._state.rig_connected:
+            if self._state.paused:
+                segments.append(
+                    f"sync paused — rig {fmt_hz(self._state.rx_hz)} / sdr {fmt_hz(self._state.sdr_hz)}"
+                )
+            elif snap.reverse_sync_pending:
+                segments.append(f"reverse sync: {snap.reverse_sync_pending}")
+            else:
+                segments.append("syncing")
+        if self._state.sdr_connected and self._state.site:
+            segments.append(self._state.site)
+
+        dot_mode = "paused" if self._state.paused else ("syncing" if self._state.rig_connected else "disconnected")
+        return " · ".join(segments), dot_mode
 
     def _apply_snapshot(self, snap: StatusSnapshot) -> None:
         # Every message row this method may touch is updated through
