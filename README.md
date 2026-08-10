@@ -173,6 +173,42 @@ minimized/hidden, which suspends WebView2's rendering and audio) —
 this keeps the real audio pipeline intact while showing nothing on
 screen.
 
+### Window size, position, and idle behavior
+
+The WebSDR browser window remembers its own size and position
+separately per WebSDR *software family* (websdr.org, KiwiSDR, OpenWebRX,
+...), restoring it the next time you connect to that type — a KiwiSDR
+window you left large on a second monitor comes back there, independent
+of wherever you last left an OpenWebRX window. The very first time a
+given type has nothing remembered yet, it opens on whichever monitor
+sdrsync's own main window is currently on. The main sdrsync window
+itself also remembers its own size and position across restarts, the
+same way. In both cases, if the remembered position was on a monitor
+that's no longer connected (a laptop undocked, a display unplugged
+since), it falls back to whatever monitor is available instead of
+landing somewhere unreachable.
+
+When there's no active WebSDR connection at all — at startup, or after a
+disconnect — the WebSDR browser window is hidden outright (not just
+moved off-screen) rather than sitting empty on screen or in the
+taskbar. It reappears, positioned above the main window, the moment you
+connect. Clicking the WebSDR window's own close (X) button disconnects
+that session, the same as the **Disconnect WebSDR** button — it doesn't
+just refuse to close.
+
+### Idle disconnect
+
+By default, sdrsync disconnects the WebSDR session after 60 minutes of
+no rig activity at all (no frequency/mode/PTT change) and reconnects
+automatically the instant you touch the rig again — the panel shows
+**"disconnected (idle)"** when this happens, not an error. This isn't a
+bug: most WebSDR receivers are volunteer-run, shared infrastructure with
+a small number of concurrent-listener slots, and holding one open
+indefinitely while you've stepped away from the radio denies it to
+someone else. Change the threshold, or clear the field (or set it to 0)
+to disable it and hold the connection forever, via the **Idle disconnect
+(min)** field in the WebSDR panel.
+
 ### Poll interval
 
 The Transceiver panel's **Poll interval (s)** control sets how often
@@ -208,14 +244,45 @@ It listens on `127.0.0.1:4532` and gives you a small prompt (`f <hz>`,
 ## Adding a new WebSDR type
 
 1. Implement `sdrsync.websdr.base.WebSDRDriver` in a new module under
-   `sdrsync/websdr/`, including a `FINGERPRINT_MARKERS: ClassVar[tuple[str, ...]]`
-   class attribute — one or more distinctive `<script src="...">` filename
+   `sdrsync/websdr/` — read that Protocol's docstrings first, not just its
+   method signatures; every method there documents a real constraint an
+   earlier driver got wrong before the comment was added (e.g. `tune_hz`'s
+   `verify` parameter, and why a mode mapper can't just collapse every
+   hamlib mode onto the nearest string). **Every method on the Protocol is
+   required**, including the two reverse-sync ones added in v11
+   (`hamlib_mode_from_status`, `rig_freq_from_status`) — the sync engine
+   calls them unconditionally on every tick once a WebSDR is connected,
+   with no `hasattr` guard, so a driver missing either one crashes the
+   *entire* engine thread (both the WebSDR and rig connections) the
+   moment reverse sync ties, not just fails to sync. This is not
+   hypothetical: it's exactly the shape of bug an external driver
+   contribution hit, because the Protocol had gained both that parameter
+   and those two methods since the branch was started — if you're
+   picking this project back up after a while, or reviewing someone
+   else's driver PR, diff `sdrsync/websdr/base.py` against whatever the
+   driver was actually written against before assuming it's complete.
+   Also include a `FINGERPRINT_MARKERS: ClassVar[tuple[str, ...]]` class
+   attribute — one or more distinctive `<script src="...">` filename
    substrings that only this software family's pages ever load (used by
    the Custom URL Detect flow; see `sdrsync/websdr/registry.py`).
 2. Register it in `sdrsync/websdr/registry.py`'s `DRIVERS` dict under a new
    `driver_type` key.
 3. Add a `WebSDRSite(name=..., url=..., driver_type=...)` entry to
-   `KNOWN_SITES` in `sdrsync/config.py`.
+   `KNOWN_SITES` in `sdrsync/config.py`, and optionally to
+   `sites/websdr_sites.json` (the curated list the app can auto-fetch from
+   GitHub — see the "Manage sites..." dialog).
+4. Add tests following the existing per-driver pattern (e.g.
+   `tests/test_kiwisdr_mode_mapping.py`, `tests/test_kiwisdr_reverse_mode_mapping.py`):
+   pure hamlib-mode-mapping tests for both directions, and a stub-page test
+   that pins the exact commands/JS your driver sends (a fake object
+   standing in for the browser page — see any existing driver's test file
+   for the shape). Extend `tests/test_fingerprint.py` with detection cases
+   for your new marker(s), including a case confirming it does *not*
+   false-positive against another driver's fingerprint or an unrelated
+   page. There's no way to click through a live WebSDR session in CI or
+   in this kind of automated environment, so these pure/stubbed tests are
+   the only safety net a driver gets before someone tests it by hand
+   against a real receiver.
 
 ## Tests
 

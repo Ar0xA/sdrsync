@@ -19,6 +19,17 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 MIN_POLL_INTERVAL_S = 0.05
 MAX_POLL_INTERVAL_S = 5.0
 
+# Floor for AppSettings.webview_sizes entries (the WebSDR popup) --
+# defined here (not in gui/webview_host.py) so
+# load() can enforce it on a hand-edited config.json too, not just the
+# GUI. gui/webview_host.py imports these same two constants rather than
+# redefining them, so the two layers can't drift apart (same split as
+# MIN/MAX_POLL_INTERVAL_S above). There's no matching upper bound here --
+# the sane ceiling is "this machine's screen", which only the wx-aware
+# GUI layer can know; see gui/webview_host.py's display-clamping logic.
+MIN_WEBVIEW_WIDTH = 400
+MIN_WEBVIEW_HEIGHT = 300
+
 
 @dataclass(frozen=True)
 class WebSDRSite:
@@ -143,6 +154,41 @@ class AppSettings:
     # here is a few seconds of reconnect delay, while the cost of the
     # old always-on behavior is borne by someone else's hardware.
     websdr_idle_disconnect_min: Optional[int] = 60
+    # Remembers the WebSDR browser window's size per driver_type (e.g.
+    # "kiwisdr", "websdr_org", "openwebrx" -- see websdr.registry.DRIVERS),
+    # since different sites' pages can want different window proportions.
+    # {driver_type: [width, height]}. Saved on disconnect/switch (see
+    # gui/app.py's _save_current_webview_geometry()) and on app close; a
+    # driver_type with no entry yet falls back to webview_host.VISIBLE_SIZE.
+    webview_sizes: dict = field(default_factory=dict)
+    # Companion to webview_sizes: the window's top-left position, same
+    # keying and save points. {driver_type: [x, y]}. No entry yet (a
+    # driver_type never connected to before, or a fresh install) falls
+    # back to a position on whichever monitor the main app window is
+    # currently on -- see gui/webview_host.py's on_screen_pos_for_monitor().
+    # Deliberately unclamped/unfloored unlike webview_sizes -- a monitor
+    # can legitimately sit at a negative coordinate in a multi-monitor
+    # arrangement, so there's no sane universal floor the way there is
+    # for a width/height.
+    webview_positions: dict = field(default_factory=dict)
+    # Remembers the main control-panel window's own POSITION across
+    # restarts -- same idea as webview_positions above, but a single
+    # window rather than one per driver_type, so a plain Optional[list]
+    # field rather than a dict. See gui/app.py's
+    # _restore_main_window_geometry(). None means "never saved yet"
+    # (fresh install, or an old config from before this existed); a saved
+    # position that no longer lands on any connected display (e.g. a
+    # docking station's monitor unplugged since it was saved) is also
+    # treated as absent.
+    #
+    # No matching main_window_size: this window's height is instead
+    # computed live from whatever's currently visible (see
+    # gui/app.py's _resize_main_window_to_content()), clamped to the
+    # display and floored so "Open log folder" never scrolls out of the
+    # baseline view -- a fixed remembered size would fight that (and did,
+    # live: forcing a stale pre-condensing size made the window bigger
+    # than the content actually needs).
+    main_window_position: Optional[list] = None
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -166,6 +212,9 @@ class AppSettings:
             _clamp_poll_interval(filtered)
             _clamp_reverse_sync_range(filtered)
             _clamp_idle_disconnect(filtered)
+            _validate_webview_sizes(filtered)
+            _validate_webview_positions(filtered)
+            _validate_main_window_position(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
             logger.warning("Could not load %s (%s); using defaults", CONFIG_FILE, e)
@@ -409,6 +458,94 @@ def _validate_site_list(filtered: dict[str, Any], key: str) -> None:
         else:
             valid_sites.append(validated)
     filtered[key] = valid_sites
+
+
+def _validate_webview_size_entry(value: Any) -> Optional[list[int]]:
+    if not (isinstance(value, (list, tuple)) and len(value) == 2):
+        return None
+    width, height = value
+    is_int = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
+    if not (is_int(width) and is_int(height)):
+        return None
+    return [max(width, MIN_WEBVIEW_WIDTH), max(height, MIN_WEBVIEW_HEIGHT)]
+
+
+def _validate_webview_sizes(filtered: dict[str, Any]) -> None:
+    """Drop (in place) any malformed entry in webview_sizes -- same
+    lenient, shape-only tier as _validate_site_list (a bad size just
+    falls back to webview_host.VISIBLE_SIZE for that driver_type rather
+    than crashing SetSize())."""
+    if "webview_sizes" not in filtered:
+        return
+    raw = filtered["webview_sizes"]
+    if not isinstance(raw, dict):
+        logger.warning("Ignoring invalid webview_sizes value in %s (expected an object): %r", CONFIG_FILE, raw)
+        del filtered["webview_sizes"]
+        return
+    valid: dict[str, list[int]] = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key):
+            logger.warning("Skipping malformed webview_sizes key in %s: %r", CONFIG_FILE, key)
+            continue
+        size = _validate_webview_size_entry(value)
+        if size is None:
+            logger.warning("Skipping malformed webview_sizes entry for %r in %s: %r", key, CONFIG_FILE, value)
+            continue
+        valid[key] = size
+    filtered["webview_sizes"] = valid
+
+
+def _validate_webview_position_entry(value: Any) -> Optional[list[int]]:
+    if not (isinstance(value, (list, tuple)) and len(value) == 2):
+        return None
+    x, y = value
+    is_int = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
+    if not (is_int(x) and is_int(y)):
+        return None
+    return [x, y]
+
+
+def _validate_webview_positions(filtered: dict[str, Any]) -> None:
+    """Same lenient, shape-only tier as _validate_webview_sizes -- a bad
+    entry just falls back to on_screen_pos_for_monitor() for that
+    driver_type rather than crashing SetPosition(). No floor/ceiling
+    here (unlike sizes): any int pair is a plausible screen coordinate
+    across some monitor arrangement."""
+    if "webview_positions" not in filtered:
+        return
+    raw = filtered["webview_positions"]
+    if not isinstance(raw, dict):
+        logger.warning("Ignoring invalid webview_positions value in %s (expected an object): %r", CONFIG_FILE, raw)
+        del filtered["webview_positions"]
+        return
+    valid: dict[str, list[int]] = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key):
+            logger.warning("Skipping malformed webview_positions key in %s: %r", CONFIG_FILE, key)
+            continue
+        pos = _validate_webview_position_entry(value)
+        if pos is None:
+            logger.warning("Skipping malformed webview_positions entry for %r in %s: %r", key, CONFIG_FILE, value)
+            continue
+        valid[key] = pos
+    filtered["webview_positions"] = valid
+
+
+def _validate_main_window_position(filtered: dict[str, Any]) -> None:
+    """Reuses _validate_webview_position_entry's shape check -- same
+    [x, y] shape as a webview_positions entry, just a lone field instead
+    of a per-driver_type dict."""
+    if "main_window_position" not in filtered:
+        return
+    value = filtered["main_window_position"]
+    if value is None:
+        return
+    pos = _validate_webview_position_entry(value)
+    if pos is None:
+        logger.warning("Ignoring malformed main_window_position in %s: %r", CONFIG_FILE, value)
+        del filtered["main_window_position"]
+    else:
+        filtered["main_window_position"] = pos
 
 
 def find_site_by_url(url: str) -> WebSDRSite | None:

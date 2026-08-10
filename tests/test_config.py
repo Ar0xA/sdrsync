@@ -373,6 +373,110 @@ def test_load_clamps_negative_idle_disconnect_to_disabled(monkeypatch, tmp_path)
     assert AppSettings.load().websdr_idle_disconnect_min is None
 
 
+# --- window-size memory: AppSettings.webview_sizes ----------------------
+
+
+def test_webview_sizes_defaults_to_empty(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().webview_sizes == {}
+
+
+def test_load_accepts_valid_webview_sizes(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_sizes": {"kiwisdr": [1280, 900], "websdr_org": [1600, 1000]}
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {"kiwisdr": [1280, 900], "websdr_org": [1600, 1000]}
+
+
+def test_load_floors_undersized_webview_size(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_sizes": {"kiwisdr": [10, 5]}
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {
+        "kiwisdr": [config_module.MIN_WEBVIEW_WIDTH, config_module.MIN_WEBVIEW_HEIGHT]
+    }
+
+
+def test_load_skips_malformed_webview_sizes_entries(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_sizes": {
+            "kiwisdr": [1280, 900],
+            "openwebrx": [1000],
+            "websdr_org": ["1000", "700"],
+            "": [1000, 700],
+            "bad_type": "not a list",
+        }
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {"kiwisdr": [1280, 900]}
+
+
+def test_load_rejects_wrong_type_webview_sizes(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"webview_sizes": ["not", "a", "dict"]}), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {}
+
+
+# --- window-position memory: AppSettings.webview_positions ---------------
+
+
+def test_webview_positions_defaults_to_empty(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().webview_positions == {}
+
+
+def test_load_accepts_valid_webview_positions(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_positions": {"kiwisdr": [80, 70], "websdr_org": [-1200, 40]}
+    }), encoding="utf-8")
+    # A negative x is a legitimate coordinate for a monitor to the left of the
+    # primary one -- unlike webview_sizes, there's no floor to enforce here.
+    assert AppSettings.load().webview_positions == {"kiwisdr": [80, 70], "websdr_org": [-1200, 40]}
+
+
+def test_load_skips_malformed_webview_positions_entries(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_positions": {
+            "kiwisdr": [80, 70],
+            "openwebrx": [100],
+            "websdr_org": ["100", "200"],
+            "": [100, 200],
+            "bad_type": "not a list",
+        }
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_positions == {"kiwisdr": [80, 70]}
+
+
+def test_load_rejects_wrong_type_webview_positions(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"webview_positions": ["not", "a", "dict"]}), encoding="utf-8")
+    assert AppSettings.load().webview_positions == {}
+
+
+# --- main-window geometry memory: main_window_position ------------------
+
+
+def test_main_window_position_defaults_to_none(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().main_window_position is None
+
+
+def test_load_accepts_valid_main_window_position(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"main_window_position": [-1200, 40]}), encoding="utf-8")
+    assert AppSettings.load().main_window_position == [-1200, 40]
+
+
+def test_load_rejects_malformed_main_window_position(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"main_window_position": "not a list"}), encoding="utf-8")
+    assert AppSettings.load().main_window_position is None
+
+
 def test_clamp_idle_disconnect_min_passes_through_valid_values():
     assert config_module.clamp_idle_disconnect_min(30) == 30
     assert config_module.clamp_idle_disconnect_min(0) == 0
