@@ -85,6 +85,109 @@ def test_load_clamps_out_of_range_poll_interval(monkeypatch, tmp_path):
     assert AppSettings.load().poll_interval_s == config_module.MAX_POLL_INTERVAL_S
 
 
+def test_load_accepts_valid_reverse_sync_range(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"reverse_sync_min_hz": 1_800_000, "reverse_sync_max_hz": 30_000_000}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz == 1_800_000
+    assert settings.reverse_sync_max_hz == 30_000_000
+
+
+def test_load_defaults_reverse_sync_range_to_unrestricted(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz is None
+    assert settings.reverse_sync_max_hz is None
+
+
+def test_load_accepts_reverse_sync_range_with_only_one_bound_set(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"reverse_sync_min_hz": 100_000}), encoding="utf-8")
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz == 100_000
+    assert settings.reverse_sync_max_hz is None
+
+
+def test_load_rejects_wrong_type_reverse_sync_range(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"reverse_sync_min_hz": "not a number", "reverse_sync_max_hz": True}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz is None
+    assert settings.reverse_sync_max_hz is None
+
+
+def test_load_clamps_negative_reverse_sync_bounds_to_unrestricted(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"reverse_sync_min_hz": -100}), encoding="utf-8")
+    assert AppSettings.load().reverse_sync_min_hz is None
+
+    config_file.write_text(json.dumps({"reverse_sync_max_hz": -1}), encoding="utf-8")
+    assert AppSettings.load().reverse_sync_max_hz is None
+
+
+def test_load_swaps_inverted_reverse_sync_range():
+    """An inverted range (min > max) is almost always a transposition of
+    the intended bounds. It must be SWAPPED, not reset to unrestricted:
+    unlike poll_interval_s (where the safe correction is the permissive
+    one), LOOSENING is the unsafe direction for this guard -- it bounds
+    what a public WebSDR page may retune a real transmitter to, so
+    dropping both bounds would silently leave no guard at all while the
+    user still believes reverse sync is confined to, say, HF."""
+    filtered = {"reverse_sync_min_hz": 30_000_000, "reverse_sync_max_hz": 1_800_000}
+    config_module._clamp_reverse_sync_range(filtered)
+    assert filtered["reverse_sync_min_hz"] == 1_800_000
+    assert filtered["reverse_sync_max_hz"] == 30_000_000
+
+
+def test_load_swaps_inverted_reverse_sync_range_end_to_end(monkeypatch, tmp_path):
+    """The swap must survive the full load() path, not just the helper --
+    a hand-edited config.json with min/max transposed still ends up with
+    an enforced (corrected) range on the AppSettings instance."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"reverse_sync_min_hz": 30_000_000, "reverse_sync_max_hz": 1_800_000}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.reverse_sync_min_hz == 1_800_000
+    assert settings.reverse_sync_max_hz == 30_000_000
+
+
+def test_clamp_reverse_sync_bounds_passes_through_a_valid_range():
+    """The shared helper (used by both config.load() and gui/app.py's
+    range fields) must leave a sane range completely alone, including the
+    one-bound-only and both-unset cases."""
+    assert config_module.clamp_reverse_sync_bounds(1_800_000, 30_000_000) == (1_800_000, 30_000_000)
+    assert config_module.clamp_reverse_sync_bounds(1_800_000, None) == (1_800_000, None)
+    assert config_module.clamp_reverse_sync_bounds(None, 30_000_000) == (None, 30_000_000)
+    assert config_module.clamp_reverse_sync_bounds(None, None) == (None, None)
+
+
+def test_clamp_reverse_sync_bounds_allows_an_equal_min_and_max():
+    """min == max is a degenerate but legitimate single-frequency lock,
+    not an inverted range -- must pass through untouched (engine.py's own
+    check is a strict inequality, so that exact value is still allowed)."""
+    assert config_module.clamp_reverse_sync_bounds(14_074_000, 14_074_000) == (14_074_000, 14_074_000)
+
+
+def test_clamp_reverse_sync_bounds_drops_only_the_negative_bound():
+    """A negative bound can't be satisfied by any real frequency, so it
+    goes to None (unrestricted on that side only) -- the OTHER, valid
+    bound must survive rather than being collateral damage."""
+    assert config_module.clamp_reverse_sync_bounds(-100, 30_000_000) == (None, 30_000_000)
+    assert config_module.clamp_reverse_sync_bounds(1_800_000, -1) == (1_800_000, None)
+    assert config_module.clamp_reverse_sync_bounds(-5, -9) == (None, None)
+
+
+def test_clamp_reverse_sync_bounds_does_not_swap_when_a_bound_was_dropped():
+    """A negative min is dropped BEFORE the inversion check, so the pair
+    can't then be 'swapped' into resurrecting the discarded value."""
+    assert config_module.clamp_reverse_sync_bounds(-30_000_000, 1_800_000) == (None, 1_800_000)
+
+
 def test_load_does_not_crash_on_non_object_top_level_json(monkeypatch, tmp_path):
     """config.json containing valid JSON that isn't an object (a list,
     string, number, or null) must fall back to defaults, not raise --
@@ -223,3 +326,164 @@ def test_save_then_load_round_trips_imported_and_curated_sites(monkeypatch, tmp_
 
     assert reloaded.imported_sites == [{"name": "I", "url": "http://i.example/", "driver_type": "kiwisdr"}]
     assert reloaded.curated_sites == [{"name": "C", "url": "http://c.example/", "driver_type": "openwebrx"}]
+
+
+
+# --- v14: websdr_idle_disconnect_min -----------------------------------
+
+
+def test_idle_disconnect_defaults_to_sixty_minutes(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().websdr_idle_disconnect_min == 60
+
+
+def test_load_accepts_a_valid_idle_disconnect(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": 15}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min == 15
+
+
+def test_load_accepts_null_idle_disconnect_as_disabled(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": None}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min is None
+
+
+def test_load_keeps_zero_idle_disconnect_as_disabled(monkeypatch, tmp_path):
+    """0 is a valid way to say 'never' -- it must survive load() unchanged
+    (the engine treats <= 0 as off), not be corrected to the default."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": 0}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min == 0
+
+
+def test_load_rejects_wrong_type_idle_disconnect(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": "60"}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min == 60  # falls back to the default
+
+
+def test_load_clamps_negative_idle_disconnect_to_disabled(monkeypatch, tmp_path):
+    """Fails toward OFF, deliberately the opposite direction from
+    clamp_reverse_sync_bounds' inverted-range swap: over-eager
+    disconnecting tears down a working session under the user, whereas
+    not idle-disconnecting merely restores the old behavior."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"websdr_idle_disconnect_min": -5}), encoding="utf-8")
+    assert AppSettings.load().websdr_idle_disconnect_min is None
+
+
+# --- window-size memory: AppSettings.webview_sizes ----------------------
+
+
+def test_webview_sizes_defaults_to_empty(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().webview_sizes == {}
+
+
+def test_load_accepts_valid_webview_sizes(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_sizes": {"kiwisdr": [1280, 900], "websdr_org": [1600, 1000]}
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {"kiwisdr": [1280, 900], "websdr_org": [1600, 1000]}
+
+
+def test_load_floors_undersized_webview_size(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_sizes": {"kiwisdr": [10, 5]}
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {
+        "kiwisdr": [config_module.MIN_WEBVIEW_WIDTH, config_module.MIN_WEBVIEW_HEIGHT]
+    }
+
+
+def test_load_skips_malformed_webview_sizes_entries(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_sizes": {
+            "kiwisdr": [1280, 900],
+            "openwebrx": [1000],
+            "websdr_org": ["1000", "700"],
+            "": [1000, 700],
+            "bad_type": "not a list",
+        }
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {"kiwisdr": [1280, 900]}
+
+
+def test_load_rejects_wrong_type_webview_sizes(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"webview_sizes": ["not", "a", "dict"]}), encoding="utf-8")
+    assert AppSettings.load().webview_sizes == {}
+
+
+# --- window-position memory: AppSettings.webview_positions ---------------
+
+
+def test_webview_positions_defaults_to_empty(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().webview_positions == {}
+
+
+def test_load_accepts_valid_webview_positions(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_positions": {"kiwisdr": [80, 70], "websdr_org": [-1200, 40]}
+    }), encoding="utf-8")
+    # A negative x is a legitimate coordinate for a monitor to the left of the
+    # primary one -- unlike webview_sizes, there's no floor to enforce here.
+    assert AppSettings.load().webview_positions == {"kiwisdr": [80, 70], "websdr_org": [-1200, 40]}
+
+
+def test_load_skips_malformed_webview_positions_entries(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({
+        "webview_positions": {
+            "kiwisdr": [80, 70],
+            "openwebrx": [100],
+            "websdr_org": ["100", "200"],
+            "": [100, 200],
+            "bad_type": "not a list",
+        }
+    }), encoding="utf-8")
+    assert AppSettings.load().webview_positions == {"kiwisdr": [80, 70]}
+
+
+def test_load_rejects_wrong_type_webview_positions(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"webview_positions": ["not", "a", "dict"]}), encoding="utf-8")
+    assert AppSettings.load().webview_positions == {}
+
+
+# --- main-window geometry memory: main_window_position ------------------
+
+
+def test_main_window_position_defaults_to_none(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().main_window_position is None
+
+
+def test_load_accepts_valid_main_window_position(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"main_window_position": [-1200, 40]}), encoding="utf-8")
+    assert AppSettings.load().main_window_position == [-1200, 40]
+
+
+def test_load_rejects_malformed_main_window_position(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"main_window_position": "not a list"}), encoding="utf-8")
+    assert AppSettings.load().main_window_position is None
+
+
+def test_clamp_idle_disconnect_min_passes_through_valid_values():
+    assert config_module.clamp_idle_disconnect_min(30) == 30
+    assert config_module.clamp_idle_disconnect_min(0) == 0
+    assert config_module.clamp_idle_disconnect_min(None) is None
+
+
+def test_save_then_load_round_trips_idle_disconnect(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    AppSettings(websdr_idle_disconnect_min=45).save()
+    assert AppSettings.load().websdr_idle_disconnect_min == 45

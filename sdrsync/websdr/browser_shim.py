@@ -615,7 +615,27 @@ class WxPageAdapter:
         if current is not None and evt.GetURL() != current:
             return
         self._pending_goto = None
+        self._nudge_repaint()
         self._loop.call_soon_threadsafe(_safe_set_result, fut, None)
+
+    def _nudge_repaint(self) -> None:
+        """WebView2/WebKitGTK's compositor doesn't reliably present pixels
+        for a freshly-navigated page in this window -- confirmed via live
+        testing (Show()/LoadURL() alone left the on-screen window flat
+        gray despite JS reads and audio both working correctly the whole
+        time; an external OS-level resize was the only thing that made it
+        actually paint). A genuine resize event delivered through the
+        message loop is what's needed, not just a redraw request -- a
+        1px-and-back SetSize is the cheapest reliable way to generate one.
+        Harmless to call even while off-screen/hidden."""
+        if not self._alive:
+            return
+        try:
+            size = self.webview.GetSize()
+            self.webview.SetSize(wx.Size(size.width, max(size.height - 1, 1)))
+            self.webview.SetSize(size)
+        except Exception as e:
+            logger.debug("Repaint nudge failed (non-fatal): %s", e)
 
     def _on_webview_error(self, evt: "wx.html2.WebViewEvent") -> None:
         assert wx.IsMainThread()

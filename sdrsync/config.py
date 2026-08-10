@@ -19,6 +19,17 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 MIN_POLL_INTERVAL_S = 0.05
 MAX_POLL_INTERVAL_S = 5.0
 
+# Floor for AppSettings.webview_sizes entries (the WebSDR popup) --
+# defined here (not in gui/webview_host.py) so
+# load() can enforce it on a hand-edited config.json too, not just the
+# GUI. gui/webview_host.py imports these same two constants rather than
+# redefining them, so the two layers can't drift apart (same split as
+# MIN/MAX_POLL_INTERVAL_S above). There's no matching upper bound here --
+# the sane ceiling is "this machine's screen", which only the wx-aware
+# GUI layer can know; see gui/webview_host.py's display-clamping logic.
+MIN_WEBVIEW_WIDTH = 400
+MIN_WEBVIEW_HEIGHT = 300
+
 
 @dataclass(frozen=True)
 class WebSDRSite:
@@ -130,6 +141,64 @@ class AppSettings:
     # in the GUI widget -- a hand-edited 0 or negative value would
     # otherwise reach asyncio.wait_for(timeout=...) as a busy loop.
     poll_interval_s: float = 0.2
+    # Reverse sync (WebSDR -> rig, v11) frequency safety bound. None means
+    # unrestricted on that side -- either can be set independently (e.g.
+    # min_hz alone rejects anything below it with no upper bound). Any
+    # frequency the WebSDR page reports outside this range is rejected
+    # rather than written to the rig; see sync/engine.py's
+    # _reverse_sync_tick(). Default unrestricted on both, matching every
+    # other reverse-sync safety control in this app (Hold toggle
+    # defaults off too) -- this is an opt-in guard, not a forced-on
+    # restriction, since a sane default range doesn't exist across every
+    # rig/band/country this app might be used in.
+    reverse_sync_min_hz: Optional[int] = None
+    reverse_sync_max_hz: Optional[int] = None
+    # Minutes of no rig activity (no frequency/mode/PTT change at all)
+    # after which the WebSDR session is disconnected, releasing the audio
+    # slot back to what is usually a volunteer-run public receiver with a
+    # small number of concurrent listeners. None or <= 0 disables it
+    # entirely (hold the connection forever, the pre-v14 behavior). The
+    # session reconnects automatically the moment the rig is touched
+    # again -- see sync/engine.py's _tick(). Defaults to ON (unlike the
+    # reverse-sync guards, which default off): the cost of being wrong
+    # here is a few seconds of reconnect delay, while the cost of the
+    # old always-on behavior is borne by someone else's hardware.
+    websdr_idle_disconnect_min: Optional[int] = 60
+    # Remembers the WebSDR browser window's size per driver_type (e.g.
+    # "kiwisdr", "websdr_org", "openwebrx" -- see websdr.registry.DRIVERS),
+    # since different sites' pages can want different window proportions.
+    # {driver_type: [width, height]}. Saved on disconnect/switch (see
+    # gui/app.py's _save_current_webview_geometry()) and on app close; a
+    # driver_type with no entry yet falls back to webview_host.VISIBLE_SIZE.
+    webview_sizes: dict = field(default_factory=dict)
+    # Companion to webview_sizes: the window's top-left position, same
+    # keying and save points. {driver_type: [x, y]}. No entry yet (a
+    # driver_type never connected to before, or a fresh install) falls
+    # back to a position on whichever monitor the main app window is
+    # currently on -- see gui/webview_host.py's on_screen_pos_for_monitor().
+    # Deliberately unclamped/unfloored unlike webview_sizes -- a monitor
+    # can legitimately sit at a negative coordinate in a multi-monitor
+    # arrangement, so there's no sane universal floor the way there is
+    # for a width/height.
+    webview_positions: dict = field(default_factory=dict)
+    # Remembers the main control-panel window's own POSITION across
+    # restarts -- same idea as webview_positions above, but a single
+    # window rather than one per driver_type, so a plain Optional[list]
+    # field rather than a dict. See gui/app.py's
+    # _restore_main_window_geometry(). None means "never saved yet"
+    # (fresh install, or an old config from before this existed); a saved
+    # position that no longer lands on any connected display (e.g. a
+    # docking station's monitor unplugged since it was saved) is also
+    # treated as absent.
+    #
+    # No matching main_window_size: this window's height is instead
+    # computed live from whatever's currently visible (see
+    # gui/app.py's _resize_main_window_to_content()), clamped to the
+    # display and floored so "Open log folder" never scrolls out of the
+    # baseline view -- a fixed remembered size would fight that (and did,
+    # live: forcing a stale pre-condensing size made the window bigger
+    # than the content actually needs).
+    main_window_position: Optional[list] = None
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -151,6 +220,11 @@ class AppSettings:
             _validate_site_list(filtered, "curated_sites")
             _validate_rig_backend(filtered)
             _clamp_poll_interval(filtered)
+            _clamp_reverse_sync_range(filtered)
+            _clamp_idle_disconnect(filtered)
+            _validate_webview_sizes(filtered)
+            _validate_webview_positions(filtered)
+            _validate_main_window_position(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
             logger.warning("Could not load %s (%s); using defaults", CONFIG_FILE, e)
@@ -191,6 +265,9 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "headless": bool,
     "use_mock_rig": bool,
     "poll_interval_s": (int, float),
+    "reverse_sync_min_hz": (int, type(None)),
+    "reverse_sync_max_hz": (int, type(None)),
+    "websdr_idle_disconnect_min": (int, type(None)),
 }
 
 RIG_BACKENDS = {"rigctld", "flrig"}
@@ -219,6 +296,101 @@ def _clamp_poll_interval(filtered: dict[str, Any]) -> None:
             CONFIG_FILE, value, clamped, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S,
         )
         filtered["poll_interval_s"] = clamped
+
+
+def clamp_reverse_sync_bounds(
+    min_hz: Optional[int], max_hz: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Pure sanity-check of a reverse-sync min/max Hz pair: takes the two
+    bounds, returns the corrected pair. Shared by _clamp_reverse_sync_range()
+    below (a hand-edited config.json) and gui/app.py's range entry fields
+    (typed input), so the two layers enforcing this safety bound can't
+    drift apart.
+
+    A NEGATIVE bound can never be satisfied by a real frequency, so it
+    would silently reject every reverse-sync push forever with no way for
+    the user to tell why -- that one bound is dropped to None
+    (unrestricted) rather than left as a value nothing can pass.
+
+    An INVERTED range (min > max, both otherwise valid) is SWAPPED, not
+    dropped. This is deliberately the opposite correction direction from
+    _clamp_poll_interval's fail-open philosophy, because the risk is
+    reversed: for poll_interval_s a too-tight value breaks the app, so
+    the safe direction is permissive; here LOOSENING is the unsafe
+    direction, since this range bounds what a public WebSDR page may
+    retune a real transmitter to. Resetting both bounds to None would
+    silently leave NO guard at all -- with only a log warning nobody
+    reads -- while the user still believes reverse sync is confined to,
+    say, HF. An honest transposition (30000000/1800000 for a meant
+    1.8-30 MHz) is overwhelmingly the likely cause, so swapping keeps
+    *a* range enforced instead of quietly removing the guard."""
+    if min_hz is not None and min_hz < 0:
+        logger.warning("Ignoring negative reverse-sync minimum %r; unrestricted on that side", min_hz)
+        min_hz = None
+    if max_hz is not None and max_hz < 0:
+        logger.warning("Ignoring negative reverse-sync maximum %r; unrestricted on that side", max_hz)
+        max_hz = None
+    if min_hz is not None and max_hz is not None and min_hz > max_hz:
+        logger.warning(
+            "Reverse-sync range %r..%r is inverted -- swapping to %r..%r rather than dropping the guard",
+            min_hz, max_hz, max_hz, min_hz,
+        )
+        min_hz, max_hz = max_hz, min_hz
+    return min_hz, max_hz
+
+
+def _clamp_reverse_sync_range(filtered: dict[str, Any]) -> None:
+    """Apply clamp_reverse_sync_bounds() to a loaded config dict, in
+    place. Runs after _validate_scalars, so by this point each bound (if
+    present) is already known to be an int or None. Only writes a key
+    back when its value actually changed, so an absent key stays absent
+    and falls through to the dataclass default."""
+    min_hz = filtered.get("reverse_sync_min_hz")
+    max_hz = filtered.get("reverse_sync_max_hz")
+    new_min, new_max = clamp_reverse_sync_bounds(min_hz, max_hz)
+    if new_min != min_hz:
+        filtered["reverse_sync_min_hz"] = new_min
+    if new_max != max_hz:
+        filtered["reverse_sync_max_hz"] = new_max
+
+
+def clamp_idle_disconnect_min(value: Optional[int]) -> Optional[int]:
+    """Pure sanity-check of websdr_idle_disconnect_min: takes the value,
+    returns the corrected one. Shared by _clamp_idle_disconnect() below (a
+    hand-edited config.json) and gui/app.py's entry field (typed input),
+    so the two layers can't drift apart -- same split as
+    clamp_reverse_sync_bounds().
+
+    A NEGATIVE value is dropped to None (feature OFF), which is the
+    DELIBERATELY OPPOSITE correction direction from
+    clamp_reverse_sync_bounds()'s "keep *a* guard rather than silently
+    remove it": there, loosening was the unsafe direction (that range
+    bounds what a public page may do to a real transmitter). Here the
+    unsafe direction is the other way round -- a bad value read as
+    "disconnect more eagerly" would tear down a working WebSDR session
+    under the user mid-QSO, whereas failing to idle-disconnect only
+    restores the app's previous (merely impolite) behavior. Fail toward
+    "off"."""
+    if value is not None and value < 0:
+        logger.warning(
+            "Ignoring negative websdr_idle_disconnect_min %r; idle disconnect disabled", value
+        )
+        return None
+    return value
+
+
+def _clamp_idle_disconnect(filtered: dict[str, Any]) -> None:
+    """Apply clamp_idle_disconnect_min() to a loaded config dict, in place.
+    Runs after _validate_scalars, so the value (if present) is already
+    known to be an int or None. Only writes the key back when the value
+    actually changed, so an absent key stays absent and falls through to
+    the dataclass default."""
+    if "websdr_idle_disconnect_min" not in filtered:
+        return
+    value = filtered["websdr_idle_disconnect_min"]
+    clamped = clamp_idle_disconnect_min(value)
+    if clamped != value:
+        filtered["websdr_idle_disconnect_min"] = clamped
 
 
 def _validate_rig_backend(filtered: dict[str, Any]) -> None:
@@ -296,6 +468,94 @@ def _validate_site_list(filtered: dict[str, Any], key: str) -> None:
         else:
             valid_sites.append(validated)
     filtered[key] = valid_sites
+
+
+def _validate_webview_size_entry(value: Any) -> Optional[list[int]]:
+    if not (isinstance(value, (list, tuple)) and len(value) == 2):
+        return None
+    width, height = value
+    is_int = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
+    if not (is_int(width) and is_int(height)):
+        return None
+    return [max(width, MIN_WEBVIEW_WIDTH), max(height, MIN_WEBVIEW_HEIGHT)]
+
+
+def _validate_webview_sizes(filtered: dict[str, Any]) -> None:
+    """Drop (in place) any malformed entry in webview_sizes -- same
+    lenient, shape-only tier as _validate_site_list (a bad size just
+    falls back to webview_host.VISIBLE_SIZE for that driver_type rather
+    than crashing SetSize())."""
+    if "webview_sizes" not in filtered:
+        return
+    raw = filtered["webview_sizes"]
+    if not isinstance(raw, dict):
+        logger.warning("Ignoring invalid webview_sizes value in %s (expected an object): %r", CONFIG_FILE, raw)
+        del filtered["webview_sizes"]
+        return
+    valid: dict[str, list[int]] = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key):
+            logger.warning("Skipping malformed webview_sizes key in %s: %r", CONFIG_FILE, key)
+            continue
+        size = _validate_webview_size_entry(value)
+        if size is None:
+            logger.warning("Skipping malformed webview_sizes entry for %r in %s: %r", key, CONFIG_FILE, value)
+            continue
+        valid[key] = size
+    filtered["webview_sizes"] = valid
+
+
+def _validate_webview_position_entry(value: Any) -> Optional[list[int]]:
+    if not (isinstance(value, (list, tuple)) and len(value) == 2):
+        return None
+    x, y = value
+    is_int = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
+    if not (is_int(x) and is_int(y)):
+        return None
+    return [x, y]
+
+
+def _validate_webview_positions(filtered: dict[str, Any]) -> None:
+    """Same lenient, shape-only tier as _validate_webview_sizes -- a bad
+    entry just falls back to on_screen_pos_for_monitor() for that
+    driver_type rather than crashing SetPosition(). No floor/ceiling
+    here (unlike sizes): any int pair is a plausible screen coordinate
+    across some monitor arrangement."""
+    if "webview_positions" not in filtered:
+        return
+    raw = filtered["webview_positions"]
+    if not isinstance(raw, dict):
+        logger.warning("Ignoring invalid webview_positions value in %s (expected an object): %r", CONFIG_FILE, raw)
+        del filtered["webview_positions"]
+        return
+    valid: dict[str, list[int]] = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key):
+            logger.warning("Skipping malformed webview_positions key in %s: %r", CONFIG_FILE, key)
+            continue
+        pos = _validate_webview_position_entry(value)
+        if pos is None:
+            logger.warning("Skipping malformed webview_positions entry for %r in %s: %r", key, CONFIG_FILE, value)
+            continue
+        valid[key] = pos
+    filtered["webview_positions"] = valid
+
+
+def _validate_main_window_position(filtered: dict[str, Any]) -> None:
+    """Reuses _validate_webview_position_entry's shape check -- same
+    [x, y] shape as a webview_positions entry, just a lone field instead
+    of a per-driver_type dict."""
+    if "main_window_position" not in filtered:
+        return
+    value = filtered["main_window_position"]
+    if value is None:
+        return
+    pos = _validate_webview_position_entry(value)
+    if pos is None:
+        logger.warning("Ignoring malformed main_window_position in %s: %r", CONFIG_FILE, value)
+        del filtered["main_window_position"]
+    else:
+        filtered["main_window_position"] = pos
 
 
 def find_site_by_url(url: str) -> WebSDRSite | None:

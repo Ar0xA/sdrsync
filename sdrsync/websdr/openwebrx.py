@@ -119,6 +119,30 @@ _READY_PREDICATE = """
 """
 
 
+# get_status()'s already-normalized mode string (mode_str.upper(), the
+# exact post-normalization set -- USB/LSB/CW/AM/NFM/WFM) -> canonical
+# hamlib mode name. Unlike the other two drivers there's no narrow/wide
+# suffix convention on this site at all (see the forward _MODE_MAP's own
+# comment), so this reverse map is a plain 1:1 dict too.
+_REVERSE_MODE_MAP: dict[str, str] = {
+    "USB": "USB",
+    "LSB": "LSB",
+    "CW": "CW",
+    "AM": "AM",
+    "NFM": "FM",
+    "WFM": "WFM",
+}
+
+
+def map_openwebrx_mode_to_hamlib(openwebrx_mode: Optional[str]) -> Optional[str]:
+    """Pure reverse mapping: OpenWebRX's get_status()-normalized mode
+    string (already uppercased) -> a canonical hamlib mode name. None if
+    unknown (caller should skip the reverse push and log, not raise)."""
+    if openwebrx_mode is None:
+        return None
+    return _REVERSE_MODE_MAP.get(openwebrx_mode.upper())
+
+
 class OpenWebRXDriver:
     """WebSDRDriver implementation for the OpenWebRX software family.
 
@@ -203,8 +227,13 @@ class OpenWebRXDriver:
         self._last_unmapped_mode = None
 
     # ------------------------------------------------------------------
-    async def tune_hz(self, freq_hz: int) -> bool:
-        """Returns True only if actually applied and verified via readback."""
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
+        """Returns True only if actually applied and verified via readback.
+
+        verify is accepted for WebSDRDriver Protocol parity but unused
+        here -- this driver's readback verification is synchronous and
+        inline (below), not a delayed background task, so there's nothing
+        for verify=False to skip."""
         if not self._attached:
             return False
         effective_hz = freq_hz
@@ -375,6 +404,28 @@ class OpenWebRXDriver:
             )
         except PlaywrightError as e:
             logger.debug("toggleMute() call failed (non-fatal): %s", e)
+
+    def _reverse_effective_hz(
+        self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]
+    ) -> Optional[int]:
+        """Un-applies cw_offset_hz for the reverse direction (WebSDR ->
+        rig), symmetric to tune_hz()'s forward application. Takes the
+        mode as an explicit argument, sourced from the SAME status
+        snapshot map_openwebrx_mode_to_hamlib() derived it from -- NOT
+        self._current_mode, which is stale by construction for reverse
+        sync (see websdr_org.py's identical helper for the full
+        reasoning)."""
+        if observed_hz is None:
+            return None
+        if observed_hamlib_mode == "CW":
+            return observed_hz - self.cw_offset_hz
+        return observed_hz
+
+    def hamlib_mode_from_status(self, status: WebSDRStatus) -> Optional[str]:
+        return map_openwebrx_mode_to_hamlib(status.mode)
+
+    def rig_freq_from_status(self, status: WebSDRStatus) -> Optional[int]:
+        return self._reverse_effective_hz(status.freq_hz, self.hamlib_mode_from_status(status))
 
     # ------------------------------------------------------------------
     def _combined_error(self) -> Optional[str]:

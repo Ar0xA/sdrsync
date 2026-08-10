@@ -45,10 +45,14 @@ from sdrsync.config import (
     AppSettings,
     KNOWN_SITES,
     WebSDRSite,
+    clamp_idle_disconnect_min,
+    clamp_reverse_sync_bounds,
 )
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
-from sdrsync.gui.webview_host import WebViewHost
+from sdrsync.gui.webview_host import (
+    WebViewHost, clamp_size_to_display, has_display_at, on_screen_pos_for_monitor,
+)
 from sdrsync.logging_setup import LOG_FILE
 from sdrsync.resources import ICON_PATH
 from sdrsync.preflight import (
@@ -81,6 +85,42 @@ def _set_wrapped(static_text: wx.StaticText, text: str, width: int = LABEL_WRAP_
     static_text.Wrap(width)
 
 
+def _parse_optional_hz(text: str) -> tuple[Optional[int], bool]:
+    """Parse a reverse-sync range field, returning (value, is_valid).
+
+    Blank -> (None, True): unrestricted is an intentional, valid state,
+    not an error. Anything non-numeric -> (None, False), reported as
+    INVALID rather than silently collapsing to unrestricted -- this field
+    bounds what a WebSDR page may retune a real transmitter to, so a
+    typo must never be read as "no bound at all". See
+    _on_reverse_sync_range_commit() for what the caller does with it."""
+    text = text.strip()
+    if not text:
+        return None, True
+    try:
+        return int(text), True
+    except ValueError:
+        return None, False
+
+
+def _parse_optional_minutes(text: str) -> tuple[Optional[int], bool]:
+    """Parse the idle-disconnect field, returning (value, is_valid).
+
+    Blank -> (None, True): "never idle-disconnect" is an intentional,
+    valid state. Anything non-numeric -> (None, False), reported as
+    INVALID and reverted rather than silently persisted -- same rule as
+    _parse_optional_hz, for the same reason (what's on screen must be
+    what's actually in force). 0 parses fine and also means disabled; see
+    config.AppSettings.websdr_idle_disconnect_min."""
+    text = text.strip()
+    if not text:
+        return None, True
+    try:
+        return int(text), True
+    except ValueError:
+        return None, False
+
+
 class _Tooltip:
     """Minimal dynamic tooltip. text_func() is re-evaluated on every hover
     so it can explain a *currently disabled* control (e.g. why a button
@@ -101,7 +141,16 @@ class _Tooltip:
 
 class MainFrame(wx.Frame):
     def __init__(self, settings: AppSettings, webview_host: WebViewHost) -> None:
-        super().__init__(None, title="SDRSync - rigctld -> WebSDR")
+        super().__init__(
+            None, title=f"SDRSync {__version__} - rigctld -> WebSDR",
+            # No RESIZE_BORDER/MAXIMIZE_BOX -- this window's size is
+            # entirely computed (_resize_main_window_to_content(), the
+            # MinSize floor from _finish_initial_layout()), not something
+            # a manual drag or maximize should be able to override; either
+            # would just get silently undone by the next rig/mock-rig
+            # connect or disconnect anyway.
+            style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX),
+        )
         if ICON_PATH.exists():
             try:
                 icon = wx.Icon(str(ICON_PATH), wx.BITMAP_TYPE_ICO)
@@ -115,6 +164,16 @@ class MainFrame(wx.Frame):
             logger.warning("App icon not found at %s", ICON_PATH)
         self.settings = settings
         self._webview_host = webview_host
+        # No WebSDR connection exists yet at startup -- hide the (empty)
+        # WebSDR window immediately rather than leaving it sitting on
+        # screen/in the taskbar until the first Connect. Symmetric with
+        # the show/hide calls around connect/disconnect below.
+        self._webview_host.set_frame_visible(False)
+        # The WebSDR window's own close (X) button is otherwise always
+        # vetoed (see WebViewHost.__init__) since the frame itself must
+        # never actually be destroyed mid-session -- but a user clicking
+        # it clearly means "disconnect this", not "do nothing".
+        self._webview_host.on_close_requested = self._on_websdr_window_close_requested
 
         self.status_queue: "queue.Queue[GuiMessage]" = queue.Queue()
         self.rig_test_thread: Optional[threading.Thread] = None
@@ -156,6 +215,21 @@ class MainFrame(wx.Frame):
         self._rig_ever_connected = False
         self._websdr_active = False
         self._websdr_ever_connected = False
+        # True from the moment Connect/Switch is clicked until the engine
+        # either reports websdr_active=True (success) or an explicit
+        # failure (snap.websdr is not None -- see _start_websdr's own
+        # error-path publishes). SyncEngine._tick() keeps publishing
+        # ordinary "nothing to report" snapshots (websdr_active=False,
+        # websdr=None) on its regular cadence throughout the connect
+        # attempt -- until _start_websdr() actually flips its internal
+        # websdr_active True (only after the WebView round-trip completes,
+        # a GUI-thread hop away), those ordinary snapshots are
+        # indistinguishable on the wire from a genuine disconnect having
+        # just completed (_stop_websdr() also publishes websdr=None).
+        # This flag is what lets _apply_snapshot tell "still waiting, no
+        # news yet" apart from "actually over" and skip tearing down the
+        # connect-in-progress UI/window on a merely-stale snapshot.
+        self._websdr_connect_pending = False
         # What the WebSDR panel last told the engine to load -- None means
         # "not active". Used to tell "Disconnect" (same site reselected)
         # apart from "Switch WebSDR" (different site selected while active).
@@ -169,6 +243,11 @@ class MainFrame(wx.Frame):
         # _websdr_conn_text, which is display text only.
         self._websdr_connected = False
 
+        # Raw (pre-Wrap) text currently shown by each collapsing message
+        # row -- see _update_message_row() for why the widget's own
+        # GetLabel() can't be used for this.
+        self._message_text: dict[wx.StaticText, str] = {}
+
         self._dispatch: dict[type, Callable[[GuiMessage], None]] = {
             StatusSnapshot: self._apply_snapshot,
             RigPreflightResult: self._apply_rig_preflight,
@@ -180,6 +259,14 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
         self._build_widgets()
+        self._restore_main_window_geometry()
+        # Best-size/virtual-size metrics are only accurate once this
+        # frame is genuinely realized on screen (confirmed live: a
+        # measurable gap between the pre-Show() and post-Show() computed
+        # size). Queued via CallAfter so it runs right after
+        # SDRSyncApp.OnInit()'s frame.Show(True) -- see
+        # _finish_initial_layout()'s own docstring for what it does and why.
+        wx.CallAfter(self._finish_initial_layout)
         self._restore_custom_site_if_needed()
         self._maybe_auto_update_curated_sites()
 
@@ -194,6 +281,95 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_TIMER, self._poll_status_queue, self._poll_timer)
         self._poll_timer.Start(QUEUE_POLL_MS)
 
+    def _restore_main_window_geometry(self) -> None:
+        """Applies this window's own remembered POSITION from the last
+        session, if any -- same idea as the WebSDR popup's geometry
+        memory (_restore_webview_geometry). Falls back to wx's own
+        default placement both when nothing was ever saved and when the
+        saved point no longer lands on any connected display (e.g. a
+        docking station's monitor unplugged since it was saved) -- the
+        same has_display_at() check the WebSDR popup's geometry restore
+        uses.
+
+        Size is deliberately handled separately, in _finish_initial_layout()
+        (queued via wx.CallAfter in __init__) rather than here: it needs
+        this window's position already settled (to know which display to
+        clamp against) and needs the frame to have actually been shown at
+        least once for accurate metrics -- neither is true yet at this
+        point in __init__."""
+        pos = self.settings.main_window_position
+        if pos and len(pos) == 2:
+            candidate = wx.Point(pos[0], pos[1])
+            if has_display_at(candidate):
+                self.SetPosition(candidate)
+
+    def _finish_initial_layout(self) -> None:
+        """Queued via wx.CallAfter in __init__, so this runs right after
+        SDRSyncApp.OnInit()'s frame.Show(True) -- best-size/virtual-size
+        metrics are only accurate once this frame is genuinely realized
+        on screen (confirmed live: _root_panel's computed best size grew
+        by dozens of pixels between construction and the first real
+        Show()+Layout() pass -- enough that "Open log folder", the last
+        always-present widget, landed just past the frame's own
+        bottom edge before this ran).
+
+        Establishes a hard floor -- this window's own MinSize -- from the
+        natural content size with the Mock Rig Control panel HIDDEN (its
+        baseline, always-available state): whatever else happens (a user
+        drag-resize, a future change here), this window can never shrink
+        past the point where "Open log folder" would go out of view.
+        Then hands off to _resize_main_window_to_content() for the actual
+        sizing, which _update_mock_rig_panel_visibility() also calls on
+        every rig/mock-rig connect and disconnect, so the window grows
+        and shrinks live with whatever's currently visible rather than
+        only ever growing (Fit()'s old behavior)."""
+        self._root_panel.Layout()
+        self._root_panel.FitInside()
+        # mock_box is still in its construction-time hidden state here --
+        # the Mock Rig Control panel only ever appears after a rig
+        # connects, which requires the GUI to already be interactive, so
+        # it can't have happened yet this early in startup. That's what
+        # makes this the right moment to capture the MinSize floor below.
+        # GetSizer().CalcMin(), not _root_panel.GetBestSize() -- a
+        # wx.ScrolledWindow's own best-size doesn't reliably reflect its
+        # sizer's true minimum the way a plain Panel's does (confirmed
+        # live: it under-reported the natural content height, exactly
+        # the "content unreachable" failure mode this whole mechanism
+        # exists to prevent).
+        min_natural = self._root_panel.GetSizer().CalcMin()
+        chrome = self.GetSize() - self.GetClientSize()
+        self.SetMinSize(wx.Size(min_natural.width + chrome.width, min_natural.height + chrome.height))
+        self._resize_main_window_to_content()
+
+    def _resize_main_window_to_content(self) -> None:
+        """Resizes this window's own OUTER size to exactly fit whatever's
+        CURRENTLY visible (the Mock Rig Control panel included or
+        excluded), clamped to whichever display it's on. Called once at
+        startup (via _finish_initial_layout()) and again every time
+        _update_mock_rig_panel_visibility() toggles that panel.
+
+        SetMinSize() (see _finish_initial_layout()) guarantees the
+        SetSize() below can never actually shrink this window past the
+        point "Open log folder" would go out of view. FitInside() keeps
+        _root_panel's scrollbar range in sync for whatever doesn't fit
+        even at the clamped size -- content taller than the display is
+        still fully reachable, just via scrolling rather than a window
+        that would otherwise be taller than the screen itself."""
+        self._root_panel.Layout()
+        self._root_panel.FitInside()
+        natural = self._root_panel.GetSizer().CalcMin()
+        # clamp_size_to_display bounds an OUTER top-level window size
+        # (see its other use, on the WebSDR popup's frame.SetSize()) --
+        # natural is a CLIENT size (what _root_panel needs), so convert
+        # through this frame's own chrome (title bar/borders) in both
+        # directions, or the clamp bound (and the size we end up
+        # requesting) is off by however tall the title bar is.
+        chrome = self.GetSize() - self.GetClientSize()
+        outer_target = clamp_size_to_display(
+            wx.Size(natural.width + chrome.width, natural.height + chrome.height), self.GetPosition(),
+        )
+        self.SetSize(outer_target)
+
     @staticmethod
     def _run_engine(engine: SyncEngine) -> None:
         try:
@@ -204,33 +380,51 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------------------------
     def _build_widgets(self) -> None:
-        panel = wx.Panel(self)
+        # wx.ScrolledWindow, not wx.Panel -- this window's full natural
+        # content height (Transceiver fields, the Mock Rig Control panel)
+        # can exceed a real monitor's usable height (live-reported), and
+        # unlike the WebSDR popup there's no "any size is fine" browser
+        # view to just clamp; a scrollbar is what keeps every control
+        # reachable regardless of screen size. Vertical-only scrolling
+        # (x rate 0) -- nothing here is expected to need horizontal
+        # scroll. See _finish_initial_layout() for how this window's
+        # VISIBLE size is capped independently of its virtual (full
+        # content) size, and _update_mock_rig_panel_visibility() for how
+        # the virtual size is kept in sync afterward.
+        panel = wx.ScrolledWindow(self)
+        panel.SetScrollRate(0, 20)
         self._root_panel = panel
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         websdr_box = wx.StaticBox(panel, label="WebSDR")
         websdr_sizer = wx.StaticBoxSizer(websdr_box, wx.VERTICAL)
         self._build_websdr_panel(websdr_box, websdr_sizer)
-        main_sizer.Add(websdr_sizer, flag=wx.EXPAND | wx.ALL, border=6)
+        main_sizer.Add(websdr_sizer, flag=wx.EXPAND | wx.ALL, border=3)
 
         rig_box = wx.StaticBox(panel, label="Transceiver")
         rig_sizer = wx.StaticBoxSizer(rig_box, wx.VERTICAL)
         self._build_rig_panel(rig_box, rig_sizer)
-        main_sizer.Add(rig_sizer, flag=wx.EXPAND | wx.ALL, border=6)
+        main_sizer.Add(rig_sizer, flag=wx.EXPAND | wx.ALL, border=3)
 
         self._build_mock_rig_panel(panel, main_sizer)
 
         open_log_btn = wx.Button(panel, label="Open log folder")
         open_log_btn.Bind(wx.EVT_BUTTON, self._on_open_log_folder_clicked)
-        main_sizer.Add(open_log_btn, flag=wx.ALIGN_LEFT | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=6)
+        main_sizer.Add(open_log_btn, flag=wx.ALIGN_LEFT | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=3)
 
         panel.SetSizer(main_sizer)
         frame_sizer = wx.BoxSizer(wx.VERTICAL)
-        frame_sizer.Add(panel, flag=wx.EXPAND)
-        self.SetSizerAndFit(frame_sizer)
+        frame_sizer.Add(panel, proportion=1, flag=wx.EXPAND)
+        # SetSizer(), not SetSizerAndFit() -- fitting the frame to the
+        # panel's full content here (before this frame is even Show()'n)
+        # is both inaccurate (see _finish_initial_layout()'s docstring)
+        # and, now that the panel scrolls, no longer what we want anyway:
+        # the frame's own visible size is decided later, independently of
+        # the panel's (potentially taller) virtual content size.
+        self.SetSizer(frame_sizer)
 
     def _build_websdr_panel(self, parent: wx.Window, outer: wx.BoxSizer) -> None:
-        grid = wx.GridBagSizer(vgap=4, hgap=6)
+        grid = wx.GridBagSizer(vgap=2, hgap=6)
         row = 0
 
         grid.Add(wx.StaticText(parent, label="WebSDR site:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -270,7 +464,24 @@ class MainFrame(wx.Frame):
         self.websdr_disconnect_btn = wx.Button(parent, label="Disconnect WebSDR")
         self.websdr_disconnect_btn.Bind(wx.EVT_BUTTON, self._on_websdr_disconnect_clicked)
         _Tooltip(self.websdr_disconnect_btn, self._websdr_disconnect_tooltip_text)
-        grid.Add(self.websdr_disconnect_btn, pos=(row, 1), flag=wx.ALIGN_LEFT)
+        # Same column as websdr_connect_btn (row above) so the two sit
+        # directly under each other rather than at unrelated columns.
+        grid.Add(self.websdr_disconnect_btn, pos=(row, 3), flag=wx.EXPAND)
+
+        self.reverse_sync_hold_btn = wx.CheckBox(parent, label="Hold (WebSDR read-only)")
+        self.reverse_sync_hold_btn.Bind(wx.EVT_CHECKBOX, self._on_reverse_sync_hold_toggled)
+        _Tooltip(
+            self.reverse_sync_hold_btn,
+            lambda: "Pause the WebSDR page from moving your rig. Forward sync (rig -> WebSDR) "
+                    "keeps working. Can be toggled before connecting. A write already on its "
+                    "way to the rig may still complete once -- it can't be recalled mid-send.",
+        )
+        grid.Add(self.reverse_sync_hold_btn, pos=(row, 2), flag=wx.ALIGN_LEFT)
+        self.reverse_sync_held_text = wx.StaticText(parent, label="")
+        self.reverse_sync_held_text.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        # Column 4, not 3 -- column 3 in this row is now websdr_disconnect_btn
+        # (moved here so it sits directly under websdr_connect_btn).
+        grid.Add(self.reverse_sync_held_text, pos=(row, 4), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         grid.Add(wx.StaticText(parent, label="Custom URL:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -310,29 +521,84 @@ class MainFrame(wx.Frame):
         grid.Add(self.mute_on_tx_check, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
-        self.websdr_preflight_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
-        grid.Add(self.websdr_preflight_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
+        grid.Add(wx.StaticText(parent, label="Idle disconnect (min):"), pos=(row, 0),
+                 flag=wx.ALIGN_CENTER_VERTICAL)
+        self.idle_disconnect_entry = wx.TextCtrl(
+            parent,
+            value=(str(self.settings.websdr_idle_disconnect_min)
+                   if self.settings.websdr_idle_disconnect_min is not None else ""),
+            size=(90, -1),
+            style=wx.TE_PROCESS_ENTER,
+        )
+        # Commits on Enter/blur only, never per keystroke -- same pattern
+        # as the reverse-sync range fields (see
+        # _on_idle_disconnect_commit), so a field momentarily blank while
+        # retyping can't be persisted as "disabled".
+        self.idle_disconnect_entry.Bind(wx.EVT_TEXT_ENTER, self._on_idle_disconnect_commit)
+        self.idle_disconnect_entry.Bind(wx.EVT_KILL_FOCUS, self._on_idle_disconnect_commit)
+        _Tooltip(
+            self.idle_disconnect_entry,
+            lambda: "Release the WebSDR audio slot after this many minutes with no rig activity "
+                    "(no frequency, mode or PTT change). Reconnects automatically as soon as you "
+                    "use the rig again. Blank or 0 = never disconnect. Public receivers are "
+                    "volunteer-run and have limited slots. Applies when you press Enter or leave "
+                    "the field.",
+        )
+        grid.Add(self.idle_disconnect_entry, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.websdr_idle_text = wx.StaticText(parent, label="")
+        self.websdr_idle_text.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+        grid.Add(self.websdr_idle_text, pos=(row, 2), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
+        # --- Live status readout ---------------------------------------
+        # Paired two-across (see _grid_status_pair): five one-per-row
+        # readouts cost five rows of a panel that already had columns 2-3
+        # sitting empty beside them. Pairing is by kind -- what this
+        # connection IS (state + which driver is driving it), then what
+        # it's DOING (frequency + mode), then whether audio is actually
+        # flowing.
         self.websdr_conn_text = wx.StaticText(parent, label="not connected")
+        self.websdr_driver_text = wx.StaticText(parent, label="-")
         self.websdr_freq_text = wx.StaticText(parent, label="-")
         self.websdr_mode_text = wx.StaticText(parent, label="-")
         self.websdr_audio_text = wx.StaticText(parent, label="-")
-        row = self._grid_status_row(parent, grid, row, "Status:", self.websdr_conn_text)
-        row = self._grid_status_row(parent, grid, row, "Frequency:", self.websdr_freq_text)
-        row = self._grid_status_row(parent, grid, row, "Mode:", self.websdr_mode_text)
+        row = self._grid_status_pair(parent, grid, row,
+                                     "Status:", self.websdr_conn_text, "Driver:", self.websdr_driver_text)
+        row = self._grid_status_pair(parent, grid, row,
+                                     "Frequency:", self.websdr_freq_text, "Mode:", self.websdr_mode_text)
         row = self._grid_status_row(parent, grid, row, "Audio:", self.websdr_audio_text)
 
-        self.websdr_err_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
-        self.websdr_err_text.SetForegroundColour(ERROR_COLOUR)
-        grid.Add(self.websdr_err_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
+        # --- Message area (collapsing -- see _add_message_row) ---------
+        # Every message this panel can raise, gathered in one place under
+        # the status block instead of scattered between the controls, in
+        # descending severity: hard failure, reverse-sync gave up,
+        # reverse-sync still trying, Test result. Each line appears only
+        # while it has something to say, so the normal (quiet) case costs
+        # nothing at all -- and because they sit BELOW the readout, a
+        # message appearing no longer shoves the status block down the
+        # panel while the user is reading it.
+        self.websdr_err_text, row = self._add_message_row(parent, grid, row, ERROR_COLOUR)
+        # Final/actionable (red -- the retry ladder gave up) vs
+        # transient/informational (grey -- a retry is still in progress).
+        # Two independent rows, NOT one shared line: the engine's
+        # reverse_sync_error persists until a later push succeeds (or the
+        # WebSDR reattaches), so a stale freq give-up and a live mode
+        # retry genuinely can be pending at the same moment
+        # (SyncEngine._reverse_sync_error vs _reverse_sync_pending_text()
+        # are separately maintained). Sharing one row would silently drop
+        # whichever lost.
+        self.reverse_sync_error_text, row = self._add_message_row(parent, grid, row, ERROR_COLOUR)
+        self.reverse_sync_pending_text, row = self._add_message_row(
+            parent, grid, row, wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT),
+        )
+        self.websdr_preflight_text, row = self._add_message_row(parent, grid, row)
 
         grid.AddGrowableCol(1)
-        outer.Add(grid, flag=wx.EXPAND | wx.ALL, border=4)
+        outer.Add(grid, flag=wx.EXPAND | wx.ALL, border=2)
         self._update_websdr_controls()
 
     def _build_rig_panel(self, parent: wx.Window, outer: wx.BoxSizer) -> None:
-        grid = wx.GridBagSizer(vgap=4, hgap=6)
+        grid = wx.GridBagSizer(vgap=2, hgap=6)
         row = 0
 
         grid.Add(wx.StaticText(parent, label="Backend:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -364,6 +630,43 @@ class MainFrame(wx.Frame):
         grid.Add(self.poll_interval_ctrl, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
+        grid.Add(wx.StaticText(parent, label="Reverse-sync range (Hz):"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.reverse_sync_min_entry = wx.TextCtrl(
+            parent,
+            value=str(self.settings.reverse_sync_min_hz) if self.settings.reverse_sync_min_hz is not None else "",
+            size=(90, -1),
+            style=wx.TE_PROCESS_ENTER,
+        )
+        _Tooltip(
+            self.reverse_sync_min_entry,
+            lambda: "Lowest Hz reverse sync (WebSDR -> rig) may write to your rig. Blank = no lower bound. "
+                    "Applies when you press Enter or leave the field.",
+        )
+        grid.Add(self.reverse_sync_min_entry, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(wx.StaticText(parent, label="to:"), pos=(row, 2), flag=wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+        self.reverse_sync_max_entry = wx.TextCtrl(
+            parent,
+            value=str(self.settings.reverse_sync_max_hz) if self.settings.reverse_sync_max_hz is not None else "",
+            size=(90, -1),
+            style=wx.TE_PROCESS_ENTER,
+        )
+        # Both fields commit on Enter/blur only, never per keystroke (see
+        # _on_reverse_sync_range_commit). Bound only now that BOTH
+        # controls exist -- the handler reads them as a pair, so binding
+        # the min field earlier would leave a window where a kill-focus
+        # event (wx can move focus as later controls are created) reaches
+        # a handler whose max field isn't assigned yet.
+        for entry in (self.reverse_sync_min_entry, self.reverse_sync_max_entry):
+            entry.Bind(wx.EVT_TEXT_ENTER, self._on_reverse_sync_range_commit)
+            entry.Bind(wx.EVT_KILL_FOCUS, self._on_reverse_sync_range_commit)
+        _Tooltip(
+            self.reverse_sync_max_entry,
+            lambda: "Highest Hz reverse sync (WebSDR -> rig) may write to your rig. Blank = no upper bound. "
+                    "Applies when you press Enter or leave the field.",
+        )
+        grid.Add(self.reverse_sync_max_entry, pos=(row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        row += 1
+
         self.mock_rig_check = wx.CheckBox(parent, label="Use mock rig (embedded, for testing)")
         self.mock_rig_check.SetValue(self.settings.use_mock_rig)
         self.mock_rig_check.Bind(wx.EVT_CHECKBOX, self._on_mock_rig_toggled)
@@ -378,25 +681,28 @@ class MainFrame(wx.Frame):
         grid.Add(self.rig_test_btn, pos=(row, 3), flag=wx.EXPAND)
         row += 1
 
-        self.rig_preflight_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
-        grid.Add(self.rig_preflight_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
-        row += 1
-
+        # --- Live status readout ---------------------------------------
+        # Same two-across pairing as the WebSDR panel, same grouping
+        # logic: connection state beside PTT (the two "what is the radio
+        # doing right now" facts, and PTT is the one an operator glances
+        # at mid-QSO), then frequency beside mode.
         self.rig_conn_text = wx.StaticText(parent, label="not connected")
         self.rig_freq_text = wx.StaticText(parent, label="-")
         self.rig_mode_text = wx.StaticText(parent, label="-")
         self.rig_ptt_text = wx.StaticText(parent, label="-")
-        row = self._grid_status_row(parent, grid, row, "Status:", self.rig_conn_text)
-        row = self._grid_status_row(parent, grid, row, "Frequency:", self.rig_freq_text)
-        row = self._grid_status_row(parent, grid, row, "Mode:", self.rig_mode_text)
-        row = self._grid_status_row(parent, grid, row, "PTT:", self.rig_ptt_text)
+        row = self._grid_status_pair(parent, grid, row,
+                                     "Status:", self.rig_conn_text, "PTT:", self.rig_ptt_text)
+        row = self._grid_status_pair(parent, grid, row,
+                                     "Frequency:", self.rig_freq_text, "Mode:", self.rig_mode_text)
 
-        self.rig_err_text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
-        self.rig_err_text.SetForegroundColour(ERROR_COLOUR)
-        grid.Add(self.rig_err_text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
+        # --- Message area (collapsing -- see _add_message_row) ---------
+        # Error first, then the Test (preflight) result; both collapsed
+        # away entirely while empty, which is nearly always.
+        self.rig_err_text, row = self._add_message_row(parent, grid, row, ERROR_COLOUR)
+        self.rig_preflight_text, row = self._add_message_row(parent, grid, row)
 
         grid.AddGrowableCol(1)
-        outer.Add(grid, flag=wx.EXPAND | wx.ALL, border=4)
+        outer.Add(grid, flag=wx.EXPAND | wx.ALL, border=2)
 
         if self.mock_rig_check.GetValue():
             self.host_entry.Disable()
@@ -407,7 +713,7 @@ class MainFrame(wx.Frame):
         controls that look like they drive a real radio."""
         self.mock_box = wx.StaticBox(parent, label="Mock Rig Control")
         mock_sizer = wx.StaticBoxSizer(self.mock_box, wx.VERTICAL)
-        grid = wx.GridBagSizer(vgap=4, hgap=6)
+        grid = wx.GridBagSizer(vgap=2, hgap=6)
 
         self.mock_freq_entry = wx.TextCtrl(self.mock_box, value="14074000", size=(120, -1))
         grid.Add(wx.StaticText(self.mock_box, label="Freq (Hz):"), pos=(0, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -433,12 +739,11 @@ class MainFrame(wx.Frame):
         self.mock_ptt_check.Bind(wx.EVT_CHECKBOX, self._on_mock_ptt_toggled)
         grid.Add(self.mock_ptt_check, pos=(3, 0), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
 
-        mock_sizer.Add(grid, flag=wx.EXPAND | wx.ALL, border=4)
-        self.mock_err_text = wx.StaticText(self.mock_box, label="")
-        self.mock_err_text.SetForegroundColour(ERROR_COLOUR)
-        mock_sizer.Add(self.mock_err_text, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=4)
+        mock_sizer.Add(grid, flag=wx.EXPAND | wx.ALL, border=2)
+        self.mock_err_text = self._new_message_text(self.mock_box, ERROR_COLOUR)
+        mock_sizer.Add(self.mock_err_text, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=2)
 
-        outer_sizer.Add(mock_sizer, flag=wx.EXPAND | wx.ALL, border=6)
+        outer_sizer.Add(mock_sizer, flag=wx.EXPAND | wx.ALL, border=3)
         self.mock_box.Show(False)  # hidden until mock mode + rig connected
 
     @staticmethod
@@ -447,17 +752,119 @@ class MainFrame(wx.Frame):
         grid.Add(value_widget, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         return row + 1
 
+    @staticmethod
+    def _grid_status_pair(
+        parent: wx.Window, grid: wx.GridBagSizer, row: int,
+        label_a: str, widget_a: wx.StaticText, label_b: str, widget_b: wx.StaticText,
+    ) -> int:
+        """Two label/value readouts on ONE grid row: the first in the
+        col 0/1 pair a plain _grid_status_row() would use, the second in
+        the col 2/3 pair (label right-aligned against its value, the same
+        convention the Transceiver panel's 'port:'/'to:' labels already
+        use). Halves the vertical space a status block costs without
+        making it any denser to read -- these are short, fixed-width
+        key/value pairs, and columns 2-3 were otherwise entirely blank
+        alongside them.
+
+        Both values still land in columns whose minimum width is already
+        set by much wider content above them (the site combo and the
+        Connect/Disconnect buttons here, the host/port fields in the
+        Transceiver panel), so a value changing at runtime -- a longer
+        frequency string, a longer driver name -- can't push this
+        window's width around."""
+        grid.Add(wx.StaticText(parent, label=label_a), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(widget_a, pos=(row, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(wx.StaticText(parent, label=label_b), pos=(row, 2),
+                 flag=wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+        grid.Add(widget_b, pos=(row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        return row + 1
+
+    def _add_message_row(
+        self, parent: wx.Window, grid: wx.GridBagSizer, row: int, colour: Optional[wx.Colour] = None,
+    ) -> tuple[wx.StaticText, int]:
+        """One line of a panel's collapsing message area.
+
+        Created HIDDEN and kept hidden while its text is empty -- which
+        is the overwhelmingly normal state for every one of them. Hidden
+        windows are skipped by wx.GridBagSizer.CalcMin(), and a row that
+        ends up zero-height is then dropped along with its vgap, so an
+        empty message costs this window literally nothing -- instead of
+        the ~18px an always-present (but blank) StaticText reserved
+        forever. Live-reported: with six of these across the two panels,
+        that was 108px of permanently blank window.
+
+        The fixed LABEL_WRAP_PX width is what caps how wide a message may
+        make its panel (wx gives an explicitly-sized window's min size
+        priority over its best size), so long text wraps to more lines
+        rather than stretching the window sideways -- unchanged from
+        before; only the height behaviour is new.
+
+        Use _set_message()/_update_message_row() to fill one in; never
+        SetLabel() it directly, or the row would stay collapsed and the
+        message would never be seen."""
+        text = self._new_message_text(parent, colour)
+        grid.Add(text, pos=(row, 0), span=(1, 4), flag=wx.EXPAND)
+        return text, row + 1
+
+    def _new_message_text(self, parent: wx.Window, colour: Optional[wx.Colour] = None) -> wx.StaticText:
+        """The collapsing message label itself, for the one caller whose
+        sizer isn't a GridBagSizer (the Mock Rig Control panel's own
+        error line, on a plain BoxSizer). _add_message_row() is the usual
+        entry point."""
+        text = wx.StaticText(parent, label="", size=(LABEL_WRAP_PX, -1))
+        if colour is not None:
+            text.SetForegroundColour(colour)
+        text.Show(False)
+        self._message_text[text] = ""
+        return text
+
+    def _update_message_row(self, text_ctrl: wx.StaticText, message: str) -> bool:
+        """Sets one collapsing message row's text and its matching
+        shown/hidden state. Returns whether anything actually changed --
+        the caller owes a _resize_main_window_to_content() if (and only
+        if) it did, so a batch of these costs one relayout rather than
+        one each. _set_message() is the single-message shorthand.
+
+        The no-change fast path matters: _apply_snapshot() runs on every
+        engine tick and rewrites all of these (almost always with the
+        same value, usually ""), and resizing this window on each of
+        those would be a permanent low-grade flicker.
+
+        self._message_text, not text_ctrl.GetLabel(), holds the
+        comparison value because wx.StaticText.Wrap() re-SetLabel()s the
+        control with the line-broken text, so GetLabel() no longer
+        returns what was set -- comparing against it would make every
+        wrapped message look changed on every tick."""
+        message = message or ""
+        if self._message_text.get(text_ctrl, "") == message:
+            return False
+        self._message_text[text_ctrl] = message
+        _set_wrapped(text_ctrl, message)
+        text_ctrl.Show(bool(message))
+        return True
+
+    def _set_message(self, text_ctrl: wx.StaticText, message: str) -> None:
+        """_update_message_row() plus the relayout it owes, for the call
+        sites that set a single message. Passing "" collapses the row
+        again. No-ops entirely when the text is unchanged."""
+        if self._update_message_row(text_ctrl, message):
+            # Same contract _update_mock_rig_panel_visibility() follows
+            # for the Mock Rig Control panel: a visibility change inside
+            # a fixed-size, content-sized window is only visible once the
+            # window itself is re-fitted to the content.
+            self._resize_main_window_to_content()
+
     # ------------------------------------------------------------------ WebSDR panel
     def _on_site_selected(self, _event=None) -> None:
         # A Test result (or a stale error already shown from a previous
         # site) describes whatever was selected when it ran -- leaving it
         # on screen after switching sites is misleading, since it reads as
         # if it still applies to the newly selected one.
-        self.websdr_preflight_text.SetLabel("")
+        self._set_message(self.websdr_preflight_text, "")
         self._update_websdr_controls()
 
     def _on_custom_url_edited(self, _event=None) -> None:
-        self.websdr_preflight_text.SetLabel("")
+        self._set_message(self.websdr_preflight_text, "")
         self._update_websdr_controls()
 
     def _update_websdr_controls(self) -> None:
@@ -525,9 +932,24 @@ class MainFrame(wx.Frame):
     def _on_websdr_disconnect_clicked(self, _event=None) -> None:
         if not self._websdr_active:
             return  # belt-and-suspenders -- button is disabled in this state too
+        self._websdr_connect_pending = False
         self.websdr_disconnect_btn.Enable(False)
         self.websdr_disconnect_btn.SetLabel("Disconnecting...")
         self.engine.stop_websdr_from_other_thread()
+
+    def _on_websdr_window_close_requested(self) -> None:
+        """The WebSDR popup's own X button (see WebViewHost.on_close_requested)
+        -- the frame's close is always vetoed there, so this is the only
+        thing a click on it ever does. Same effect as the Disconnect
+        WebSDR button; a no-op if nothing is active (e.g. a stray click
+        arriving just as a disconnect completes on its own)."""
+        self._on_websdr_disconnect_clicked()
+
+    def _on_reverse_sync_hold_toggled(self, _event=None) -> None:
+        # Not gated on _websdr_active -- deliberately toggleable before
+        # connecting, so it can be pre-armed (see engine.set_reverse_sync_held's
+        # docstring for why setting it before the engine loop exists is safe).
+        self.engine.set_reverse_sync_held(self.reverse_sync_hold_btn.GetValue())
 
     def _websdr_connect_tooltip_text(self) -> Optional[str]:
         # The only reason Connect is ever disabled (as opposed to clickable
@@ -751,11 +1173,11 @@ class MainFrame(wx.Frame):
             return
         site = self._resolve_selected_site()
         if site is None:
-            self.websdr_preflight_text.SetLabel("Select a known site, or Detect a Custom URL first")
+            self._set_message(self.websdr_preflight_text, "Select a known site, or Detect a Custom URL first")
             return
         self.websdr_test_btn.Enable(False)
         self.websdr_test_btn.SetLabel("Testing...")
-        self.websdr_preflight_text.SetLabel("Checking WebSDR reachability...")
+        self._set_message(self.websdr_preflight_text, "Checking WebSDR reachability...")
         self.websdr_test_thread = threading.Thread(
             target=self._run_websdr_test, args=(site.url, self.status_queue), daemon=True
         )
@@ -776,7 +1198,53 @@ class MainFrame(wx.Frame):
     def _apply_websdr_preflight(self, result: WebsdrPreflightResult) -> None:
         self.websdr_test_btn.Enable(True)
         self.websdr_test_btn.SetLabel("Test")
-        self.websdr_preflight_text.SetLabel(("OK: " if result.ok else "FAIL: ") + result.message)
+        self._set_message(self.websdr_preflight_text, ("OK: " if result.ok else "FAIL: ") + result.message)
+
+    def _save_current_webview_geometry(self) -> None:
+        """Remembers the WebSDR browser window's current size AND
+        position against whatever site is (still) active, keyed by
+        driver_type -- the position the user last had it at, e.g. on a
+        second monitor, so a later restore can put it straight back
+        there. A no-op if nothing is active. Call this BEFORE clearing/
+        reassigning self._active_websdr_site -- callers are the three
+        points where that site stops being current: switching to a
+        different site (_on_websdr_connect_clicked), a disconnect
+        completing of any kind including idle-disconnect
+        (_apply_snapshot), and app close (_on_close)."""
+        if self._active_websdr_site is None:
+            return
+        driver_type = self._active_websdr_site.driver_type
+        size = self._webview_host.frame.GetSize()
+        pos = self._webview_host.frame.GetPosition()
+        self.settings.webview_sizes[driver_type] = [size.width, size.height]
+        self.settings.webview_positions[driver_type] = [pos.x, pos.y]
+        self.settings.save()
+
+    def _restore_webview_geometry(self, driver_type: str) -> None:
+        """Applies the remembered window size/position for driver_type,
+        if any. Position falls back to on_screen_pos_for_monitor(self)
+        (the same monitor this control-panel window is on) both when
+        there's no remembered position yet, and when there IS one but it
+        no longer lands on any connected display (e.g. a docking
+        station's monitor got unplugged since it was saved) -- a stale
+        coordinate must not be allowed to place the frame somewhere
+        unreachable. Size falls back to leaving the frame at its current
+        size (webview_host clamps it to whichever monitor the position
+        above just picked) -- webview_host.VISIBLE_SIZE only ever applies
+        at the very first connect of a fresh app launch. Position is
+        applied first: size's clamp depends on knowing which monitor the
+        frame is headed to."""
+        pos = self.settings.webview_positions.get(driver_type)
+        target = wx.Point(pos[0], pos[1]) if pos and len(pos) == 2 else None
+        if target is not None and not has_display_at(target):
+            target = None
+        if target is None:
+            target = on_screen_pos_for_monitor(self)
+        self._webview_host.set_on_screen_position(target)
+
+        size = self.settings.webview_sizes.get(driver_type)
+        if size and len(size) == 2:
+            self._webview_host.set_size(size[0], size[1])
 
     def _on_websdr_connect_clicked(self, _event=None) -> None:
         active = self._active_websdr_site
@@ -784,12 +1252,12 @@ class MainFrame(wx.Frame):
             # Belt-and-suspenders -- the button is disabled in this state
             # (see _update_websdr_controls()), but guard the handler too in
             # case of a race between a click and a state-changing snapshot.
-            self.websdr_err_text.SetLabel("Connect the transceiver first")
+            self._set_message(self.websdr_err_text, "Connect the transceiver first")
             return
 
         site = self._resolve_selected_site()
         if site is None:
-            self.websdr_err_text.SetLabel("Select a known site, or Detect a Custom URL first")
+            self._set_message(self.websdr_err_text, "Select a known site, or Detect a Custom URL first")
             return
 
         if self._websdr_active and active is not None and site.url == active.url and site.driver_type == active.driver_type:
@@ -801,21 +1269,39 @@ class MainFrame(wx.Frame):
 
         # Connect (not active) or Switch (active, different site) -- same
         # call either way; the engine replaces whatever's currently loaded.
+        # If switching away from an active site, remember its window
+        # geometry under its own driver_type before it stops being current.
+        self._websdr_connect_pending = True
+        self._save_current_webview_geometry()
         self.settings.last_site_url = site.url
         self.settings.last_site_driver_type = site.driver_type if self._find_any_site_by_url(site.url) is None else ""
         self.settings.headless = self.headless_check.GetValue()
         self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
         self.settings.save()
+        # Shown again before anything else touches the frame -- a fresh
+        # Connect (as opposed to a switch) starts from the idle-hidden
+        # state set at startup/disconnect (see _apply_snapshot/_on_close).
+        self._webview_host.set_frame_visible(True)
         self._webview_host.set_headless(self.settings.headless)
 
         self._websdr_ever_connected = False
         self._active_websdr_site = site
+        self._restore_webview_geometry(site.driver_type)
+        # Only now -- after the frame has been shown, had its headless
+        # style toggled (which internally re-shows it, resetting z-order)
+        # and been moved/resized -- is it worth settling where it sits:
+        # the WebSDR window directly over this one, and this app in front
+        # of whatever else is on the desktop. Runs synchronously inside
+        # the user's own button click, which is exactly when Windows
+        # allows a foreground change (see bring_pair_to_front()).
+        self._webview_host.bring_to_front_over(self)
         self._websdr_conn_text = "connecting..."
         self.websdr_conn_text.SetLabel("connecting...")
+        self.websdr_driver_text.SetLabel(site.driver_type)
         self.websdr_freq_text.SetLabel("-")
         self.websdr_mode_text.SetLabel("-")
         self.websdr_audio_text.SetLabel("-")
-        self.websdr_err_text.SetLabel("")
+        self._set_message(self.websdr_err_text, "")
         self.websdr_connect_btn.Enable(False)
         self.websdr_connect_btn.SetLabel("Connecting...")
         self.engine.start_websdr_from_other_thread(site)
@@ -880,6 +1366,90 @@ class MainFrame(wx.Frame):
         self.settings.poll_interval_s = self.poll_interval_ctrl.GetValue()
         self.settings.save()
 
+    def _refresh_reverse_sync_range_fields(self) -> None:
+        """Redisplay both range fields from the saved settings, so what's
+        on screen is always exactly what's being enforced. ChangeValue(),
+        not SetValue(), so this never re-fires a text event."""
+        for entry, value in (
+            (self.reverse_sync_min_entry, self.settings.reverse_sync_min_hz),
+            (self.reverse_sync_max_entry, self.settings.reverse_sync_max_hz),
+        ):
+            text = "" if value is None else str(value)
+            if entry.GetValue() != text:
+                entry.ChangeValue(text)
+
+    def _on_reverse_sync_range_commit(self, event=None) -> None:
+        """Commit on Enter/blur, NOT per keystroke. sync/engine.py reads
+        self.settings.reverse_sync_min_hz/max_hz live on every reverse-sync
+        tick, so anything saved here is enforced within one poll interval
+        -- and this range is what bounds the frequencies a public WebSDR
+        page may write to a real transmitter. A per-keystroke save would
+        therefore persist and enforce every mid-edit state (a field
+        momentarily blank while retyping, a half-typed number, a pasted
+        "14,000,000"), most of which read as "unrestricted". That's fine
+        for a cosmetic field and not fine for this one.
+
+        Blank stays a valid, intentional state (None/unrestricted). A
+        genuinely unparseable value saves nothing and reverts the fields
+        to the last saved values, so the screen never shows a bound that
+        isn't actually in force. Otherwise the values go through
+        config.clamp_reverse_sync_bounds() -- the same negative-drop /
+        inverted-swap rules load() applies to a hand-edited config.json,
+        called rather than reimplemented so the two layers can't drift --
+        and the fields are redisplayed from what was actually saved, so a
+        corrected (swapped) range doesn't leave the raw typed text on
+        screen misrepresenting what's enforced."""
+        if event is not None:
+            event.Skip()  # EVT_KILL_FOCUS must keep propagating
+        min_hz, min_valid = _parse_optional_hz(self.reverse_sync_min_entry.GetValue())
+        max_hz, max_valid = _parse_optional_hz(self.reverse_sync_max_entry.GetValue())
+        if not (min_valid and max_valid):
+            logger.warning("Ignoring unparseable reverse-sync range input; reverting to the saved values")
+            self._refresh_reverse_sync_range_fields()
+            return
+        min_hz, max_hz = clamp_reverse_sync_bounds(min_hz, max_hz)
+        # Blur fires on every tab-through, so skip the disk write when
+        # nothing actually changed; the redisplay below still runs, which
+        # is what normalizes e.g. surrounding whitespace.
+        if (min_hz, max_hz) != (self.settings.reverse_sync_min_hz, self.settings.reverse_sync_max_hz):
+            self.settings.reverse_sync_min_hz = min_hz
+            self.settings.reverse_sync_max_hz = max_hz
+            self.settings.save()
+        self._refresh_reverse_sync_range_fields()
+
+    def _refresh_idle_disconnect_field(self) -> None:
+        """Redisplay the field from the saved setting, so what's on screen
+        is always exactly what's in force. ChangeValue(), not SetValue(),
+        so this never re-fires a text event."""
+        value = self.settings.websdr_idle_disconnect_min
+        text = "" if value is None else str(value)
+        if self.idle_disconnect_entry.GetValue() != text:
+            self.idle_disconnect_entry.ChangeValue(text)
+
+    def _on_idle_disconnect_commit(self, event=None) -> None:
+        """Commit on Enter/blur, NOT per keystroke -- mirrors
+        _on_reverse_sync_range_commit exactly. sync/engine.py reads
+        self.settings.websdr_idle_disconnect_min live on every tick, so
+        anything saved here takes effect within one poll interval; a
+        per-keystroke save would briefly enforce every mid-edit state
+        (e.g. a lone "6" while typing "60" would arm a 6-minute
+        disconnect). An unparseable value saves nothing and reverts,
+        rather than silently collapsing to "disabled"."""
+        if event is not None:
+            event.Skip()  # EVT_KILL_FOCUS must keep propagating
+        minutes, valid = _parse_optional_minutes(self.idle_disconnect_entry.GetValue())
+        if not valid:
+            logger.warning("Ignoring unparseable idle-disconnect input; reverting to the saved value")
+            self._refresh_idle_disconnect_field()
+            return
+        minutes = clamp_idle_disconnect_min(minutes)
+        # Blur fires on every tab-through, so skip the disk write when
+        # nothing actually changed.
+        if minutes != self.settings.websdr_idle_disconnect_min:
+            self.settings.websdr_idle_disconnect_min = minutes
+            self.settings.save()
+        self._refresh_idle_disconnect_field()
+
     def _update_mock_rig_panel_visibility(self) -> None:
         # Gate on the *running rig session's* mode, not the live checkbox
         # -- the checkbox is disabled while the rig is connected so they
@@ -889,25 +1459,28 @@ class MainFrame(wx.Frame):
         should_show = self._rig_active and self.settings.use_mock_rig
         if self.mock_box.IsShown() != should_show:
             self.mock_box.Show(should_show)
-            self._root_panel.Layout()
-            self.Fit()
+            # Grows/shrinks this window live to fit whichever of
+            # this-panel-shown/hidden is now current, clamped to the
+            # display and never below the "Open log folder"-visible
+            # floor -- see _resize_main_window_to_content()'s docstring.
+            self._resize_main_window_to_content()
 
     def _on_mock_set_freq(self, _event=None) -> None:
         try:
             freq_hz = int(self.mock_freq_entry.GetValue())
         except ValueError:
-            self.mock_err_text.SetLabel("Frequency must be a whole number of Hz")
+            self._set_message(self.mock_err_text, "Frequency must be a whole number of Hz")
             return
-        self.mock_err_text.SetLabel("")
+        self._set_message(self.mock_err_text, "")
         self.engine.push_mock_freq(freq_hz)
 
     def _on_mock_set_mode(self, _event=None) -> None:
         try:
             passband_hz = int(self.mock_passband_entry.GetValue())
         except ValueError:
-            self.mock_err_text.SetLabel("Passband must be a whole number of Hz")
+            self._set_message(self.mock_err_text, "Passband must be a whole number of Hz")
             return
-        self.mock_err_text.SetLabel("")
+        self._set_message(self.mock_err_text, "")
         self.engine.push_mock_mode(self.mock_mode_combo.GetValue(), passband_hz)
 
     def _on_mock_ptt_toggled(self, _event=None) -> None:
@@ -919,13 +1492,13 @@ class MainFrame(wx.Frame):
         try:
             port = int(self.port_entry.GetValue())
         except ValueError:
-            self.rig_preflight_text.SetLabel("Invalid port")
+            self._set_message(self.rig_preflight_text, "Invalid port")
             return
         host = self.host_entry.GetValue().strip() or "127.0.0.1"
         backend = self.rig_backend_combo.GetValue()
         self.rig_test_btn.Enable(False)
         self.rig_test_btn.SetLabel("Testing...")
-        self.rig_preflight_text.SetLabel(f"Checking {backend} reachability...")
+        self._set_message(self.rig_preflight_text, f"Checking {backend} reachability...")
         self.rig_test_thread = threading.Thread(
             target=self._run_rig_test, args=(backend, host, port, self.status_queue), daemon=True
         )
@@ -947,7 +1520,7 @@ class MainFrame(wx.Frame):
     def _apply_rig_preflight(self, result: RigPreflightResult) -> None:
         self.rig_test_btn.Enable(True)
         self.rig_test_btn.SetLabel("Test")
-        self.rig_preflight_text.SetLabel(("OK: " if result.ok else "FAIL: ") + result.message)
+        self._set_message(self.rig_preflight_text, ("OK: " if result.ok else "FAIL: ") + result.message)
 
     def _on_rig_connect_clicked(self, _event=None) -> None:
         if self._rig_active:
@@ -959,7 +1532,7 @@ class MainFrame(wx.Frame):
         try:
             port = int(self.port_entry.GetValue())
         except ValueError:
-            self.rig_err_text.SetLabel("Invalid port")
+            self._set_message(self.rig_err_text, "Invalid port")
             return
 
         backend = self.rig_backend_combo.GetValue()
@@ -981,7 +1554,7 @@ class MainFrame(wx.Frame):
 
         self._rig_ever_connected = False
         self.rig_conn_text.SetLabel("connecting...")
-        self.rig_err_text.SetLabel("")
+        self._set_message(self.rig_err_text, "")
         self.rig_connect_btn.Enable(False)
         self.rig_connect_btn.SetLabel("Connecting...")
         self.mock_rig_check.Enable(False)
@@ -1004,25 +1577,44 @@ class MainFrame(wx.Frame):
             pass
 
     def _apply_snapshot(self, snap: StatusSnapshot) -> None:
+        # Every message row this method may touch is updated through
+        # _update_message_row() and this one accumulator, so a snapshot
+        # that changes several of them (or, far more often, none of them
+        # -- this runs on every engine tick) costs at most one window
+        # relayout. See _update_message_row()'s docstring.
+        messages_changed = False
         if snap.fatal_error:
             # The whole background thread has died -- both subsystems are
             # gone with it and there's nothing to salvage short of
             # restarting the app. Distinct from (and far rarer than) either
             # subsystem's own start failing, which is reported through its
             # own error field further down instead.
-            _set_wrapped(self.websdr_err_text, f"Sync engine crashed: {snap.fatal_error}")
-            _set_wrapped(self.rig_err_text, f"Sync engine crashed: {snap.fatal_error}")
+            messages_changed |= self._update_message_row(
+                self.websdr_err_text, f"Sync engine crashed: {snap.fatal_error}")
+            messages_changed |= self._update_message_row(
+                self.rig_err_text, f"Sync engine crashed: {snap.fatal_error}")
             self.websdr_conn_text.SetLabel("error")
+            self.websdr_driver_text.SetLabel("-")
             self.rig_conn_text.SetLabel("error")
+            messages_changed |= self._update_message_row(self.reverse_sync_error_text, "")
+            messages_changed |= self._update_message_row(self.reverse_sync_pending_text, "")
+            self.reverse_sync_held_text.SetLabel("")
+            self.websdr_idle_text.SetLabel("")
+            self.reverse_sync_hold_btn.Enable(False)
             self._websdr_active = False
             self._websdr_connected = False
+            self._websdr_connect_pending = False
+            self._save_current_webview_geometry()
             self._active_websdr_site = None
+            self._webview_host.set_frame_visible(False)
             self._update_websdr_controls()
             # Override _update_websdr_controls' normal rig-active-based
             # enabling -- the whole engine thread is dead, so both connect
             # buttons must stay disabled regardless of stale _rig_active.
             self.websdr_connect_btn.Enable(False)
             self.rig_connect_btn.Enable(False)
+            if messages_changed:
+                self._resize_main_window_to_content()
             return
 
         # --- Transceiver ---
@@ -1050,23 +1642,58 @@ class MainFrame(wx.Frame):
             self.mock_rig_check.Enable(True)
             self.rig_backend_combo.Enable(True)
             self.poll_interval_ctrl.Enable(True)
-        _set_wrapped(self.rig_err_text, snap.rig_error or "")
+        messages_changed |= self._update_message_row(self.rig_err_text, snap.rig_error or "")
         self._update_mock_rig_panel_visibility()
 
         # --- WebSDR ---
         self._websdr_active = snap.websdr_active
         if not snap.websdr_active:
-            self._active_websdr_site = None
-            self._websdr_conn_text = "not connected"
-            self._websdr_connected = False
-            self.websdr_conn_text.SetLabel("not connected")
-            self.websdr_freq_text.SetLabel("-")
-            self.websdr_mode_text.SetLabel("-")
-            self.websdr_audio_text.SetLabel("-")
-            _set_wrapped(self.websdr_err_text, snap.websdr.last_error if snap.websdr is not None else "")
+            # A pending Connect/Switch's own _start_websdr() hasn't
+            # flipped the engine's websdr_active True yet (it's gated on a
+            # GUI-thread WebView-creation round-trip), so SyncEngine._tick()
+            # keeps publishing its ordinary "nothing to report" snapshots
+            # (websdr_active=False, websdr=None) throughout that window --
+            # on the wire, indistinguishable from _stop_websdr() having
+            # just genuinely completed (it publishes the same shape). Only
+            # an explicit failure report (snap.websdr is not None -- see
+            # _start_websdr's own error-path publishes) or the absence of
+            # a pending attempt makes this a REAL "nothing is connected"
+            # state; otherwise, skip the teardown below and leave the
+            # connect-in-progress UI/window exactly as the click handler
+            # set it. See self._websdr_connect_pending's own docstring.
+            if not self._websdr_connect_pending or snap.websdr is not None:
+                # Covers every disconnect/failure path that lands here
+                # (manual Disconnect completing, idle-disconnect, a
+                # connect attempt that definitively failed) -- the
+                # fatal_error branch above handles its own case, since it
+                # returns before reaching here. Self-guards against
+                # repeat snapshots since _active_websdr_site is cleared
+                # right below, so this only actually saves/hides once per
+                # transition.
+                self._websdr_connect_pending = False
+                self._save_current_webview_geometry()
+                self._active_websdr_site = None
+                self._webview_host.set_frame_visible(False)
+                # v14: an idle release is a deliberate, healthy state -- it
+                # must read as such, not as "not connected" (which looks
+                # like the user never connected) and certainly not through
+                # the red error label below.
+                self._websdr_conn_text = "disconnected (idle)" if snap.websdr_idle_stopped else "not connected"
+                self._websdr_connected = False
+                self.websdr_conn_text.SetLabel(self._websdr_conn_text)
+                self.websdr_driver_text.SetLabel("-")
+                self.websdr_freq_text.SetLabel("-")
+                self.websdr_mode_text.SetLabel("-")
+                self.websdr_audio_text.SetLabel("-")
+            messages_changed |= self._update_message_row(
+                self.websdr_err_text, snap.websdr.last_error if snap.websdr is not None else "")
         else:
+            self._websdr_connect_pending = False
             ws = snap.websdr
             self._websdr_connected = bool(ws and ws.connected)
+            self.websdr_driver_text.SetLabel(
+                self._active_websdr_site.driver_type if self._active_websdr_site is not None else "-"
+            )
             if ws is not None:
                 if ws.connected:
                     self._websdr_ever_connected = True
@@ -1080,8 +1707,19 @@ class MainFrame(wx.Frame):
                     self.websdr_audio_text.SetLabel("-")
                 else:
                     self.websdr_audio_text.SetLabel("streaming" if ws.audio_active else "silent")
-                _set_wrapped(self.websdr_err_text, ws.last_error or "")
+                messages_changed |= self._update_message_row(self.websdr_err_text, ws.last_error or "")
+        messages_changed |= self._update_message_row(self.reverse_sync_error_text, snap.reverse_sync_error or "")
+        messages_changed |= self._update_message_row(self.reverse_sync_pending_text, snap.reverse_sync_pending or "")
+        self.reverse_sync_hold_btn.Enable(True)
+        self.reverse_sync_hold_btn.SetValue(snap.reverse_sync_held)
+        self.reverse_sync_held_text.SetLabel("Reverse sync held" if snap.reverse_sync_held else "")
+        self.websdr_idle_text.SetLabel(
+            "Idle -- slot released, will reconnect when you use the rig"
+            if snap.websdr_idle_stopped else ""
+        )
         self._update_websdr_controls()
+        if messages_changed:
+            self._resize_main_window_to_content()
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:
         folder = LOG_FILE.parent
@@ -1101,6 +1739,17 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------------------------
     def _on_close(self, _event=None) -> None:
+        # This window's own position -- see _restore_main_window_geometry().
+        # No matching size save: see AppSettings.main_window_position's
+        # own comment for why this window's height is computed live
+        # instead of remembered.
+        pos = self.GetPosition()
+        self.settings.main_window_position = [pos.x, pos.y]
+        self.settings.save()
+        # Closing while connected doesn't go through _apply_snapshot's
+        # active->inactive transition (the engine thread is just killed
+        # below), so this needs its own save.
+        self._save_current_webview_geometry()
         self.engine.stop_from_other_thread()
         self.thread.join(timeout=SHUTDOWN_TIMEOUT_S)
         self._poll_timer.Stop()

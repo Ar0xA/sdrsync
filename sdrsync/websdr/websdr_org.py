@@ -81,6 +81,34 @@ def map_hamlib_mode(hamlib_mode: str, passband_hz: Optional[int]) -> Optional[st
     return base_mode
 
 
+# WebSDR base mode string (post-N-stripping, the exact set get_status()
+# already normalizes to -- see get_status()'s own mode-stripping logic)
+# -> canonical hamlib mode name. Reverse of _MODE_MAP above, but NOT
+# mechanically derived from it: _MODE_MAP is many-to-one (e.g. USB/
+# PKTUSB/DATA-U all forward-map to "USB"), so each collision here is an
+# explicit, deliberate choice of ONE canonical hamlib name to reverse-map
+# back to -- never the data/CW variants, which this driver's forward
+# direction also never sends to this site in the first place.
+_REVERSE_MODE_MAP: dict[str, str] = {
+    "USB": "USB",
+    "LSB": "LSB",
+    "CW": "CW",
+    "AM": "AM",
+    "AMSYNC": "SAM",
+    "FM": "FM",
+}
+
+
+def map_websdr_mode_to_hamlib(websdr_mode: Optional[str]) -> Optional[str]:
+    """Pure reverse mapping: a websdr.org base mode string (as already
+    normalized by get_status(), i.e. any trailing 'N' narrow suffix
+    already stripped) -> a canonical hamlib mode name. None if unknown
+    (caller should skip the reverse push and log, not raise)."""
+    if websdr_mode is None:
+        return None
+    return _REVERSE_MODE_MAP.get(websdr_mode.upper())
+
+
 class WebsdrOrgDriver:
     """WebSDRDriver implementation for the websdr.org (PA3FWM) WebSDR software family.
 
@@ -120,6 +148,14 @@ class WebsdrOrgDriver:
         # every poll tick the engine retries set_mode() (rate-limiting,
         # same pattern as openwebrx.py's _last_out_of_range_key).
         self._last_unmapped_mode: Optional[str] = None
+        # Same rate-limiting pattern, for the "outside all bands this
+        # WebSDR covers" rejection: the engine retries a rejected forward
+        # push on its own schedule, so a rig parked on a frequency this
+        # receiver simply doesn't cover would otherwise emit an identical
+        # WARNING line indefinitely. Keyed on the effective frequency
+        # alone, since the band table it's tested against only changes on
+        # attach() -- which resets this too.
+        self._last_out_of_range_hz: Optional[int] = None
 
     @property
     def attached(self) -> bool:
@@ -180,6 +216,7 @@ class WebsdrOrgDriver:
         self._last_tune_error = None
         self._last_mode_error = None
         self._last_unmapped_mode = None
+        self._last_out_of_range_hz = None
 
     async def _load_band_table(self) -> None:
         try:
@@ -226,12 +263,17 @@ class WebsdrOrgDriver:
                 return idx
         return None
 
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         """Returns True only if the frequency was actually pushed to the
         page. The caller (SyncEngine) must only update its "last sent"
         bookkeeping when this is True -- otherwise a no-op (not attached, or
         a failed page.evaluate) would get recorded as delivered, and the
-        engine would never retry it once the WebSDR recovers."""
+        engine would never retry it once the WebSDR recovers.
+
+        verify=False skips arming _schedule_freq_verification() -- see
+        WebSDRDriver.tune_hz's docstring for why (periodic full-resync of
+        an unchanged frequency must not arm a corrective re-tune that can
+        fight a concurrent reverse-sync push)."""
         if not self._attached:
             return False
         effective_hz = freq_hz
@@ -241,7 +283,14 @@ class WebsdrOrgDriver:
         band_idx = self._band_for_freq(effective_hz)
         if band_idx is None:
             self._last_tune_error = f"{effective_hz/1000:.3f} kHz is outside all bands this WebSDR covers"
-            logger.warning(self._last_tune_error)
+            # Rate-limited exactly like _last_unmapped_mode below and
+            # openwebrx.py's _last_out_of_range_key: WARNING the first
+            # time a given frequency is rejected, DEBUG on exact repeats.
+            if effective_hz != self._last_out_of_range_hz:
+                logger.warning(self._last_tune_error)
+            else:
+                logger.debug("Frequency still outside all bands (unchanged): %s", effective_hz)
+            self._last_out_of_range_hz = effective_hz
             return False
 
         try:
@@ -255,7 +304,8 @@ class WebsdrOrgDriver:
             logger.warning(self._last_tune_error)
             return False
 
-        self._schedule_freq_verification(effective_hz)
+        if verify:
+            self._schedule_freq_verification(effective_hz)
         return True
 
     def _schedule_freq_verification(self, expected_hz: int) -> None:
@@ -350,6 +400,29 @@ class WebsdrOrgDriver:
             )
         except PlaywrightError as e:
             logger.debug("mute() call failed (non-fatal): %s", e)
+
+    def _reverse_effective_hz(
+        self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]
+    ) -> Optional[int]:
+        """Un-applies cw_offset_hz for the reverse direction (WebSDR ->
+        rig), symmetric to tune_hz()'s forward application above. Takes
+        the mode as an explicit argument, sourced from the SAME status
+        snapshot map_websdr_mode_to_hamlib() derived it from -- NOT
+        self._current_mode, which only reflects this driver's own last
+        PUSHED mode and is stale by construction for reverse sync (a page
+        change the driver didn't itself push is exactly what reverse sync
+        exists to observe)."""
+        if observed_hz is None:
+            return None
+        if observed_hamlib_mode == "CW":
+            return observed_hz - self.cw_offset_hz
+        return observed_hz
+
+    def hamlib_mode_from_status(self, status: WebSDRStatus) -> Optional[str]:
+        return map_websdr_mode_to_hamlib(status.mode)
+
+    def rig_freq_from_status(self, status: WebSDRStatus) -> Optional[int]:
+        return self._reverse_effective_hz(status.freq_hz, self.hamlib_mode_from_status(status))
 
     # ------------------------------------------------------------------
     def _combined_error(self) -> Optional[str]:
