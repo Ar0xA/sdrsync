@@ -53,6 +53,10 @@ from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui import theme
 from sdrsync.gui.fonts import load_fonts
 from sdrsync.gui.section_bar import SectionBar
+from sdrsync.gui.settings_host import SettingsHost
+from sdrsync.gui.settings_panels.behaviour_panel import BehaviourPanel
+from sdrsync.gui.settings_panels.sites_panel import SitesPanel
+from sdrsync.gui.settings_panels.transceiver_panel import TransceiverPanel
 from sdrsync.gui.state import AppState
 from sdrsync.gui.strip_panel import StripPanel
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
@@ -306,7 +310,11 @@ class MainFrame(wx.Frame):
         # by the temporary click handlers below until phase 8 replaces
         # this with build_app_state() driven by real StatusSnapshots. See
         # sdrsync/gui/state.py.
-        self._state = AppState(mute_on_tx=self.settings.mute_on_tx, mock_rig=self.settings.use_mock_rig)
+        self._state = AppState(
+            mute_on_tx=self.settings.mute_on_tx,
+            mock_rig=self.settings.use_mock_rig,
+            sync_tx_vfo=self.settings.sync_tx_vfo,
+        )
 
         self._build_widgets()
         self._restore_main_window_geometry()
@@ -442,14 +450,9 @@ class MainFrame(wx.Frame):
         root.Add(self.section_bar, 0, wx.EXPAND)
         self._wire_section_bar()
 
-        # SettingsHost starts hidden (spec §5: "folds away once the rig
-        # is connected... never occupies vertical space unless the user
-        # opens it") -- shown here at a placeholder height only so its
-        # presence/absence is visible while wiring up the skeleton;
-        # real SettingsHost (phase 5) starts genuinely hidden.
-        self.settings_host = _PlaceholderBand(self, "SettingsHost (hidden by default)", height=140, fill=theme.BG)
+        self.settings_host = SettingsHost(self)
         root.Add(self.settings_host, 0, wx.EXPAND)
-        self.settings_host.Hide()
+        self._build_settings_panels()
 
         self.receiver_host = _PlaceholderBand(self, "ReceiverHost", fill=theme.BG, hairline_edge="top")
         root.Add(self.receiver_host, 1, wx.EXPAND)
@@ -516,12 +519,22 @@ class MainFrame(wx.Frame):
 
     def _on_section_panel_toggled(self, key: str) -> None:
         self._state.open_panel = None if self._state.open_panel == key else key
-        # GUI REWRITE IN PROGRESS: settings_host is still a placeholder
-        # (phase 5 gives it real per-panel content) -- toggle its
-        # visibility now so the fold/unfold mechanic and SectionBar's
-        # hint text are both verifiable ahead of that.
-        self.settings_host.Show(self._state.open_panel is not None)
-        self.Layout()
+        self.settings_host.show_panel(self._state.open_panel)
+        self._refresh_chrome()
+
+    def _build_settings_panels(self) -> None:
+        self.transceiver_panel = TransceiverPanel(self.settings_host, self.settings)
+        self.settings_host.add_panel("transceiver", self.transceiver_panel)
+
+        self.sites_panel = SitesPanel(self.settings_host, self.settings)
+        self.settings_host.add_panel("sites", self.sites_panel)
+
+        self.behaviour_panel = BehaviourPanel(self.settings_host, self.settings)
+        self.behaviour_panel.on_sync_tx_vfo_changed = self._on_sync_tx_vfo_changed
+        self.settings_host.add_panel("behaviour", self.behaviour_panel)
+
+    def _on_sync_tx_vfo_changed(self, value: bool) -> None:
+        self._state.sync_tx_vfo = value
         self._refresh_chrome()
 
     def _build_websdr_panel(self, parent: wx.Window, outer: wx.BoxSizer) -> None:

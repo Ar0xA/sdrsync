@@ -122,6 +122,20 @@ class AppSettings:
     curated_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
     mute_on_tx: bool = True
+    # GUI rewrite (spec §5.3): purely a display-gate today -- the strip's
+    # TX VFO readout mirrors RX VFO regardless (no real split/second-VFO
+    # rig polling exists), but when this is off the TX VFO label dims and
+    # relabels to "TX VFO (not synced)". Kept as a real, persisted
+    # setting even though it has no functional effect yet, since it's a
+    # user-visible display preference in its own right.
+    sync_tx_vfo: bool = True
+    # GUI rewrite (spec §5.3): both inert until the compact-bar/undock
+    # feature itself is built (out of scope for the pixel-perfect
+    # rewrite) -- persisted now so the Behaviour panel's field list
+    # matches the spec exactly and the values are ready for undock to
+    # read once it exists.
+    hide_receiver_when_undocked: bool = False
+    keep_compact_bar_on_top: bool = True
     # Despite the name, this does NOT use Chromium's real --headless mode --
     # that has no audio output at all (confirmed: neither the lightweight
     # headless-shell binary nor the full binary's own headless mode play
@@ -262,6 +276,9 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "last_site_driver_type": str,
     "cw_offset_hz": int,
     "mute_on_tx": bool,
+    "sync_tx_vfo": bool,
+    "hide_receiver_when_undocked": bool,
+    "keep_compact_bar_on_top": bool,
     "headless": bool,
     "use_mock_rig": bool,
     "poll_interval_s": (int, float),
