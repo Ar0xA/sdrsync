@@ -140,16 +140,18 @@ control functions. This means:
   match any known driver, or matches more than one (ambiguous), Detect
   reports that rather than guessing.
 - **The rig connection and the WebSDR connection are two fully independent
-  subsystems, each with its own Connect/Disconnect in its own panel** —
-  not one combined session. Picking a different WebSDR has nothing to do
-  with your transceiver, so it never touches the rigctld connection (or
-  vice versa): connect to your rig once and leave it running, then freely
-  switch which WebSDR you're listening through — clicking Connect in the
-  WebSDR panel while another site is already loaded just replaces it
-  (relabeled **Switch WebSDR** when that's what it'll do). If rigctld
-  drops, it reconnects with backoff while the WebSDR keeps running
-  unaffected, and vice versa if the WebSDR page fails to load or becomes
-  incompatible — each panel shows its own status and last error
+  subsystems, each with its own Connect in its own panel** — not one
+  combined session. Picking a different WebSDR has nothing to do with
+  your transceiver, so it never touches the rigctld connection (or vice
+  versa): connect to your rig once and leave it running, then freely
+  switch which WebSDR you're listening through — while connected, the
+  same button relabels to **Load** the moment you pick a different site
+  in the dropdown, and swaps the browser content in place (no window
+  flicker, your transceiver connection completely untouched); it reads
+  **Disconnect** again once the dropdown matches whatever's active. If
+  rigctld drops, it reconnects with backoff while the WebSDR keeps
+  running unaffected, and vice versa if the WebSDR page fails to load or
+  becomes incompatible — each panel shows its own status and last error
   independently.
 - Frequency **and** mode both sync, independently of each other. If your
   rig reports a mode this particular WebSDR driver has no equivalent for,
@@ -192,13 +194,15 @@ pip install -e .
    probe, depending on the selected backend; an HTTP GET for the WebSDR
    URL) without actually connecting/launching a browser.
 4. In the WebSDR panel, pick a site from the dropdown (or **Custom URL...**
-   + **Detect**) and click **Connect**. To switch to a different WebSDR
-   later, just pick a new site and click the same button again — it's now
-   labeled **Switch WebSDR** and swaps only the browser tab/driver, leaving
-   your transceiver connection completely untouched. **Disconnect** only
-   appears when the *currently selected* site is the one that's active, and
-   only ends the WebSDR side — use the Transceiver panel's own Disconnect
-   to end the rig connection.
+   + **Detect**) and click **Connect** (only enabled once the transceiver
+   is actually connected, not just mid-handshake). To switch to a
+   different WebSDR later, pick a new site in the dropdown — the button
+   relabels to **Load** and swaps the browser content in place without
+   disconnecting, closing, or reopening the window. Picking the
+   currently-active site back in the dropdown relabels the button to
+   **Disconnect**, which ends the WebSDR side only — use the Transceiver
+   panel's own button to end the rig connection. The dropdown restores
+   whichever site you last connected to on the next launch.
 
 ### Hidden window mode
 
@@ -218,19 +222,22 @@ window you left large on a second monitor comes back there, independent
 of wherever you last left an OpenWebRX window. The very first time a
 given type has nothing remembered yet, it opens on whichever monitor
 sdrsync's own main window is currently on. The main sdrsync window
-itself also remembers its own size and position across restarts, the
-same way. In both cases, if the remembered position was on a monitor
-that's no longer connected (a laptop undocked, a display unplugged
-since), it falls back to whatever monitor is available instead of
-landing somewhere unreachable.
+itself remembers its own *position* the same way (not size — its height
+is computed automatically from what's actually showing, e.g. whether
+the Mock Rig Control panel is visible, so it isn't user-resizable). In
+both cases, if the remembered position was on a monitor that's no
+longer connected (a laptop undocked, a display unplugged since), it
+falls back to whatever monitor is available instead of landing
+somewhere unreachable.
 
 When there's no active WebSDR connection at all — at startup, or after a
 disconnect — the WebSDR browser window is hidden outright (not just
 moved off-screen) rather than sitting empty on screen or in the
 taskbar. It reappears, positioned above the main window, the moment you
 connect. Clicking the WebSDR window's own close (X) button disconnects
-that session, the same as the **Disconnect WebSDR** button — it doesn't
-just refuse to close.
+that session, the same as the **Disconnect** button — it doesn't just
+refuse to close. Loading a different site into an already-open window
+(see above) never touches this hide/show behavior at all.
 
 ### Idle disconnect
 

@@ -241,7 +241,7 @@ class WebViewHost(Protocol):
         self, loop: "asyncio.AbstractEventLoop", on_dead: Optional[Callable[[str], None]] = None
     ) -> Page: ...
 
-    async def destroy_page(self, page: Page) -> None: ...
+    async def destroy_page(self, page: Page, loop: "asyncio.AbstractEventLoop") -> None: ...
 
 
 class RigClient(Protocol):
@@ -594,12 +594,24 @@ class SyncEngine:
         self._run_coro_threadsafe(self._stop_rig())
 
     def start_websdr_from_other_thread(self, site: WebSDRSite) -> None:
-        """Also used to *switch* sites: if a WebSDR session is already
-        active, _start_websdr() replaces it -- there is no separate "switch"
-        code path, loading a site always means "this is what's active now"."""
+        """The initial Connect (or a recovery from a dead WebView) -- if a
+        session is already active, _start_websdr() tears the whole page
+        down and rebuilds it. switch_websdr_from_other_thread() below is
+        the entry point for changing sites while already connected; it
+        does NOT go through this."""
         if self._loop is None:
             return
         self._run_coro_threadsafe(self._start_websdr(site))
+
+    def switch_websdr_from_other_thread(self, site: WebSDRSite) -> None:
+        """Loads a different site on the SAME already-open WebView instead
+        of tearing it down and rebuilding it -- see _switch_websdr()'s own
+        docstring for why. The GUI only calls this while already
+        connected; _switch_websdr() falls back to a full _start_websdr()
+        on its own if that's somehow not the case."""
+        if self._loop is None:
+            return
+        self._run_coro_threadsafe(self._switch_websdr(site))
 
     def stop_websdr_from_other_thread(self) -> None:
         """A manual Disconnect. _stop_websdr()'s default
@@ -875,6 +887,85 @@ class SyncEngine:
         # must carry across it (see _start_websdr's docstring).
         asyncio.ensure_future(self._start_websdr(self.site, user_initiated=False))
 
+    async def _switch_websdr(self, site: WebSDRSite) -> None:
+        """Loads a different site on the SAME already-open WebView/host
+        frame, instead of destroying and recreating it the way
+        _start_websdr()/_stop_websdr() do. Falls back to a full
+        _start_websdr() if there's nothing open to switch on (the GUI
+        shouldn't call this in that state, but this is the safe thing to
+        do if it ever does).
+
+        Why this exists: Switch used to just call start_websdr_from_other_
+        thread() again, which (via _start_websdr()'s own "if active,
+        _stop_websdr() first" guard) always tore the whole page and its
+        host frame down and rebuilt them. On Windows that meant the WebSDR
+        window disappeared and had to be reshown/re-raised every single
+        switch -- which turned out to be the root of a string of Win32
+        z-order/visibility races (the window coming up behind an
+        already-maximized app, or staying invisible with its audio still
+        playing) chased across several fixes in one live-testing session
+        before landing on "don't tear the window down at all" as the
+        actual fix, not a faster teardown.
+
+        Reusing self._page here works because WxPageAdapter's own
+        goto()/attach() machinery already treats "navigate the same
+        adapter to a new URL" as a first-class, already-tested case (every
+        driver's own reattach-retry loop does exactly this against the
+        same page) -- nothing about the page adapter is single-navigation-
+        only. The new driver's attach() does the actual page.goto() once
+        its handshake against whatever's currently loaded (the OLD site)
+        fails, which it always will."""
+        driver_cls = DRIVERS.get(site.driver_type)
+        if driver_cls is None:
+            logger.error("No WebSDR driver registered for type %r", site.driver_type)
+            self._publish(websdr=WebSDRStatus(
+                connected=False, last_error=f"No WebSDR driver registered for type {site.driver_type!r}"
+            ))
+            return
+
+        if self._page is None or not self._websdr_active:
+            await self._start_websdr(site)
+            return
+
+        self._websdr_generation += 1  # invalidates any in-flight on_dead notification
+        if self._attach_task is not None:
+            self._attach_task.cancel()
+            try:
+                await self._attach_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Attach supervisor raised while switching WebSDR sites")
+            self._attach_task = None
+        if self._driver is not None:
+            try:
+                await self._driver.close()
+            except Exception:
+                logger.exception("Error closing WebSDR driver during switch")
+
+        # A user-picked switch is a fresh human decision, same reasoning as
+        # _start_websdr(user_initiated=True)'s identical reset.
+        self._attach_failures = 0
+        self._attach_attached_at = None
+        self._attach_first_failure_at = None
+        self._attach_status_message = None
+        self._websdr_idle_stopped = False
+        self._idle_stopped_site = None
+        self._last_rig_activity_at = time.monotonic()
+
+        self.site = site
+        self._driver = driver_cls(site.url, cw_offset_hz=self.settings.cw_offset_hz)
+        self._reset_sync_latches()
+        my_generation = self._websdr_generation
+        # Re-bound against the SAME page for the new generation -- see
+        # WxPageAdapter.set_on_dead()'s docstring for why this can't be
+        # skipped just because create_page() (which normally wires this
+        # up) isn't being called here.
+        self._page.set_on_dead(lambda reason: self._on_page_dead(my_generation, reason))
+        self._attach_task = asyncio.ensure_future(self._attach_supervisor(self._page))
+        logger.info("WebSDR session switched to: %s (%s)", site.name, site.url)
+        self._publish()
+
     async def _stop_websdr(self, idle_disconnect: bool = False) -> None:
         """idle_disconnect=True is the ONLY path that arms auto-resume.
         Every other stop -- a user Disconnect, the rig-stop cascade, a
@@ -898,7 +989,7 @@ class SyncEngine:
             self._driver = None
         if self._page is not None:
             try:
-                await self._webview_host.destroy_page(self._page)
+                await self._webview_host.destroy_page(self._page, self._loop)
             except Exception as e:
                 logger.warning("Non-fatal error destroying WebView: %s", e)
             self._page = None
@@ -1928,6 +2019,21 @@ class SyncEngine:
             ):
                 await self._reverse_sync_tick(websdr_status, state)
 
+        if not self._websdr_active:
+            # websdr_status may describe a session that a concurrent
+            # stop_websdr_from_other_thread()/_stop_rig() cascade tore down
+            # while this tick was mid-flight (this method has several
+            # awaits above, any of which can yield to that coroutine on
+            # the same loop) -- same reasoning as the two websdr_status =
+            # None guards earlier in this method, just reached from the
+            # "rig fully connected" path instead of the "not yet
+            # connected" ones. Without this, _publish() below reads
+            # websdr_active=False fresh from self but would still attach
+            # this stale non-None status, which looks exactly like a
+            # genuine attach failure to _apply_snapshot()'s
+            # _websdr_connect_pending guard and tears the GUI's
+            # just-started reconnect back down.
+            websdr_status = None
         self._publish(
             rig_connected=True,
             rig_freq_hz=state.freq_hz,

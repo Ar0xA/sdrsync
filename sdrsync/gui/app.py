@@ -33,6 +33,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 import wx
@@ -51,7 +52,7 @@ from sdrsync.config import (
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
 from sdrsync.gui.webview_host import (
-    WebViewHost, clamp_size_to_display, has_display_at, on_screen_pos_for_monitor,
+    WebViewHost, bring_pair_to_front, clamp_size_to_display, has_display_at, on_screen_pos_for_monitor,
 )
 from sdrsync.logging_setup import LOG_FILE
 from sdrsync.resources import ICON_PATH
@@ -212,10 +213,17 @@ class MainFrame(wx.Frame):
         # "connecting.../reconnecting..." status wording (see
         # _update_websdr_controls / _apply_snapshot).
         self._rig_active = False
+        # Separate from _rig_active, which goes True the moment a rig
+        # session is STARTED (client object created, connect deadline
+        # armed) -- not once it's actually reachable. WebSDR Connect must
+        # gate on this, the real "up and answering" state, or clicking
+        # Connect while rigctld is still mid-handshake races a rig-connect
+        # timeout that tears the whole engine down mid-WebView-creation.
+        self._rig_connected = False
         self._rig_ever_connected = False
         self._websdr_active = False
         self._websdr_ever_connected = False
-        # True from the moment Connect/Switch is clicked until the engine
+        # True from the moment Connect is clicked until the engine
         # either reports websdr_active=True (success) or an explicit
         # failure (snap.websdr is not None -- see _start_websdr's own
         # error-path publishes). SyncEngine._tick() keeps publishing
@@ -231,8 +239,7 @@ class MainFrame(wx.Frame):
         # connect-in-progress UI/window on a merely-stale snapshot.
         self._websdr_connect_pending = False
         # What the WebSDR panel last told the engine to load -- None means
-        # "not active". Used to tell "Disconnect" (same site reselected)
-        # apart from "Switch WebSDR" (different site selected while active).
+        # "not active".
         self._active_websdr_site: Optional[WebSDRSite] = None
         # Mirrors the panel's current status text -- used the same way the
         # Tkinter version read the conn_var StringVar back for gating logic.
@@ -428,22 +435,33 @@ class MainFrame(wx.Frame):
         row = 0
 
         grid.Add(wx.StaticText(parent, label="WebSDR site:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        selected_site = self._find_any_site_by_url(self.settings.last_site_url) or KNOWN_SITES[0]
-        self.site_combo = wx.ComboBox(parent, value=selected_site.name, choices=[], style=wx.CB_READONLY)
+        selected_site = self._find_selectable_site_by_url(self.settings.last_site_url) or KNOWN_SITES[0]
+        # No value= here: a CB_READONLY combo silently discards it while
+        # choices=[] (there's nothing yet for it to match), so GetValue()
+        # reads back "" until _refresh_site_dropdown_values() below
+        # actually populates the list -- confirmed live: that "" then
+        # failed _refresh_site_dropdown_values()'s "restore current
+        # selection" check and silently fell back to KNOWN_SITES[0]
+        # (Twente) on every single restart, regardless of the real
+        # last-used site. Set explicitly after populating instead.
+        self.site_combo = wx.ComboBox(parent, choices=[], style=wx.CB_READONLY)
         self.site_combo.Bind(wx.EVT_COMBOBOX, self._on_site_selected)
         grid.Add(self.site_combo, pos=(row, 1), span=(1, 2), flag=wx.EXPAND)
 
         self.websdr_connect_btn = wx.Button(parent, label="Connect")
         self.websdr_connect_btn.Bind(wx.EVT_BUTTON, self._on_websdr_connect_clicked)
         _Tooltip(self.websdr_connect_btn, self._websdr_connect_tooltip_text)
-        # Reserve room for the widest label this button is ever relabeled to
-        # at runtime ("Switch WebSDR", see _update_websdr_controls) -- the
-        # GridBagSizer column's width is computed once, at Fit() time in
-        # _build_widgets, from whatever label is showing then ("Connect");
-        # relabeling later doesn't retrigger that sizing, so the wider text
-        # was getting clipped. A few px of margin on top of the exact text
-        # width so it doesn't look pixel-tight either.
-        widest_label = "Switch WebSDR"
+        # One toggle button for the whole Connect/Disconnect lifecycle, same
+        # pattern as the Transceiver panel's rig_connect_btn -- relabeled
+        # in place rather than a separate always-there Disconnect button.
+        # Reserve room for the widest label it's ever relabeled to at
+        # runtime ("Disconnecting...", see _on_websdr_connect_clicked) --
+        # the GridBagSizer column's width is computed once, at Fit() time
+        # in _build_widgets, from whatever label is showing then
+        # ("Connect"); relabeling later doesn't retrigger that sizing, so
+        # the wider text was getting clipped. A few px of margin on top of
+        # the exact text width so it doesn't look pixel-tight either.
+        widest_label = "Disconnecting..."
         self.websdr_connect_btn.SetLabel(widest_label)
         min_size = self.websdr_connect_btn.GetBestSize()
         self.websdr_connect_btn.SetMinSize(wx.Size(min_size.width + 12, min_size.height))
@@ -455,18 +473,12 @@ class MainFrame(wx.Frame):
         _Tooltip(self.delete_site_btn, self._delete_site_tooltip_text)
         grid.Add(self.delete_site_btn, pos=(row, 4), flag=wx.EXPAND)
         self._refresh_site_dropdown_values()
+        self.site_combo.SetValue(selected_site.name)
         row += 1
 
         manage_sites_btn = wx.Button(parent, label="Manage sites...")
         manage_sites_btn.Bind(wx.EVT_BUTTON, self._on_manage_sites_clicked)
         grid.Add(manage_sites_btn, pos=(row, 0), flag=wx.ALIGN_LEFT)
-
-        self.websdr_disconnect_btn = wx.Button(parent, label="Disconnect WebSDR")
-        self.websdr_disconnect_btn.Bind(wx.EVT_BUTTON, self._on_websdr_disconnect_clicked)
-        _Tooltip(self.websdr_disconnect_btn, self._websdr_disconnect_tooltip_text)
-        # Same column as websdr_connect_btn (row above) so the two sit
-        # directly under each other rather than at unrelated columns.
-        grid.Add(self.websdr_disconnect_btn, pos=(row, 3), flag=wx.EXPAND)
 
         self.reverse_sync_hold_btn = wx.CheckBox(parent, label="Hold (WebSDR read-only)")
         self.reverse_sync_hold_btn.Bind(wx.EVT_CHECKBOX, self._on_reverse_sync_hold_toggled)
@@ -479,9 +491,7 @@ class MainFrame(wx.Frame):
         grid.Add(self.reverse_sync_hold_btn, pos=(row, 2), flag=wx.ALIGN_LEFT)
         self.reverse_sync_held_text = wx.StaticText(parent, label="")
         self.reverse_sync_held_text.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
-        # Column 4, not 3 -- column 3 in this row is now websdr_disconnect_btn
-        # (moved here so it sits directly under websdr_connect_btn).
-        grid.Add(self.reverse_sync_held_text, pos=(row, 4), flag=wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.reverse_sync_held_text, pos=(row, 3), span=(1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         row += 1
 
         grid.Add(wx.StaticText(parent, label="Custom URL:"), pos=(row, 0), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -897,53 +907,63 @@ class MainFrame(wx.Frame):
             # first frequency it reports has no rig context yet (and any
             # out-of-range rejection reads as a mystery instead of an
             # explainable "the rig wants a frequency this profile doesn't
-            # cover") -- require the rig connected first.
+            # cover") -- require the rig connected first. Gated on
+            # _rig_connected (actually up and answering), not _rig_active
+            # (a session merely started) -- clicking Connect while rigctld
+            # is still mid-handshake let a rig-connect timeout tear the
+            # WebSDR window down while it was still opening.
             self.websdr_connect_btn.SetLabel("Connect")
-            self.websdr_connect_btn.Enable(self._rig_active)
-            self.websdr_disconnect_btn.SetLabel("Disconnect WebSDR")
-            self.websdr_disconnect_btn.Enable(False)
+            self.websdr_connect_btn.Enable(self._rig_connected)
             self.headless_check.Enable(True)
             self.cw_offset_ctrl.Enable(True)
             return
 
         self.headless_check.Enable(False)
         self.cw_offset_ctrl.Enable(False)
-        self.websdr_disconnect_btn.SetLabel("Disconnect WebSDR")
-        self.websdr_disconnect_btn.Enable(True)
-        selected = self._resolve_selected_site()
+        # One button, two meanings while connected -- "Disconnect" when
+        # the dropdown still points at what's active, "Load" when a
+        # different site is selected (loads it on the SAME already-open
+        # WebSDR window; see SyncEngine._switch_websdr()). No separate
+        # always-there Disconnect button any more, and no in-place
+        # destroy-and-recreate "Switch" either -- an earlier version of
+        # that hand-off (going through a real disconnect+reconnect) was
+        # traced to four distinct, hard-to-fully-close Win32 races in one
+        # live-testing session (z-order corruption against a maximized
+        # app, the window going invisible-with-audio-still-playing, a
+        # stale engine-tick snapshot defeating the reconnect, and a
+        # rig-disconnect racing the reconnect's own rig-connected gate).
+        # Reusing the page instead of tearing the window down avoids all
+        # of that, since the window itself never hides or needs its
+        # z-order re-established.
         active = self._active_websdr_site
         same_as_active = (
             selected is not None and active is not None
             and selected.url == active.url and selected.driver_type == active.driver_type
         )
-        # Disconnecting is exclusively websdr_disconnect_btn's job now (see
-        # its own always-available handler below) -- this button only ever
-        # means "connect to whatever's selected," so it's disabled rather
-        # than relabeled to "Disconnect" when the selection already matches
-        # what's active, since there'd be nothing to switch to.
-        self.websdr_connect_btn.SetLabel("Switch WebSDR")
-        self.websdr_connect_btn.Enable(not same_as_active)
+        if same_as_active:
+            self.websdr_connect_btn.SetLabel("Disconnect")
+        else:
+            self.websdr_connect_btn.SetLabel("Load")
+        self.websdr_connect_btn.Enable(True)
 
-    def _websdr_disconnect_tooltip_text(self) -> Optional[str]:
-        if not self.websdr_disconnect_btn.IsEnabled():
-            return "No active WebSDR session to disconnect"
-        return None
-
-    def _on_websdr_disconnect_clicked(self, _event=None) -> None:
+    def _disconnect_websdr(self) -> None:
+        """The actual Disconnect, shared by the Connect/Disconnect toggle
+        button (_on_websdr_connect_clicked, when already active) and the
+        WebSDR popup's own X button (_on_websdr_window_close_requested)."""
         if not self._websdr_active:
-            return  # belt-and-suspenders -- button is disabled in this state too
+            return  # belt-and-suspenders -- callers already guard this too
         self._websdr_connect_pending = False
-        self.websdr_disconnect_btn.Enable(False)
-        self.websdr_disconnect_btn.SetLabel("Disconnecting...")
+        self.websdr_connect_btn.Enable(False)
+        self.websdr_connect_btn.SetLabel("Disconnecting...")
         self.engine.stop_websdr_from_other_thread()
 
     def _on_websdr_window_close_requested(self) -> None:
         """The WebSDR popup's own X button (see WebViewHost.on_close_requested)
         -- the frame's close is always vetoed there, so this is the only
-        thing a click on it ever does. Same effect as the Disconnect
-        WebSDR button; a no-op if nothing is active (e.g. a stray click
-        arriving just as a disconnect completes on its own)."""
-        self._on_websdr_disconnect_clicked()
+        thing a click on it ever does. Same effect as the Connect/Disconnect
+        toggle button while active; a no-op if nothing is active (e.g. a
+        stray click arriving just as a disconnect completes on its own)."""
+        self._disconnect_websdr()
 
     def _on_reverse_sync_hold_toggled(self, _event=None) -> None:
         # Not gated on _websdr_active -- deliberately toggleable before
@@ -956,7 +976,7 @@ class MainFrame(wx.Frame):
         # but rejected with an error, e.g. an undetected Custom URL) is the
         # rig-first gate -- explain that on hover rather than leaving a
         # greyed-out button with no clue why.
-        if not self.websdr_connect_btn.IsEnabled() and not self._rig_active:
+        if not self.websdr_connect_btn.IsEnabled() and not self._rig_connected:
             return "Connect the transceiver first"
         return None
 
@@ -993,6 +1013,21 @@ class MainFrame(wx.Frame):
         # dropdown/name-lookup genuinely needs to see curated/imported
         # sites too (_refresh_site_dropdown_values, _resolve_selected_site).
         return KNOWN_SITES + self._user_sites + self._curated_sites + self._imported_sites
+
+    def _find_selectable_site_by_url(self, url: str) -> Optional[WebSDRSite]:
+        """Same idea as _find_any_site_by_url() but over the FULL
+        _all_selectable_sites() scope -- for "does the dropdown already
+        have an entry for this URL, so it can just be selected by name"
+        questions (the last-used-site restore below, and the matching
+        save-time decision of whether last_site_driver_type needs to
+        remember a synthetic Custom-URL reconstruction at all). Connecting
+        to a curated/imported site (most of the built-in list) previously
+        fell outside _find_any_site_by_url's narrower KNOWN_SITES+
+        user_sites scope, so it got needlessly remembered and restored as
+        a Custom URL instead of just reselecting the dropdown entry that
+        was right there the whole time -- live-reported after a session
+        spent on OH6LSL (a curated-list site)."""
+        return next((s for s in self._all_selectable_sites() if s.url == url), None)
 
     def _refresh_site_dropdown_values(self) -> None:
         names = [s.name for s in self._all_selectable_sites()] + [CUSTOM_URL_SENTINEL]
@@ -1106,7 +1141,7 @@ class MainFrame(wx.Frame):
         logger.info("Background curated-site auto-fetch populated %d site(s)", len(result.sites))
 
     def _restore_custom_site_if_needed(self) -> None:
-        if self._find_any_site_by_url(self.settings.last_site_url) is not None:
+        if self._find_selectable_site_by_url(self.settings.last_site_url) is not None:
             return
         if not self.settings.last_site_driver_type or not self.settings.last_site_url:
             return
@@ -1247,8 +1282,25 @@ class MainFrame(wx.Frame):
             self._webview_host.set_size(size[0], size[1])
 
     def _on_websdr_connect_clicked(self, _event=None) -> None:
-        active = self._active_websdr_site
-        if not self._websdr_active and not self._rig_active:
+        if self._websdr_active:
+            # Disconnect if the dropdown still matches what's active,
+            # Load if a different site is selected -- see
+            # _update_websdr_controls() for the same comparison driving
+            # the button's label, and _begin_websdr_switch()/
+            # SyncEngine._switch_websdr() for why this reuses the
+            # existing window instead of disconnecting first.
+            active = self._active_websdr_site
+            site = self._resolve_selected_site()
+            if site is not None and active is not None and site.url == active.url and site.driver_type == active.driver_type:
+                self._disconnect_websdr()
+                return
+            if site is None:
+                self._set_message(self.websdr_err_text, "Select a known site, or Detect a Custom URL first")
+                return
+            self._begin_websdr_switch(site)
+            return
+
+        if not self._rig_connected:
             # Belt-and-suspenders -- the button is disabled in this state
             # (see _update_websdr_controls()), but guard the handler too in
             # case of a race between a click and a state-changing snapshot.
@@ -1260,27 +1312,56 @@ class MainFrame(wx.Frame):
             self._set_message(self.websdr_err_text, "Select a known site, or Detect a Custom URL first")
             return
 
-        if self._websdr_active and active is not None and site.url == active.url and site.driver_type == active.driver_type:
-            # Nothing to switch to -- the button is disabled in this state
-            # (see _update_websdr_controls()); disconnecting is
-            # websdr_disconnect_btn's job now. Guard the handler too in
-            # case of a race between a click and a state-changing snapshot.
-            return
+        self._begin_websdr_connect(site)
 
-        # Connect (not active) or Switch (active, different site) -- same
-        # call either way; the engine replaces whatever's currently loaded.
-        # If switching away from an active site, remember its window
-        # geometry under its own driver_type before it stops being current.
+    def _begin_websdr_switch(self, site: WebSDRSite) -> None:
+        """Loads `site` on the SAME already-open WebSDR window -- see
+        SyncEngine._switch_websdr()'s docstring for why this deliberately
+        does NOT touch set_frame_visible()/bring_to_front_over() the way
+        _begin_websdr_connect() does: the window is already visible and
+        correctly ordered, and re-doing either of those was exactly the
+        mechanism behind the z-order/visibility bugs this replaces. Only
+        ever called while _websdr_active is already True."""
+        self._save_current_webview_geometry()
+        self.settings.last_site_url = site.url
+        self.settings.last_site_driver_type = (
+            site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
+        )
+        self.settings.save()
+        self._active_websdr_site = site
+        self._restore_webview_geometry(site.driver_type)
+        self._websdr_conn_text = "connecting..."
+        self.websdr_conn_text.SetLabel("connecting...")
+        self.websdr_driver_text.SetLabel(site.driver_type)
+        self.websdr_freq_text.SetLabel("-")
+        self.websdr_mode_text.SetLabel("-")
+        self.websdr_audio_text.SetLabel("-")
+        self._set_message(self.websdr_err_text, "")
+        self.websdr_connect_btn.Enable(False)
+        self.websdr_connect_btn.SetLabel("Loading...")
+        self.engine.switch_websdr_from_other_thread(site)
+
+    def _begin_websdr_connect(self, site: WebSDRSite) -> None:
+        """The actual Connect: shows/positions the WebSDR frame and starts
+        the engine session. Only ever called with the WebSDR subsystem
+        NOT already active."""
         self._websdr_connect_pending = True
         self._save_current_webview_geometry()
         self.settings.last_site_url = site.url
-        self.settings.last_site_driver_type = site.driver_type if self._find_any_site_by_url(site.url) is None else ""
+        # Scoped to _find_selectable_site_by_url (the FULL dropdown, not
+        # just KNOWN_SITES+user_sites) -- a curated/imported site is
+        # already selectable by name on restart, same as a known one, so
+        # it doesn't need last_site_driver_type's synthetic Custom-URL
+        # reconstruction; only a URL absent from every list does.
+        self.settings.last_site_driver_type = (
+            site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
+        )
         self.settings.headless = self.headless_check.GetValue()
         self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
         self.settings.save()
-        # Shown again before anything else touches the frame -- a fresh
-        # Connect (as opposed to a switch) starts from the idle-hidden
-        # state set at startup/disconnect (see _apply_snapshot/_on_close).
+        # Shown again before anything else touches the frame -- Connect
+        # always starts from the idle-hidden state set at startup/
+        # disconnect (see _apply_snapshot/_on_close).
         self._webview_host.set_frame_visible(True)
         self._webview_host.set_headless(self.settings.headless)
 
@@ -1619,6 +1700,7 @@ class MainFrame(wx.Frame):
 
         # --- Transceiver ---
         self._rig_active = snap.rig_active
+        self._rig_connected = bool(snap.rig_active and snap.rig_connected)
         if snap.rig_active:
             if snap.rig_connected:
                 self._rig_ever_connected = True
@@ -1648,7 +1730,7 @@ class MainFrame(wx.Frame):
         # --- WebSDR ---
         self._websdr_active = snap.websdr_active
         if not snap.websdr_active:
-            # A pending Connect/Switch's own _start_websdr() hasn't
+            # A pending Connect's own _start_websdr() hasn't
             # flipped the engine's websdr_active True yet (it's gated on a
             # GUI-thread WebView-creation round-trip), so SyncEngine._tick()
             # keeps publishing its ordinary "nothing to report" snapshots
@@ -1751,7 +1833,20 @@ class MainFrame(wx.Frame):
         # below), so this needs its own save.
         self._save_current_webview_geometry()
         self.engine.stop_from_other_thread()
-        self.thread.join(timeout=SHUTDOWN_TIMEOUT_S)
+        # A plain thread.join() here would block this thread -- but the
+        # engine's own shutdown (_stop_websdr() -> WebViewHost.destroy_page())
+        # now awaits a future the GUI thread resolves via wx.CallAfter once
+        # the old WebView widget is actually destroyed (see webview_host.py).
+        # A blocked GUI thread never pumps that CallAfter, so the engine
+        # thread would wait the full SHUTDOWN_TIMEOUT_S and never reach
+        # _stop_rig() at all -- confirmed live: every close while WebSDR was
+        # connected turned into a guaranteed multi-second freeze with the
+        # rig socket left uncleanly open. SafeYield() between short joins
+        # keeps the event queue (and therefore that CallAfter) moving.
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+        while self.thread.is_alive() and time.monotonic() < deadline:
+            wx.SafeYield()
+            self.thread.join(timeout=0.05)
         self._poll_timer.Stop()
         # The WebViewHost's frame is separate from this one and would
         # otherwise keep the whole app alive after this window closes
@@ -1786,6 +1881,15 @@ class SDRSyncApp(wx.App):
         frame = MainFrame(settings, host)
         self.SetTopWindow(frame)
         frame.Show(True)
+        # A freshly launched process has no standing "last input event" of
+        # its own (that belongs to whatever launched it -- Explorer, a
+        # shell, another app), so plain Show()/Raise() can come up behind
+        # an already-maximized foreground app exactly like the WebSDR
+        # popup used to before Connect started calling
+        # bring_pair_to_front() -- see its docstring for why the
+        # HWND_TOPMOST/NOTOPMOST band trick this uses doesn't need that
+        # permission in the first place, unlike a bare HWND_TOP.
+        bring_pair_to_front(frame)
         return True
 
 

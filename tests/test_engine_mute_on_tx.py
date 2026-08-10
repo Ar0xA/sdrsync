@@ -71,7 +71,7 @@ class _UnusedWebViewHost:
     async def create_page(self, loop, on_dead=None):
         raise AssertionError("not expected to be called in these tests")
 
-    async def destroy_page(self, page) -> None:
+    async def destroy_page(self, page, loop=None) -> None:
         raise AssertionError("not expected to be called in these tests")
 
 

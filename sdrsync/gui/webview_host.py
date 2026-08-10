@@ -615,12 +615,26 @@ class WebViewHost:
         wx.CallAfter(do_create)
         return await fut
 
-    async def destroy_page(self, page: WxPageAdapter) -> None:
+    async def destroy_page(self, page: WxPageAdapter, loop: "asyncio.AbstractEventLoop") -> None:
         """Callable from any thread. Marks the adapter dead first (via
         close()) -- RunScriptAsync on an already-Destroy()'d WebView
         segfaults the whole process, confirmed during Block B, so
-        ordering here is load-bearing, not stylistic."""
+        ordering here is load-bearing, not stylistic.
+
+        Awaits the actual GUI-thread Destroy(), symmetric to create_page()
+        -- a bare wx.CallAfter() with no completion signal let the caller
+        (SyncEngine._stop_websdr()) consider a session fully torn down,
+        and a subsequent Switch start a brand new create_page() for the
+        replacement, before the old widget had actually been destroyed.
+        Live-reported: an intermittent race where Switch WebSDR left the
+        WebSDR frame hidden (audio from the new session still audible,
+        window not even in the taskbar) -- the old CallAfter and the new
+        one could reach the GUI thread in either order once a round trip
+        through the engine's status-queue/GUI-timer polling separated
+        them, since neither was awaited end-to-end."""
         await page.close()
+
+        fut: "asyncio.Future" = loop.create_future()
 
         def do_destroy():
             if self._current_webview is page.webview:
@@ -629,8 +643,10 @@ class WebViewHost:
                 page.webview.Destroy()
             except Exception as e:
                 logger.debug("Non-fatal error destroying WebView widget: %s", e)
+            loop.call_soon_threadsafe(_safe_set_result, fut, None)
 
         wx.CallAfter(do_destroy)
+        await fut
 
 
 def _safe_set_result(fut: "asyncio.Future", value) -> None:

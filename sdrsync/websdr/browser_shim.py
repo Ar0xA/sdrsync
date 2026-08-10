@@ -377,6 +377,19 @@ class WxPageAdapter:
                 raise BrowserError(f"wait_for_function timed out after {timeout_s}s: {js!r}")
             await asyncio.sleep(POLL_INTERVAL_S)
 
+    def set_on_dead(self, on_dead: Optional[Callable[[str], None]]) -> None:
+        """Rebinds the on_dead callback in place -- for SyncEngine's
+        switch-in-place path (_switch_websdr()), which reuses an existing
+        page/adapter across a site change instead of going through
+        create_page()/destroy_page() again. Each switch bumps the
+        engine's generation counter, and the callback closure captures
+        that generation by value, so the OLD callback would report a
+        post-switch crash under a generation _handle_page_dead() would
+        then (correctly, but wrongly here) treat as stale and ignore --
+        this keeps crash recovery working across a switch, same as it
+        already does across create_page()."""
+        self._on_dead = on_dead
+
     async def close(self) -> None:
         """Marks this adapter dead. Does NOT destroy the underlying
         WebView/frame -- Block C's engine owns and destroys those, same

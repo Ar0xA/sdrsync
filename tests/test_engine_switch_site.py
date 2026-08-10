@@ -64,6 +64,12 @@ class StubPage:
     """Sentinel page -- nothing in these tests touches its content, only
     identity (via StubWebViewHost's created/destroyed lists)."""
 
+    def __init__(self) -> None:
+        self.on_dead = None
+
+    def set_on_dead(self, on_dead) -> None:
+        self.on_dead = on_dead
+
 
 class StubWebViewHost:
     """Satisfies SyncEngine's WebViewHost Protocol. Tracks created/
@@ -79,7 +85,7 @@ class StubWebViewHost:
         self.created.append(page)
         return page
 
-    async def destroy_page(self, page) -> None:
+    async def destroy_page(self, page, loop=None) -> None:
         self.destroyed.append(page)
 
 
@@ -139,6 +145,111 @@ def test_switching_site_swaps_driver_and_resets_latches_without_touching_rig(mon
         # Switching sites must tear down the first WebView, not leak it.
         assert len(engine._webview_host.created) == 2
         assert len(engine._webview_host.destroyed) == 1
+
+    asyncio.run(run())
+
+
+def test_switch_websdr_reuses_the_same_page_without_destroying_it(monkeypatch):
+    # _switch_websdr() is the actual "Switch" path now -- unlike
+    # _start_websdr()'s own "if active, stop first" behavior exercised by
+    # test_switching_site_swaps_driver_and_resets_latches_without_touching_rig
+    # above, this must NOT create a second WebView or destroy the first:
+    # that destroy-and-recreate cycle was the root of a string of Win32
+    # z-order/visibility bugs against the always-visible WebSDR window.
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    monkeypatch.setitem(engine_module.DRIVERS, "kiwisdr", StubDriver)
+
+    engine = make_engine()
+    site_a = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+    site_b = WebSDRSite(name="B", url="http://b.invalid/", driver_type="kiwisdr")
+
+    async def run():
+        await engine._start_websdr(site_a)
+        original_driver = engine._driver
+        original_page = engine._page
+
+        engine._last_sent_freq = 14074000
+        engine._last_sent_mode_key = ("USB", 2700)
+        engine._last_ptt = False
+
+        await engine._switch_websdr(site_b)
+
+        assert original_driver.closed is True
+        assert engine.site is site_b
+        assert engine._driver is not original_driver
+        assert engine._driver.url == "http://b.invalid/"
+        assert engine._last_sent_freq is None
+        assert engine._last_sent_mode_key is None
+        assert engine._last_ptt is None
+        assert engine._websdr_active is True
+        # The whole point: same page, nothing created or destroyed.
+        assert engine._page is original_page
+        assert len(engine._webview_host.created) == 1
+        assert len(engine._webview_host.destroyed) == 0
+
+    asyncio.run(run())
+
+
+def test_switch_websdr_falls_back_to_a_full_start_with_no_existing_page(monkeypatch):
+    # The GUI only ever calls this while already active, but a defensive
+    # fallback matters more than an assertion here would.
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    engine = make_engine()
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    asyncio.run(engine._switch_websdr(site))
+
+    assert engine._websdr_active is True
+    assert engine.site is site
+    assert len(engine._webview_host.created) == 1
+
+
+def test_switch_websdr_rebinds_on_dead_so_a_post_switch_crash_still_recovers(monkeypatch):
+    # Regression guard for the exact bug set_on_dead() exists to prevent:
+    # the dead-callback closure captures a generation number by value, and
+    # _switch_websdr() bumps that generation without going through
+    # create_page() (which is what normally re-wires on_dead for a new
+    # generation). Without the explicit rebind, a WebView crash AFTER a
+    # switch would report the pre-switch generation, _handle_page_dead()
+    # would see it doesn't match the current one, and silently ignore a
+    # real crash instead of recovering from it.
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    monkeypatch.setitem(engine_module.DRIVERS, "kiwisdr", StubDriver)
+    engine = make_engine()
+    site_a = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+    site_b = WebSDRSite(name="B", url="http://b.invalid/", driver_type="kiwisdr")
+
+    recreated = []
+    real_start = engine._start_websdr
+
+    async def spy_start(site, user_initiated=True):
+        recreated.append(site)
+        await real_start(site, user_initiated=user_initiated)
+
+    engine._start_websdr = spy_start
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        await engine._start_websdr(site_a)
+        recreated.clear()  # only the post-switch recovery below matters
+        page = engine._page
+        await engine._switch_websdr(site_b)
+        assert page.on_dead is not None
+        # Simulate the page dying after the switch -- same call shape
+        # WxPageAdapter uses (a single reason string). Deliberately calling
+        # the REBOUND callback itself (not engine._on_page_dead() with an
+        # explicit generation, as the other page-death tests do) -- the
+        # whole point is proving the closure captured the post-switch
+        # generation on its own.
+        page.on_dead("script timeout")
+        # _on_page_dead schedules _handle_page_dead via call_soon_threadsafe,
+        # which itself schedules _start_websdr() as a new task -- two
+        # sleeps to let both run, same as test_page_death_recreates_the_
+        # websdr_session above.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert recreated == [site_b], "a post-switch crash must recover the CURRENT site, not be ignored as stale"
 
     asyncio.run(run())
 
