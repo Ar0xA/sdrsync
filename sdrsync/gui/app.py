@@ -50,6 +50,8 @@ from sdrsync.config import (
     clamp_reverse_sync_bounds,
 )
 from sdrsync.gui_messages import GuiMessage
+from sdrsync.gui import theme
+from sdrsync.gui.fonts import load_fonts
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
 from sdrsync.gui.webview_host import (
     WebViewHost, bring_pair_to_front, clamp_size_to_display, has_display_at, on_screen_pos_for_monitor,
@@ -140,18 +142,50 @@ class _Tooltip:
         event.Skip()
 
 
+class _PlaceholderBand(wx.Panel):
+    """GUI REWRITE IN PROGRESS: stands in for a not-yet-built chrome band
+    (spec §2's StripPanel/SectionBar/SettingsHost/ReceiverHost/
+    StatusBarPanel) during phase 3, so the frame skeleton's geometry can
+    be verified before the real widgets exist. Each later phase replaces
+    exactly one of these with its real module; none should remain by
+    phase 10."""
+
+    def __init__(self, parent: wx.Window, name: str, height: Optional[int] = None,
+                 fill: wx.Colour = theme.SURFACE, hairline_edge: str = "bottom") -> None:
+        style = wx.TAB_TRAVERSAL
+        super().__init__(parent, style=style, size=wx.Size(-1, height) if height else wx.DefaultSize)
+        self._name = name
+        self._fill = fill
+        self._hairline_edge = hairline_edge
+        if height is not None:
+            self.SetMinSize(wx.Size(-1, self.FromDIP(height)))
+        self.SetBackgroundColour(fill)
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+
+    def _on_paint(self, _evt: wx.PaintEvent) -> None:
+        dc = wx.BufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(self._fill))
+        dc.Clear()
+        dc.SetFont(wx.Font(wx.FontInfo(9)))
+        dc.SetTextForeground(theme.MUTED)
+        dc.DrawText(self._name, self.FromDIP(8), self.FromDIP(4))
+        theme.draw_hairline(dc, self.GetClientRect(), self._hairline_edge)
+
+
 class MainFrame(wx.Frame):
     def __init__(self, settings: AppSettings, webview_host: WebViewHost) -> None:
+        # spec §2: a genuinely resizable frame at a fixed default/min size
+        # -- the receiver band (ReceiverHost, proportion=1) absorbs all
+        # extra space on resize/maximize, replacing the old
+        # compute-size-from-content model entirely (no more
+        # _resize_main_window_to_content()/_finish_initial_layout()).
+        load_fonts()
         super().__init__(
-            None, title=f"SDRSync {__version__} - rigctld -> WebSDR",
-            # No RESIZE_BORDER/MAXIMIZE_BOX -- this window's size is
-            # entirely computed (_resize_main_window_to_content(), the
-            # MinSize floor from _finish_initial_layout()), not something
-            # a manual drag or maximize should be able to override; either
-            # would just get silently undone by the next rig/mock-rig
-            # connect or disconnect anyway.
-            style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX),
+            None, title=f"SDRSync {__version__} - not connected",
+            style=wx.DEFAULT_FRAME_STYLE, size=theme.FRAME_SIZE,
         )
+        self.SetMinSize(wx.Size(*theme.FRAME_MIN_SIZE))
+        self.SetBackgroundColour(theme.BG)
         if ICON_PATH.exists():
             try:
                 icon = wx.Icon(str(ICON_PATH), wx.BITMAP_TYPE_ICO)
@@ -267,26 +301,20 @@ class MainFrame(wx.Frame):
 
         self._build_widgets()
         self._restore_main_window_geometry()
-        # Best-size/virtual-size metrics are only accurate once this
-        # frame is genuinely realized on screen (confirmed live: a
-        # measurable gap between the pre-Show() and post-Show() computed
-        # size). Queued via CallAfter so it runs right after
-        # SDRSyncApp.OnInit()'s frame.Show(True) -- see
-        # _finish_initial_layout()'s own docstring for what it does and why.
-        wx.CallAfter(self._finish_initial_layout)
-        self._restore_custom_site_if_needed()
-        self._maybe_auto_update_curated_sites()
 
-        # One engine, one background thread, for the whole app session --
-        # NOT recreated per Connect click. The rig/WebSDR subsystems it
-        # owns are started/stopped independently via the buttons below.
-        self.engine = SyncEngine(self.settings, self.status_queue, webview_host=self._webview_host)
-        self.thread = threading.Thread(target=self._run_engine, args=(self.engine,), daemon=True)
-        self.thread.start()
-
-        self._poll_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self._poll_status_queue, self._poll_timer)
-        self._poll_timer.Start(QUEUE_POLL_MS)
+        # GUI REWRITE IN PROGRESS (branch gui-pixel-perfect-redesign):
+        # engine/thread/timer construction and the old
+        # _restore_custom_site_if_needed()/_maybe_auto_update_curated_sites()
+        # calls are deferred until the new Sites panel + inline WebView
+        # land (plan phases 5-6) -- both reference widgets
+        # (self.site_combo, self.custom_url_entry, ...) that the new
+        # StripPanel/SettingsHost skeleton doesn't build yet. Until then
+        # these three stay None and _on_close()/_poll_status_queue() no-op
+        # on that. See project_brief.md's "GUI pixel-perfect rewrite"
+        # section for the full phase plan and progress log.
+        self.engine: Optional[SyncEngine] = None
+        self.thread: Optional[threading.Thread] = None
+        self._poll_timer: Optional[wx.Timer] = None
 
     def _restore_main_window_geometry(self) -> None:
         """Applies this window's own remembered POSITION from the last
@@ -387,48 +415,40 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------------------------
     def _build_widgets(self) -> None:
-        # wx.ScrolledWindow, not wx.Panel -- this window's full natural
-        # content height (Transceiver fields, the Mock Rig Control panel)
-        # can exceed a real monitor's usable height (live-reported), and
-        # unlike the WebSDR popup there's no "any size is fine" browser
-        # view to just clamp; a scrollbar is what keeps every control
-        # reachable regardless of screen size. Vertical-only scrolling
-        # (x rate 0) -- nothing here is expected to need horizontal
-        # scroll. See _finish_initial_layout() for how this window's
-        # VISIBLE size is capped independently of its virtual (full
-        # content) size, and _update_mock_rig_panel_visibility() for how
-        # the virtual size is kept in sync afterward.
-        panel = wx.ScrolledWindow(self)
-        panel.SetScrollRate(0, 20)
-        self._root_panel = panel
-        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        """spec §2's five-band root layout. GUI REWRITE IN PROGRESS: each
+        band is a _PlaceholderBand until its own phase replaces it with
+        the real module (StripPanel/SectionBar/SettingsHost/ReceiverHost/
+        StatusBarPanel) -- see project_brief.md's progress log for which
+        phase is current. The old _build_websdr_panel/_build_rig_panel/
+        _build_mock_rig_panel methods below are temporarily unused (kept
+        for their business logic until it's ported into the new settings
+        panels in phase 5; deleted in the phase 10 cleanup pass)."""
+        root = wx.BoxSizer(wx.VERTICAL)
 
-        websdr_box = wx.StaticBox(panel, label="WebSDR")
-        websdr_sizer = wx.StaticBoxSizer(websdr_box, wx.VERTICAL)
-        self._build_websdr_panel(websdr_box, websdr_sizer)
-        main_sizer.Add(websdr_sizer, flag=wx.EXPAND | wx.ALL, border=3)
+        self.strip_panel = _PlaceholderBand(self, "StripPanel", height=theme.STRIP_HEIGHT)
+        root.Add(self.strip_panel, 0, wx.EXPAND)
 
-        rig_box = wx.StaticBox(panel, label="Transceiver")
-        rig_sizer = wx.StaticBoxSizer(rig_box, wx.VERTICAL)
-        self._build_rig_panel(rig_box, rig_sizer)
-        main_sizer.Add(rig_sizer, flag=wx.EXPAND | wx.ALL, border=3)
+        self.section_bar = _PlaceholderBand(self, "SectionBar", height=theme.SECTION_BAR_HEIGHT, fill=theme.PANEL_ALT)
+        root.Add(self.section_bar, 0, wx.EXPAND)
 
-        self._build_mock_rig_panel(panel, main_sizer)
+        # SettingsHost starts hidden (spec §5: "folds away once the rig
+        # is connected... never occupies vertical space unless the user
+        # opens it") -- shown here at a placeholder height only so its
+        # presence/absence is visible while wiring up the skeleton;
+        # real SettingsHost (phase 5) starts genuinely hidden.
+        self.settings_host = _PlaceholderBand(self, "SettingsHost (hidden by default)", height=140, fill=theme.BG)
+        root.Add(self.settings_host, 0, wx.EXPAND)
+        self.settings_host.Hide()
 
-        open_log_btn = wx.Button(panel, label="Open log folder")
-        open_log_btn.Bind(wx.EVT_BUTTON, self._on_open_log_folder_clicked)
-        main_sizer.Add(open_log_btn, flag=wx.ALIGN_LEFT | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=3)
+        self.receiver_host = _PlaceholderBand(self, "ReceiverHost", fill=theme.BG, hairline_edge="top")
+        root.Add(self.receiver_host, 1, wx.EXPAND)
 
-        panel.SetSizer(main_sizer)
-        frame_sizer = wx.BoxSizer(wx.VERTICAL)
-        frame_sizer.Add(panel, proportion=1, flag=wx.EXPAND)
-        # SetSizer(), not SetSizerAndFit() -- fitting the frame to the
-        # panel's full content here (before this frame is even Show()'n)
-        # is both inaccurate (see _finish_initial_layout()'s docstring)
-        # and, now that the panel scrolls, no longer what we want anyway:
-        # the frame's own visible size is decided later, independently of
-        # the panel's (potentially taller) virtual content size.
-        self.SetSizer(frame_sizer)
+        self.status_bar_panel = _PlaceholderBand(
+            self, "StatusBarPanel", height=theme.STATUS_BAR_HEIGHT, fill=theme.PANEL_ALT, hairline_edge="top",
+        )
+        root.Add(self.status_bar_panel, 0, wx.EXPAND)
+
+        self.SetSizer(root)
 
     def _build_websdr_panel(self, parent: wx.Window, outer: wx.BoxSizer) -> None:
         grid = wx.GridBagSizer(vgap=2, hgap=6)
@@ -1828,26 +1848,31 @@ class MainFrame(wx.Frame):
         pos = self.GetPosition()
         self.settings.main_window_position = [pos.x, pos.y]
         self.settings.save()
-        # Closing while connected doesn't go through _apply_snapshot's
-        # active->inactive transition (the engine thread is just killed
-        # below), so this needs its own save.
-        self._save_current_webview_geometry()
-        self.engine.stop_from_other_thread()
-        # A plain thread.join() here would block this thread -- but the
-        # engine's own shutdown (_stop_websdr() -> WebViewHost.destroy_page())
-        # now awaits a future the GUI thread resolves via wx.CallAfter once
-        # the old WebView widget is actually destroyed (see webview_host.py).
-        # A blocked GUI thread never pumps that CallAfter, so the engine
-        # thread would wait the full SHUTDOWN_TIMEOUT_S and never reach
-        # _stop_rig() at all -- confirmed live: every close while WebSDR was
-        # connected turned into a guaranteed multi-second freeze with the
-        # rig socket left uncleanly open. SafeYield() between short joins
-        # keeps the event queue (and therefore that CallAfter) moving.
-        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-        while self.thread.is_alive() and time.monotonic() < deadline:
-            wx.SafeYield()
-            self.thread.join(timeout=0.05)
-        self._poll_timer.Stop()
+        # GUI REWRITE IN PROGRESS: engine/thread/timer are None until
+        # phase 6 reconnects them (see __init__) -- nothing to stop/join
+        # yet in that window.
+        if self.engine is not None:
+            # Closing while connected doesn't go through _apply_snapshot's
+            # active->inactive transition (the engine thread is just killed
+            # below), so this needs its own save.
+            self._save_current_webview_geometry()
+            self.engine.stop_from_other_thread()
+            # A plain thread.join() here would block this thread -- but the
+            # engine's own shutdown (_stop_websdr() -> WebViewHost.destroy_page())
+            # now awaits a future the GUI thread resolves via wx.CallAfter once
+            # the old WebView widget is actually destroyed (see webview_host.py).
+            # A blocked GUI thread never pumps that CallAfter, so the engine
+            # thread would wait the full SHUTDOWN_TIMEOUT_S and never reach
+            # _stop_rig() at all -- confirmed live: every close while WebSDR was
+            # connected turned into a guaranteed multi-second freeze with the
+            # rig socket left uncleanly open. SafeYield() between short joins
+            # keeps the event queue (and therefore that CallAfter) moving.
+            deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+            while self.thread.is_alive() and time.monotonic() < deadline:
+                wx.SafeYield()
+                self.thread.join(timeout=0.05)
+        if self._poll_timer is not None:
+            self._poll_timer.Stop()
         # The WebViewHost's frame is separate from this one and would
         # otherwise keep the whole app alive after this window closes
         # (wx's default "exit when no top-level windows exist" behavior

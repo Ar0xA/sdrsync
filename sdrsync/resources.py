@@ -24,3 +24,4 @@ else:
     _BASE_DIR = Path(__file__).resolve().parent
 
 ICON_PATH = _BASE_DIR / "icon.ico"
+FONTS_DIR = _BASE_DIR / "assets" / "fonts"
