@@ -150,6 +150,33 @@ def map_hamlib_mode_ubersdr(hamlib_mode: str) -> Optional[str]:
     return _MODE_MAP.get(hamlib_mode.upper())
 
 
+# Reverse of _MODE_MAP's collapsing cases, for reverse sync (WebSDR -> rig,
+# v11). get_status() reports the receiver's mode id uppercased (see
+# get_status() below), so the keys here are upper too. One canonical hamlib
+# name per UberSDR id, picked the same way KiwiSDR's _REVERSE_MODE_MAP picks
+# one: nfm collapses FM/FMN's many hamlib spellings back to the plain one,
+# and cwu/cwl keep CW/CWR distinct because the API (and _is_cw() below) does.
+_REVERSE_MODE_MAP: dict[str, str] = {
+    "USB": "USB",
+    "LSB": "LSB",
+    "AM": "AM",
+    "SAM": "SAM",
+    "NFM": "FM",
+    "FM": "WFM",
+    "CWU": "CW",
+    "CWL": "CWR",
+}
+
+
+def map_ubersdr_mode_to_hamlib(mode: Optional[str]) -> Optional[str]:
+    """Pure reverse mapping: get_status()-normalized mode string (already
+    uppercased) -> a canonical hamlib mode name. None if unknown (caller
+    should skip the reverse push and log, not raise)."""
+    if mode is None:
+        return None
+    return _REVERSE_MODE_MAP.get(mode.upper())
+
+
 def passband_edges(
     mode_id: str, width_hz: Optional[int], modes: Optional[dict[str, dict[str, Any]]] = None
 ) -> Optional[tuple[int, int]]:
@@ -634,13 +661,18 @@ class UberSDRDriver:
         return bool(session.get("running")) if session else False
 
     # ------------------------------------------------------------------- tuning
-    async def tune_hz(self, freq_hz: int) -> bool:
+    async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         """Returns True only if the receiver applied it.
 
         No readback: the command returns the tuning it just set, and an
         impossible frequency comes back as `bad_args` with a reason rather than
         being clamped silently. That is stricter than a readback comparison and
         the reason gets logged.
+
+        verify is accepted for WebSDRDriver Protocol parity but unused here --
+        the command's own reply settles success/failure synchronously, so
+        there's no delayed background correction for verify=False to skip
+        (same reasoning as KiwiSDR's and OpenWebRX's tune_hz()).
         """
         if not self._attached:
             return False
@@ -800,6 +832,30 @@ class UberSDRDriver:
                 pass
         self._attached = False
         self._page = None
+
+    def _reverse_effective_hz(
+        self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]
+    ) -> Optional[int]:
+        """Un-applies cw_offset_hz for the reverse direction (WebSDR ->
+        rig), symmetric to tune_hz()'s forward application above. Takes
+        the mode as an explicit argument, sourced from the SAME status
+        snapshot map_ubersdr_mode_to_hamlib() derived it from -- NOT
+        self._current_mode, which only reflects this driver's own last
+        PUSHED mode and is stale by construction for reverse sync (a page
+        change the driver didn't itself push, e.g. someone else on the
+        receiver retuning it, is exactly what reverse sync exists to
+        observe)."""
+        if observed_hz is None:
+            return None
+        if observed_hamlib_mode in ("CW", "CWR"):
+            return observed_hz - self.cw_offset_hz
+        return observed_hz
+
+    def hamlib_mode_from_status(self, status: WebSDRStatus) -> Optional[str]:
+        return map_ubersdr_mode_to_hamlib(status.mode)
+
+    def rig_freq_from_status(self, status: WebSDRStatus) -> Optional[int]:
+        return self._reverse_effective_hz(status.freq_hz, self.hamlib_mode_from_status(status))
 
     # ---------------------------------------------------------------- internals
     def _is_cw(self) -> bool:

@@ -271,6 +271,64 @@ def test_status_while_unattached_carries_the_reason_rather_than_being_blank():
     assert status.last_error == "the browser bridge is switched off"
 
 
+# --- reverse sync (WebSDR -> rig, v11) -------------------------------------
+
+def test_reverse_sync_maps_status_mode_back_to_hamlib():
+    driver = attached(StubPage())
+    status = run(driver.get_status())  # unattached-shaped is fine; only .mode matters
+    for ubersdr_mode, hamlib_mode in [
+        ("USB", "USB"), ("LSB", "LSB"), ("AM", "AM"), ("SAM", "SAM"),
+        ("NFM", "FM"), ("FM", "WFM"), ("CWU", "CW"), ("CWL", "CWR"),
+    ]:
+        status.mode = ubersdr_mode
+        assert driver.hamlib_mode_from_status(status) == hamlib_mode
+
+
+def test_reverse_sync_reports_none_for_an_unmapped_mode():
+    driver = attached(StubPage())
+    status = run(driver.get_status())
+    status.mode = "DRM"
+    assert driver.hamlib_mode_from_status(status) is None
+
+
+def test_reverse_sync_un_applies_the_cw_offset():
+    # Symmetric to test_the_cw_offset_applies_only_in_cw() above: the same
+    # offset that gets added going out to the receiver must come back off
+    # going the other way, or every reverse-synced CW frequency would drift.
+    driver = attached(StubPage(), cw_offset_hz=700)
+    status = run(driver.get_status())
+    status.freq_hz, status.mode = 7030700, "CWU"
+    assert driver.rig_freq_from_status(status) == 7030000
+    status.mode = "CWL"
+    assert driver.rig_freq_from_status(status) == 7030000
+
+
+def test_reverse_sync_leaves_non_cw_frequency_untouched():
+    driver = attached(StubPage(), cw_offset_hz=700)
+    status = run(driver.get_status())
+    status.freq_hz, status.mode = 14074000, "USB"
+    assert driver.rig_freq_from_status(status) == 14074000
+
+
+def test_reverse_sync_reads_the_driver_own_offset_not_the_last_pushed_mode():
+    # rig_freq_from_status() must key off the OBSERVED mode in this status
+    # snapshot, not self._current_mode (the driver's own last-pushed mode) --
+    # otherwise a receiver retuned by someone else on the page (exactly what
+    # reverse sync exists to observe) would apply the wrong offset.
+    driver = attached(StubPage(), cw_offset_hz=700)
+    driver._current_mode = "usb"
+    status = run(driver.get_status())
+    status.freq_hz, status.mode = 7030700, "CWU"
+    assert driver.rig_freq_from_status(status) == 7030000
+
+
+def test_reverse_sync_frequency_is_none_when_status_has_none():
+    driver = attached(StubPage())
+    status = run(driver.get_status())
+    status.freq_hz, status.mode = None, "USB"
+    assert driver.rig_freq_from_status(status) is None
+
+
 # --- goodbye --------------------------------------------------------------
 
 def test_close_says_goodbye_so_the_client_slot_is_freed():
