@@ -53,6 +53,23 @@ class _OwnerDrawnMixin:
             setattr(self, name, value)
             self.Refresh()
 
+    def _relayout_after_label_change(self) -> None:
+        """SetMinSize() alone doesn't make an existing sizer reflow --
+        it only takes effect on the NEXT Layout() pass. Without this, a
+        label change to a wider string (e.g. "Test" -> "Testing...")
+        left the control painting at its old, now-too-small rect, so
+        the new text overflowed past the button's border (confirmed
+        live). Walks up to the top-level frame, mirroring the same
+        pattern already used for other dynamic-size changes (see
+        TransceiverPanel._on_mock_rig_toggled), since a mid-tree
+        Layout() alone doesn't always reach every affected sizer."""
+        parent = self.GetParent()
+        if parent is not None:
+            parent.Layout()
+        top = self.GetTopLevelParent()
+        if top is not None:
+            top.Layout()
+
     def _on_enter(self, evt: wx.MouseEvent) -> None:
         self._set_flag("_hover", True)
         evt.Skip()
@@ -140,6 +157,7 @@ class FlatButton(_OwnerDrawnMixin, wx.Control):
             return
         self._label = label
         self._recompute_min_size()
+        self._relayout_after_label_change()
         self.Refresh()
 
     def GetLabel(self) -> str:  # noqa: N802
@@ -278,8 +296,11 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
         return self._checked
 
     def SetLabel(self, label: str) -> None:  # noqa: N802
+        if label == self._label:
+            return
         self._label = label
         self._recompute_min_size()
+        self._relayout_after_label_change()
         self.Refresh()
 
     def GetLabel(self) -> str:  # noqa: N802

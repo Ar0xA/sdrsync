@@ -169,12 +169,33 @@ class TransceiverPanel(wx.Panel):
 
         self._refresh_poll_status()
 
-    def set_connection_state(self, active: bool, busy_label: Optional[str] = None) -> None:
+    def set_connection_state(
+        self, active: bool, busy_label: Optional[str] = None, connecting: bool = False,
+    ) -> None:
         """Called by MainFrame from real StatusSnapshots (and
         optimistically, with a busy_label, right after a click) --
         active=True means a rig session has been started (may still be
-        connecting), matching StatusSnapshot.rig_active."""
-        self.connect_btn.SetLabel(busy_label if busy_label is not None else ("Disconnect" if active else "Connect"))
+        connecting), matching StatusSnapshot.rig_active.
+
+        connecting=True (rig_active but not yet rig_connected) keeps the
+        button labeled "Connecting..." instead of immediately jumping to
+        "Disconnect" -- previously the label flipped to "Disconnect" the
+        instant the session started, which reads as "already connected"
+        even while the engine is still silently retrying the handshake
+        for up to RIG_CONNECT_TIMEOUT_S (30s). That false-positive label
+        was confirmed live as the actual source of a user's confusion
+        ("mock rig off, couldn't figure out why it wouldn't connect") --
+        the button said Disconnect but nothing else in the UI ever
+        showed a connected rig. Left enabled (unlike busy_label) so a
+        stuck attempt can still be aborted by clicking it, which routes
+        to the same stop_rig_from_other_thread() call Disconnect uses."""
+        if busy_label is not None:
+            label = busy_label
+        elif connecting:
+            label = "Connecting..."
+        else:
+            label = "Disconnect" if active else "Connect"
+        self.connect_btn.SetLabel(label)
         self.connect_btn.Enable(busy_label is None)
         self.connect_btn.SetPrimary(not active)
         editable = not active

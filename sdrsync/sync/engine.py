@@ -149,7 +149,7 @@ IDLE_RESUME_RETRY_GAP_S = 30.0
 # forever. Applies to the time-to-FIRST-connect only -- cleared once
 # ensure_connected() succeeds once, so a later transient drop-and-reconnect
 # isn't bound by this same budget (see _tick()/_start_rig()).
-RIG_CONNECT_TIMEOUT_S = 30.0
+RIG_CONNECT_TIMEOUT_S = 10.0
 
 # v11 reverse sync (WebSDR -> rig) constants.
 # Hold-off window, from either direction's last successful push, during
@@ -331,6 +331,14 @@ class StatusSnapshot(GuiMessage):
     rig_mode: Optional[str] = None
     rig_ptt: Optional[bool] = None
     rig_error: Optional[str] = None
+    # GUI rewrite: seconds left before the engine gives up on the current
+    # connect attempt (see RIG_CONNECT_TIMEOUT_S / _rig_connect_deadline)
+    # -- None once connected or when no attempt is in flight. Lets the
+    # status bar show a live "trying to connect (Ns)" countdown instead
+    # of silently sitting on the same text for the whole attempt, which
+    # was confirmed live as part of why a failed connect attempt read as
+    # the app doing nothing.
+    rig_connect_remaining_s: Optional[float] = None
     websdr_active: bool = False
     websdr: Optional[WebSDRStatus] = None
     fatal_error: Optional[str] = None
@@ -677,6 +685,10 @@ class SyncEngine:
             reverse_sync_held=self._reverse_sync_held,
             forward_sync_paused=self._forward_sync_paused,
             websdr_idle_stopped=self._websdr_idle_stopped,
+            rig_connect_remaining_s=(
+                max(0.0, self._rig_connect_deadline - time.monotonic())
+                if self._rig_connect_deadline is not None else None
+            ),
             **overrides,
         )
         try:

@@ -142,6 +142,13 @@ class MainFrame(wx.Frame):
         # _apply_status_snapshot).
         self._rig_active = False
         self._rig_ever_connected = False
+        # Gates the one-shot "rig connection failed" popup in
+        # _apply_status_snapshot -- reset to False on every fresh Connect
+        # click so each attempt can pop it again, and flipped True right
+        # after showing it so the popup doesn't reappear on every
+        # subsequent poll tick while the same rig_error snapshot lingers
+        # (the engine keeps publishing it until the next Connect/Disconnect).
+        self._rig_connect_error_shown = False
         self._websdr_active = False
         self._websdr_ever_connected = False
         # True from the moment Connect is clicked until the engine
@@ -292,14 +299,33 @@ class MainFrame(wx.Frame):
         sp.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
         sp.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
         sp.connect_btn.Bind(wx.EVT_BUTTON, self._on_strip_connect_clicked)
-        # GUI REWRITE IN PROGRESS: populated from KNOWN_SITES + user_sites
-        # (no background thread needed for either) -- curated/imported
-        # sites reach this combo only via Sites panel's Load (see
-        # _on_sites_panel_load), which adds the clicked entry if it's not
-        # already here.
-        sp.site_choice.Set([s.name for s in KNOWN_SITES + self._user_sites])
+        # EVT_CHOICE, not just click-time resolution -- the connect
+        # button's own label (Connect/Load/Disconnect) depends on
+        # whether the current selection matches the active site, so
+        # changing the dropdown while connected must re-derive it
+        # immediately, not just on the next status-queue tick.
+        sp.site_choice.Bind(wx.EVT_CHOICE, lambda evt: self._refresh_chrome())
+        self._refresh_strip_site_dropdown()
         selected = self._find_selectable_site_by_url(self.settings.last_site_url)
         sp.site_choice.SetStringSelection(selected.name if selected else KNOWN_SITES[0].name)
+
+    def _refresh_strip_site_dropdown(self) -> None:
+        """Populates the strip's dropdown from the FULL selectable-sites
+        list (KNOWN_SITES + user + curated + imported) -- previously
+        only KNOWN_SITES + user_sites, which meant the curated list
+        (populated by _maybe_auto_update_curated_sites()'s background
+        fetch on first run, or a Sites-panel Update-from-GitHub) never
+        actually reached the strip's own dropdown, only the Sites panel
+        itself. Confirmed live as a real regression from the pre-rewrite
+        app, where the single site dropdown always included every
+        bucket. Preserves the current selection if it's still present;
+        falls back to KNOWN_SITES[0] if the previously-selected entry
+        was removed out from under it (e.g. a curated-list replace)."""
+        sp = self.strip_panel
+        current = sp.site_choice.GetStringSelection()
+        names = [s.name for s in self._all_selectable_sites()]
+        sp.site_choice.Set(names)
+        sp.site_choice.SetStringSelection(current if current in names else KNOWN_SITES[0].name)
 
     def _wire_section_bar(self) -> None:
         for key, btn in self.section_bar.panel_buttons.items():
@@ -461,6 +487,7 @@ class MainFrame(wx.Frame):
         self.settings.save()
         self._state.mock_rig = use_mock
         self._rig_ever_connected = False
+        self._rig_connect_error_shown = False
         tp.set_connection_state(False, busy_label="Connecting...")
         self.engine.start_rig_from_other_thread(backend, host, port, use_mock)
 
@@ -716,7 +743,7 @@ class MainFrame(wx.Frame):
             self._state.sdr_active = False
             self.transceiver_panel.set_connection_state(False)
             self.transceiver_panel.mock_panel.set_enabled(False)
-            self.status_bar_panel.set_text(f"Sync engine crashed: {snap.fatal_error}")
+            self.status_bar_panel.set_text(f"Sync engine crashed: {snap.fatal_error}", colour_mode="error")
             self.status_bar_panel.set_dot_mode("disconnected")
             self._refresh_chrome()
             return
@@ -737,7 +764,9 @@ class MainFrame(wx.Frame):
             self._state.rx_hz = 0
             self._state.tx_hz = 0
             self._state.ptt = False
-        self.transceiver_panel.set_connection_state(snap.rig_active)
+        self.transceiver_panel.set_connection_state(
+            snap.rig_active, connecting=snap.rig_active and not snap.rig_connected,
+        )
 
         self._websdr_active = snap.websdr_active
         self._state.sdr_active = snap.websdr_active
@@ -767,8 +796,19 @@ class MainFrame(wx.Frame):
 
         self.transceiver_panel.mock_panel.set_enabled(self._state.sdr_connected)
 
-        text, dot_mode = self._resolve_status_bar_text(snap)
-        self.status_bar_panel.set_text(text)
+        # A rig_error while the rig has never once connected this attempt
+        # means the just-clicked Connect failed outright -- surface it as
+        # a popup, not just the muted status-bar line, which a user
+        # watching the big idle screen (not the thin bottom strip) can
+        # easily miss entirely (confirmed live: user had mock rig off and
+        # couldn't tell why the connect wasn't working). One-shot per
+        # attempt via _rig_connect_error_shown, reset on every new click.
+        if snap.rig_error and not self._rig_ever_connected and not self._rig_connect_error_shown:
+            self._rig_connect_error_shown = True
+            wx.MessageBox(snap.rig_error, "Rig connection failed", wx.OK | wx.ICON_ERROR)
+
+        text, dot_mode, colour_mode = self._resolve_status_bar_text(snap)
+        self.status_bar_panel.set_text(text, colour_mode=colour_mode)
         self.status_bar_panel.set_dot_mode(dot_mode)
 
         self._refresh_chrome()
@@ -785,20 +825,33 @@ class MainFrame(wx.Frame):
             host, port = self.settings.rigctld_host, self.settings.rigctld_port
         return f"{backend} connected — {host}:{port}"
 
-    def _resolve_status_bar_text(self, snap: StatusSnapshot) -> tuple[str, str]:
+    def _resolve_status_bar_text(self, snap: StatusSnapshot) -> tuple[str, str, str]:
         """spec §8's single-priority status line: exactly one message
         wins, in this order (per the plan's agreed precedence): fatal >
-        rig error > WebSDR error > reverse-sync error > paused >
-        reverse-sync pending > syncing. Anything that loses stays
-        log-file-only (Open log folder), not shown here -- a deliberate
-        scope reduction from the old up-to-four-simultaneous message
-        rows."""
+        rig error > still-connecting countdown > WebSDR error >
+        reverse-sync error > paused > reverse-sync pending > syncing.
+        Anything that loses stays log-file-only (Open log folder), not
+        shown here -- a deliberate scope reduction from the old
+        up-to-four-simultaneous message rows. The trailing colour_mode
+        ("error"/"connected"/"muted") lets StatusBarPanel render TRANSMIT
+        red for the error branches (otherwise a real failure looked
+        identical to routine "syncing" text -- confirmed live: user
+        missed a rig connect failure shown only here) and RECEIVE green
+        once the rig is actually connected (user-requested live: "rig
+        connected" read as just more grey status text, easy to miss).
+        The countdown branch isn't an error yet and the rig isn't
+        confirmed connected yet either, so it stays MUTED -- the honest
+        "still trying" signal that used to just silently sit there with
+        no feedback for up to RIG_CONNECT_TIMEOUT_S."""
         if snap.rig_error:
-            return f"rig error: {snap.rig_error}", "disconnected"
+            return f"rig error: {snap.rig_error}", "disconnected", "error"
+        if snap.rig_active and not snap.rig_connected and snap.rig_connect_remaining_s is not None:
+            remaining = int(snap.rig_connect_remaining_s) + 1  # ceil, never shows "0s" while still trying
+            return f"rig trying to connect ({remaining}s)", "disconnected", "muted"
         if snap.websdr_active and snap.websdr is not None and snap.websdr.last_error:
-            return f"WebSDR error: {snap.websdr.last_error}", "paused"
+            return f"WebSDR error: {snap.websdr.last_error}", "paused", "error"
         if snap.reverse_sync_error:
-            return f"reverse sync: {snap.reverse_sync_error}", "paused"
+            return f"reverse sync: {snap.reverse_sync_error}", "paused", "error"
 
         segments = [self._rig_status_text()]
         if self._state.rig_connected:
@@ -814,7 +867,8 @@ class MainFrame(wx.Frame):
             segments.append(self._state.site)
 
         dot_mode = "paused" if self._state.paused else ("syncing" if self._state.rig_connected else "disconnected")
-        return " · ".join(segments), dot_mode
+        colour_mode = "connected" if self._state.rig_connected else "muted"
+        return " · ".join(segments), dot_mode, colour_mode
 
 
     def _on_open_log_folder_clicked(self, _event=None) -> None:

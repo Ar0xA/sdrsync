@@ -53,7 +53,13 @@ class StatusBarPanel(wx.Panel):
     def set_dot_mode(self, mode: str) -> None:
         self.dot.set_mode(mode)
 
-    def set_text(self, text: str) -> None:
+    _COLOUR_MODES = {"error": theme.TRANSMIT, "connected": theme.RECEIVE, "muted": theme.MUTED}
+
+    def set_text(self, text: str, colour_mode: str = "muted") -> None:
+        colour = self._COLOUR_MODES[colour_mode]
+        if self.text.GetForegroundColour() != colour:
+            self.text.SetForegroundColour(colour)
+            self.text.Refresh()
         if self.text.GetLabel() != text:
             self.text.SetLabel(text)
             self.Layout()

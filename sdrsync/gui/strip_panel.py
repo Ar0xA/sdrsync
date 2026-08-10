@@ -5,8 +5,6 @@ scope) undock icon.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
-
 import wx
 
 from . import theme
@@ -331,7 +329,20 @@ class StripPanel(wx.Panel):
 
         self.mute_btn.SetValue(state.mute_on_tx)
 
-        self.connect_btn.SetLabel("Disconnect" if state.sdr_connected else "Connect")
-        self.connect_btn.SetPrimary(not state.sdr_connected)
+        # Three states, not two -- while a WebSDR session is active, the
+        # button reads "Disconnect" only if the dropdown still points at
+        # the site that's actually loaded; if the user has since picked
+        # a DIFFERENT site, it reads "Load" instead (matches
+        # _on_strip_connect_clicked's own same-site check exactly, which
+        # already supports switching in one click -- this was previously
+        # always "Disconnect" regardless of the dropdown, so switching
+        # sites silently required a manual disconnect-then-reconnect).
+        if not state.sdr_active:
+            self.connect_btn.SetLabel("Connect")
+            self.connect_btn.SetPrimary(True)
+        else:
+            same_site = self.site_choice.GetStringSelection() == state.site
+            self.connect_btn.SetLabel("Disconnect" if same_site else "Load")
+            self.connect_btn.SetPrimary(not same_site)
 
         self.Layout()
