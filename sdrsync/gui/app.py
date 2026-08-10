@@ -52,6 +52,9 @@ from sdrsync.config import (
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui import theme
 from sdrsync.gui.fonts import load_fonts
+from sdrsync.gui.section_bar import SectionBar
+from sdrsync.gui.state import AppState
+from sdrsync.gui.strip_panel import StripPanel
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
 from sdrsync.gui.webview_host import (
     WebViewHost, bring_pair_to_front, clamp_size_to_display, has_display_at, on_screen_pos_for_monitor,
@@ -299,6 +302,12 @@ class MainFrame(wx.Frame):
 
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
+        # GUI REWRITE IN PROGRESS: one AppState instance, mutated directly
+        # by the temporary click handlers below until phase 8 replaces
+        # this with build_app_state() driven by real StatusSnapshots. See
+        # sdrsync/gui/state.py.
+        self._state = AppState(mute_on_tx=self.settings.mute_on_tx, mock_rig=self.settings.use_mock_rig)
+
         self._build_widgets()
         self._restore_main_window_geometry()
 
@@ -425,11 +434,13 @@ class MainFrame(wx.Frame):
         panels in phase 5; deleted in the phase 10 cleanup pass)."""
         root = wx.BoxSizer(wx.VERTICAL)
 
-        self.strip_panel = _PlaceholderBand(self, "StripPanel", height=theme.STRIP_HEIGHT)
+        self.strip_panel = StripPanel(self)
         root.Add(self.strip_panel, 0, wx.EXPAND)
+        self._wire_strip_panel()
 
-        self.section_bar = _PlaceholderBand(self, "SectionBar", height=theme.SECTION_BAR_HEIGHT, fill=theme.PANEL_ALT)
+        self.section_bar = SectionBar(self)
         root.Add(self.section_bar, 0, wx.EXPAND)
+        self._wire_section_bar()
 
         # SettingsHost starts hidden (spec §5: "folds away once the rig
         # is connected... never occupies vertical space unless the user
@@ -449,6 +460,69 @@ class MainFrame(wx.Frame):
         root.Add(self.status_bar_panel, 0, wx.EXPAND)
 
         self.SetSizer(root)
+        self._refresh_chrome()
+
+    def _refresh_chrome(self) -> None:
+        """Pushes self._state to every chrome band that's real so far
+        (StripPanel/SectionBar; ReceiverHost/StatusBarPanel join once
+        their own phases land). One call after any state mutation --
+        matches the "no-op tick costs nothing" discipline each
+        refresh(state) individually keeps."""
+        self.strip_panel.refresh(self._state)
+        self.section_bar.refresh(self._state)
+
+    def _wire_strip_panel(self) -> None:
+        sp = self.strip_panel
+        sp.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
+        sp.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
+        sp.connect_btn.Bind(wx.EVT_BUTTON, self._on_strip_connect_clicked)
+        # GUI REWRITE IN PROGRESS: real site list + real Connect (engine)
+        # land in phases 5-6 -- populate with KNOWN_SITES now so the
+        # combo isn't empty, but selecting/connecting is demo-only (see
+        # _on_strip_connect_clicked) until then.
+        sp.site_choice.Set([s.name for s in KNOWN_SITES])
+        sp.site_choice.SetSelection(0)
+
+    def _wire_section_bar(self) -> None:
+        for key, btn in self.section_bar.panel_buttons.items():
+            btn.Bind(wx.EVT_TOGGLEBUTTON, lambda evt, k=key: self._on_section_panel_toggled(k))
+
+    def _on_pause_toggled(self, _evt: wx.CommandEvent) -> None:
+        # GUI REWRITE IN PROGRESS: flips the display flag only -- phase 8
+        # replaces this with a real call to
+        # engine.set_forward_sync_paused_from_other_thread(), reading the
+        # displayed value back from the next StatusSnapshot rather than
+        # setting it optimistically here.
+        self._state.paused = not self._state.paused
+        self._refresh_chrome()
+
+    def _on_strip_mute_toggled(self, _evt: wx.CommandEvent) -> None:
+        self._state.mute_on_tx = not self._state.mute_on_tx
+        self.settings.mute_on_tx = self._state.mute_on_tx
+        self.settings.save()
+        self._refresh_chrome()
+
+    def _on_strip_connect_clicked(self, _evt: wx.CommandEvent) -> None:
+        # GUI REWRITE IN PROGRESS: demo-only toggle so the Connect/
+        # Disconnect visual states (spec §3 item 11) can be exercised
+        # before the real WebView/engine wiring lands in phase 6.
+        self._state.sdr_connected = not self._state.sdr_connected
+        if self._state.sdr_connected:
+            self._state.site = self.strip_panel.site_choice.GetStringSelection()
+            self._state.sdr_hz = self._state.rx_hz
+        else:
+            self._state.site = ""
+        self._refresh_chrome()
+
+    def _on_section_panel_toggled(self, key: str) -> None:
+        self._state.open_panel = None if self._state.open_panel == key else key
+        # GUI REWRITE IN PROGRESS: settings_host is still a placeholder
+        # (phase 5 gives it real per-panel content) -- toggle its
+        # visibility now so the fold/unfold mechanic and SectionBar's
+        # hint text are both verifiable ahead of that.
+        self.settings_host.Show(self._state.open_panel is not None)
+        self.Layout()
+        self._refresh_chrome()
 
     def _build_websdr_panel(self, parent: wx.Window, outer: wx.BoxSizer) -> None:
         grid = wx.GridBagSizer(vgap=2, hgap=6)
