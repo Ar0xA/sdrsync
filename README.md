@@ -27,13 +27,16 @@ mid-transmission.
 
 Two controls sit on top of that, both in your hands:
 
-- **Hold (WebSDR read-only)** — a toggle in the WebSDR panel that pauses
-  the reverse direction outright. Forward sync (rig → WebSDR) keeps
-  working and nothing disconnects; the page simply stops being able to
-  move your rig. It's session-only: it does **not** persist, and every
-  launch starts with it off, so it's a deliberate "for right now" control,
-  not a setting you can configure once and forget. A write already on its
-  way to the rig when you press it may still complete once — it can't be
+- **Sync direction** — a dropdown in the Behaviour settings panel.
+  Choosing **Rig → WebSDR** pauses the reverse direction outright (the
+  old "Hold" checkbox, renamed); **Rig ↔ WebSDR (reverse within range)**
+  is the default, bidirectional behavior. Forward sync (rig → WebSDR)
+  keeps working either way and nothing disconnects — the page simply
+  stops being able to move your rig while one-way is selected. It's
+  session-only: it does **not** persist, and every launch starts
+  bidirectional, so it's a deliberate "for right now" control, not a
+  setting you can configure once and forget. A write already on its way
+  to the rig when you switch it may still complete once — it can't be
   recalled mid-send.
 - **Reverse-sync range (Hz)** — an optional min/max in the Transceiver
   panel. A reverse push whose rig-side frequency falls outside it is
@@ -67,9 +70,9 @@ actual WebSDR page and drives it by calling the site's own JavaScript
 control functions. This means:
 
 - **Audio just works** — it's genuine audio from a genuine browser engine
-  through your normal audio output device, not a reimplemented codec. This
-  is true even with the browser window hidden (see "Hidden window mode"
-  below).
+  through your normal audio output device, not a reimplemented codec.
+  The receiver is embedded directly in the main window (no separate
+  popup), so there's nothing to hide or lose track of.
 - **No separate browser install step** — unlike an earlier version of this
   project (which used Playwright/Chromium, requiring a
   `playwright install chromium` download), the embedded WebView2 engine
@@ -91,7 +94,7 @@ control functions. This means:
     Automatically switching profiles to follow a rig frequency outside the
     *currently active* profile's range isn't implemented yet — a
     frequency outside range is reported clearly (same as an unsupported
-    mode: logged, shown in the WebSDR panel, frequency/mode sync elsewhere
+    mode: logged, shown in the status bar, frequency/mode sync elsewhere
     unaffected) rather than silently dropped or retried forever.
   - **OpenWebRX mute-on-TX**: uses the page's own mute toggle
     (`toggleMute()`), confirmed working live — unlike the other two
@@ -128,30 +131,31 @@ control functions. This means:
       itself, preserving any query string so an UberSDR share link lands
       where it says.
     - **If the operator has switched the API off** (their SDR Control panel →
-      *Browser bridge*), the page says so explicitly and the WebSDR panel
-      reports that, rather than showing a timeout that looks like a broken
-      site.
+      *Browser bridge*), the page says so explicitly and sdrsync surfaces
+      that in the status bar, rather than showing a timeout that looks
+      like a broken site.
 - Pasting an arbitrary WebSDR URL doesn't require knowing which software
-  it runs: pick **Custom URL...** in the site dropdown, paste the URL, and
-  click **Detect** — sdrsync fetches the page's HTML and checks its
-  `<script src="...">` tags against each registered driver's known marker
-  filename(s) (e.g. `websdr-base.js` for websdr.org, `kiwisdr.min.js` for
-  KiwiSDR, `compiled/receiver.js` for OpenWebRX). If the site doesn't
-  match any known driver, or matches more than one (ambiguous), Detect
-  reports that rather than guessing.
-- **The rig connection and the WebSDR connection are two fully independent
-  subsystems, each with its own Connect in its own panel** — not one
-  combined session. Picking a different WebSDR has nothing to do with
-  your transceiver, so it never touches the rigctld connection (or vice
-  versa): connect to your rig once and leave it running, then freely
-  switch which WebSDR you're listening through — while connected, the
-  same button relabels to **Load** the moment you pick a different site
-  in the dropdown, and swaps the browser content in place (no window
-  flicker, your transceiver connection completely untouched); it reads
-  **Disconnect** again once the dropdown matches whatever's active. If
-  rigctld drops, it reconnects with backoff while the WebSDR keeps
-  running unaffected, and vice versa if the WebSDR page fails to load or
-  becomes incompatible — each panel shows its own status and last error
+  it runs: in the **SITES** settings tab, paste the URL into the Add-a-site
+  form and click **Detect** — sdrsync fetches the page's HTML and checks
+  its `<script src="...">` tags against each registered driver's known
+  marker filename(s) (e.g. `websdr-base.js` for websdr.org,
+  `kiwisdr.min.js` for KiwiSDR, `compiled/receiver.js` for OpenWebRX). If
+  the site doesn't match any known driver, or matches more than one
+  (ambiguous), Detect reports that rather than guessing.
+- **The rig connection and the WebSDR connection are two fully
+  independent subsystems** — not one combined session. Picking a
+  different WebSDR has nothing to do with your transceiver, so it never
+  touches the rigctld/flrig connection (or vice versa): connect to your
+  rig once (Transceiver settings tab) and leave it running, then freely
+  switch which WebSDR you're listening through from the top strip's own
+  dropdown — while connected, the same button relabels to **Load** the
+  moment you pick a different site, and swaps the embedded receiver's
+  content in place (no popup, no flicker, your transceiver connection
+  completely untouched); it reads **Disconnect** again once the dropdown
+  matches whatever's active. If rigctld/flrig drops, it reconnects with
+  backoff while the WebSDR keeps running unaffected, and vice versa if
+  the WebSDR page fails to load or becomes incompatible — the status bar
+  and each settings tab show their own status and last error
   independently.
 - Frequency **and** mode both sync, independently of each other. If your
   rig reports a mode this particular WebSDR driver has no equivalent for,
@@ -160,6 +164,8 @@ control functions. This means:
   supported one.
 
 ## Install
+
+**Windows / macOS:**
 
 ```bash
 pip install -r requirements.txt
@@ -170,6 +176,22 @@ Or, as an editable install (also registers an `sdrsync` command):
 ```bash
 pip install -e .
 ```
+
+**Linux:** `pip install`ing wxPython on Linux falls back to a slow,
+often-failing source build — PyPI ships no manylinux wheels for it.
+`requirements.txt`/`pyproject.toml` both skip wxPython on Linux for this
+reason; install your distro's package instead, *then* install the rest:
+
+```bash
+# Debian/Ubuntu -- package names confirmed working during this project's
+# own testing (Debian 12):
+sudo apt install python3-wxgtk4.0 python3-wxgtk-webview4.0 libwebkit2gtk-4.1-0
+pip install -r requirements.txt   # skips wxPython automatically on Linux
+```
+
+On another distro, install its equivalent wxPython + WebView (WebKitGTK
+4.1) packages. If sdrsync still can't find a working WebView backend at
+startup, the error message names the exact packages it's missing.
 
 ## Run
 
@@ -188,69 +210,41 @@ pip install -e .
    ```bash
    python -m sdrsync.main
    ```
-3. The **Transceiver** panel and the **WebSDR** panel each have their own
-   independent **Connect**/**Test** buttons — use them in either order.
-   **Test** checks reachability (a rigctld TCP connect or a flrig XML-RPC
-   probe, depending on the selected backend; an HTTP GET for the WebSDR
-   URL) without actually connecting/launching a browser.
-4. In the WebSDR panel, pick a site from the dropdown (or **Custom URL...**
-   + **Detect**) and click **Connect** (only enabled once the transceiver
-   is actually connected, not just mid-handshake). To switch to a
-   different WebSDR later, pick a new site in the dropdown — the button
-   relabels to **Load** and swaps the browser content in place without
-   disconnecting, closing, or reopening the window. Picking the
-   currently-active site back in the dropdown relabels the button to
-   **Disconnect**, which ends the WebSDR side only — use the Transceiver
-   panel's own button to end the rig connection. The dropdown restores
+3. **Transceiver settings** (click the **TRANSCEIVER** tab under the top
+   strip) has its own **Test**/**Connect** buttons. **Test** checks
+   reachability (a rigctld TCP connect or a flrig XML-RPC probe,
+   depending on the selected backend) without actually connecting.
+4. Once the transceiver is connected, pick a site from the dropdown in
+   the top strip and click **Connect** there (only enabled once the
+   transceiver is actually connected, not just mid-handshake) — the
+   receiver embeds directly in the main window, no separate popup.
+   To switch to a different WebSDR later, pick a new site in the
+   dropdown and click the same button — it relabels to **Load** and
+   swaps the embedded receiver's content in place, without
+   disconnecting or reopening anything. Picking the currently-active
+   site back in the dropdown relabels the button to **Disconnect**,
+   which ends the WebSDR side only — use the Transceiver settings'
+   own button to end the rig connection. The dropdown restores
    whichever site you last connected to on the next launch.
-
-### Hidden window mode
-
-Check **Hide browser window (audio still plays)** before connecting to run
-without a visible browser window on screen. sdrsync keeps its WebView
-window positioned far off any screen while genuinely shown (not
-minimized/hidden, which suspends WebView2's rendering and audio) —
-this keeps the real audio pipeline intact while showing nothing on
-screen.
-
-### Window size, position, and idle behavior
-
-The WebSDR browser window remembers its own size and position
-separately per WebSDR *software family* (websdr.org, KiwiSDR, OpenWebRX,
-...), restoring it the next time you connect to that type — a KiwiSDR
-window you left large on a second monitor comes back there, independent
-of wherever you last left an OpenWebRX window. The very first time a
-given type has nothing remembered yet, it opens on whichever monitor
-sdrsync's own main window is currently on. The main sdrsync window
-itself remembers its own *position* the same way (not size — its height
-is computed automatically from what's actually showing, e.g. whether
-the Mock Rig Control panel is visible, so it isn't user-resizable). In
-both cases, if the remembered position was on a monitor that's no
-longer connected (a laptop undocked, a display unplugged since), it
-falls back to whatever monitor is available instead of landing
-somewhere unreachable.
-
-When there's no active WebSDR connection at all — at startup, or after a
-disconnect — the WebSDR browser window is hidden outright (not just
-moved off-screen) rather than sitting empty on screen or in the
-taskbar. It reappears, positioned above the main window, the moment you
-connect. Clicking the WebSDR window's own close (X) button disconnects
-that session, the same as the **Disconnect** button — it doesn't just
-refuse to close. Loading a different site into an already-open window
-(see above) never touches this hide/show behavior at all.
+5. To add a site that isn't already in the dropdown, open the **SITES**
+   tab: fill in a Name and URL, click **Detect** to identify which
+   WebSDR software it runs, then **Save to list** (or **Test** first to
+   check it's reachable). The **More ▾** menu next to the saved-sites
+   list can also load a site list from a local file or a URL, or
+   refresh the curated list from GitHub.
 
 ### Idle disconnect
 
 By default, sdrsync disconnects the WebSDR session after 60 minutes of
 no rig activity at all (no frequency/mode/PTT change) and reconnects
-automatically the instant you touch the rig again — the panel shows
-**"disconnected (idle)"** when this happens, not an error. This isn't a
-bug: most WebSDR receivers are volunteer-run, shared infrastructure with
-a small number of concurrent-listener slots, and holding one open
-indefinitely while you've stepped away from the radio denies it to
-someone else. Change the threshold, or clear the field (or set it to 0)
-to disable it and hold the connection forever, via the **Idle disconnect
-(min)** field in the WebSDR panel.
+automatically the instant you touch the rig again — the status bar
+shows this as a paused/idle state, not an error. This isn't a bug: most
+WebSDR receivers are volunteer-run, shared infrastructure with a small
+number of concurrent-listener slots, and holding one open indefinitely
+while you've stepped away from the radio denies it to someone else.
+Change the threshold, or set it to **0** to disable it and hold the
+connection forever, via the **Idle disconnect (min)** field in the
+**BEHAVIOUR** settings tab.
 
 ### Poll interval
 
@@ -263,16 +257,18 @@ traffic. Takes effect immediately, no reconnect needed.
 
 ### Testing without real hardware
 
-Check **Use mock rig (embedded, for testing)** before connecting: sdrsync
-starts its own tiny in-process server speaking whichever backend is
-selected (rigctld's line protocol, or flrig's XML-RPC interface) --
-bound to the host/port you'd otherwise point at the real thing, host
-field forced to `127.0.0.1` and locked while this is checked -- and a
-**Mock Rig Control** panel appears once connected, letting you set
-frequency, mode + passband, and PTT directly from the app and watch the
-(real, headed) WebSDR tab follow — no separate terminal or real radio
-needed. The panel only ever appears in mock mode, so a real-rig run
-never shows controls that look like they drive a real radio.
+Check **Use mock rig (embedded, for testing)** in the Transceiver
+settings tab before connecting: sdrsync starts its own tiny in-process
+server speaking whichever backend is selected (rigctld's line protocol,
+or flrig's XML-RPC interface) -- bound to the host/port you'd otherwise
+point at the real thing, host field forced to `127.0.0.1` and locked
+while this is checked -- and a **Mock Rig Control** panel appears below
+it once the rig is connected, letting you set frequency, mode +
+passband, and PTT directly from the app and watch the embedded WebSDR
+follow. Its freq/mode/PTT fields stay disabled until a WebSDR is also
+connected (there's nothing for them to reach before then); the panel
+only ever appears in mock mode at all, so a real-rig run never shows
+controls that look like they drive a real radio.
 
 `sdrsync/rig/fake_rigctld.py` also still works standalone, if you'd rather
 drive it from a terminal instead of the GUI panel:
@@ -313,7 +309,7 @@ It listens on `127.0.0.1:4532` and gives you a small prompt (`f <hz>`,
 3. Add a `WebSDRSite(name=..., url=..., driver_type=...)` entry to
    `KNOWN_SITES` in `sdrsync/config.py`, and optionally to
    `sites/websdr_sites.json` (the curated list the app can auto-fetch from
-   GitHub — see the "Manage sites..." dialog).
+   GitHub — see the Sites settings tab's **More ▾ → Update from GitHub**).
 4. Add tests following the existing per-driver pattern (e.g.
    `tests/test_kiwisdr_mode_mapping.py`, `tests/test_kiwisdr_reverse_mode_mapping.py`):
    pure hamlib-mode-mapping tests for both directions, and a stub-page test
@@ -345,9 +341,18 @@ GPL-3.0-only — see [LICENSE](LICENSE).
 ## Platform support
 
 - **Windows**: fully supported, packaged builds released as zips (Edge
-  WebView2 as the embedded browser).
-- **Linux**: supported, packaged builds also released as tarballs
-  (WebKitGTK as the embedded browser). Live-verified inside WSL2/WSLg
+  WebView2 as the embedded browser) — see
+  [Releases](https://github.com/Ar0xA/sdrsync/releases) for a ready-to-run
+  `SDRSync-vX.Y.Z-windows.zip` (unzip, run `SDRSync.exe`, no Python
+  needed).
+- **Linux**: supported, but currently **run from source only** — no
+  packaged tarball has shipped since v1.1.0. Install the distro
+  wxPython/WebKitGTK packages (see "Install" above), then launch the
+  same way as any platform:
+  ```bash
+  python -m sdrsync.main
+  ```
+  (WebKitGTK is the embedded browser.) Live-verified inside WSL2/WSLg
   only — not yet run on a bare-metal Linux desktop or a non-GNOME/non-
   XWayland compositor.
 - **macOS**: best-effort code path only, **never run on an actual Mac**
