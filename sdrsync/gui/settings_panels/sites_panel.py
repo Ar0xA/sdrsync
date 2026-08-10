@@ -171,6 +171,16 @@ class SitesPanel(wx.Panel):
     def _all_sites(self) -> list[WebSDRSite]:
         return KNOWN_SITES + self._user_sites + self._curated_sites + self._imported_sites
 
+    def sync_from_settings(self) -> None:
+        """Reloads user/curated/imported from AppSettings and rebuilds
+        the row list -- called by MainFrame after anything outside this
+        panel changes one of those buckets (currently just the
+        background curated-site auto-fetch on first run)."""
+        self._user_sites = [_site_from_dict(d) for d in self.settings.user_sites]
+        self._curated_sites = [_site_from_dict(d) for d in self.settings.curated_sites]
+        self._imported_sites = [_site_from_dict(d) for d in self.settings.imported_sites]
+        self._rebuild_rows()
+
     def _rebuild_rows(self) -> None:
         self.rows_sizer.Clear(delete_windows=True)
         deletable_urls = {s.url for s in self._user_sites}

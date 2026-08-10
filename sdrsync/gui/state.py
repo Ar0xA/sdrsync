@@ -15,6 +15,18 @@ from typing import Optional
 class AppState:
     rig_connected: bool = False
     sdr_connected: bool = False
+    # Not in spec §10's literal field list -- a real engineering
+    # necessity found during phase 6 verification: True from the moment
+    # a WebSDR connect/switch is requested, before the page confirms
+    # connected. ReceiverHost needs this (not sdr_connected) to decide
+    # when to show ReceiverLive, because the wx.html2.WebView widget
+    # must already be part of the visible window tree (nonzero size, a
+    # real HWND) for WebView2 to initialize correctly -- confirmed live:
+    # creating it while ReceiverLive was still hidden (waiting for
+    # sdr_connected) produced "Invalid window handle"/DPI-query errors
+    # from wx's own MSW backend. Mirrors the rig_active/rig_connected
+    # distinction the rest of the app already uses for the same reason.
+    sdr_active: bool = False
     # Always False this rewrite -- spec §9 (compact bar/undock) is out
     # of scope; kept as a real field so panels can already read it the
     # way they will once undock exists.

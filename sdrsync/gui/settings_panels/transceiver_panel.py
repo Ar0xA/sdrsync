@@ -128,11 +128,10 @@ class TransceiverPanel(wx.Panel):
         self.connect_btn = FlatButton(self, "Connect", is_primary=True)
         self.test_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_test and self.on_test())
         self.connect_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_connect and self.on_connect())
-        # GUI REWRITE IN PROGRESS: real engine wiring lands in phase 6.
+        # GUI REWRITE IN PROGRESS: Test (a preflight-check call) is wired
+        # up in a later phase; Connect/Disconnect is real (phase 6).
         self.test_btn.Enable(False)
-        self.connect_btn.Enable(False)
         self.test_btn.SetToolTip("Wired up in a later phase of the GUI rewrite")
-        self.connect_btn.SetToolTip("Wired up in a later phase of the GUI rewrite")
         btn_box.Add(self.test_btn, 0, wx.RIGHT, self.FromDIP(9))
         btn_box.Add(self.connect_btn, 0)
         row1.Add(field("", btn_box), 0, wx.ALIGN_BOTTOM)
@@ -150,9 +149,9 @@ class TransceiverPanel(wx.Panel):
         row2.Add(self.poll_status_text, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(18))
         outer.Add(row2, 0, wx.TOP, self.FromDIP(14))
 
-        self._mock_panel = _MockRigPanel(self)
-        outer.Add(self._mock_panel, 0, wx.EXPAND | wx.TOP, self.FromDIP(14))
-        self._mock_panel.Show(settings.use_mock_rig)
+        self.mock_panel = _MockRigPanel(self)
+        outer.Add(self.mock_panel, 0, wx.EXPAND | wx.TOP, self.FromDIP(14))
+        self.mock_panel.Show(settings.use_mock_rig)
 
         # spec §5's "18px top / 16px sides / 20px bottom" padding, via a
         # side border on the outer sizer plus explicit top/bottom spacers
@@ -164,6 +163,20 @@ class TransceiverPanel(wx.Panel):
         outer.InsertSpacer(0, pad_top)
 
         self._refresh_poll_status()
+
+    def set_connection_state(self, active: bool, busy_label: Optional[str] = None) -> None:
+        """Called by MainFrame from real StatusSnapshots (and
+        optimistically, with a busy_label, right after a click) --
+        active=True means a rig session has been started (may still be
+        connecting), matching StatusSnapshot.rig_active."""
+        self.connect_btn.SetLabel(busy_label if busy_label is not None else ("Disconnect" if active else "Connect"))
+        self.connect_btn.Enable(busy_label is None)
+        self.connect_btn.SetPrimary(not active)
+        editable = not active
+        self.backend_choice.Enable(editable)
+        self.port_entry.Enable(editable)
+        self.host_entry.Enable(editable and not self.mock_rig_check.GetValue())
+        self.mock_rig_check.Enable(editable)
 
     def _populate_host_port_for_backend(self, backend: str) -> None:
         if backend == "flrig":
@@ -211,7 +224,7 @@ class TransceiverPanel(wx.Panel):
         self.settings.use_mock_rig = self.mock_rig_check.GetValue()
         self.settings.save()
         self.host_entry.Enable(not self.settings.use_mock_rig)
-        self._mock_panel.Show(self.settings.use_mock_rig)
+        self.mock_panel.Show(self.settings.use_mock_rig)
         self._refresh_poll_status()
         self.Layout()
         top = self.GetTopLevelParent()

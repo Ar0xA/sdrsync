@@ -52,6 +52,7 @@ from sdrsync.config import (
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui import theme
 from sdrsync.gui.fonts import load_fonts
+from sdrsync.gui.receiver_host import ReceiverHost
 from sdrsync.gui.section_bar import SectionBar
 from sdrsync.gui.settings_host import SettingsHost
 from sdrsync.gui.settings_panels.behaviour_panel import BehaviourPanel
@@ -60,9 +61,7 @@ from sdrsync.gui.settings_panels.transceiver_panel import TransceiverPanel
 from sdrsync.gui.state import AppState
 from sdrsync.gui.strip_panel import StripPanel
 from sdrsync.gui.site_manager_dialog import SiteManagerDialog
-from sdrsync.gui.webview_host import (
-    WebViewHost, bring_pair_to_front, clamp_size_to_display, has_display_at, on_screen_pos_for_monitor,
-)
+from sdrsync.gui.webview_host import WebViewHost, bring_pair_to_front, has_display_at
 from sdrsync.logging_setup import LOG_FILE
 from sdrsync.resources import ICON_PATH
 from sdrsync.preflight import (
@@ -205,17 +204,11 @@ class MainFrame(wx.Frame):
         else:
             logger.warning("App icon not found at %s", ICON_PATH)
         self.settings = settings
+        # GUI REWRITE: WebViewHost no longer owns a separate popup frame
+        # (spec §6.1 inline embedding) -- attach() is called once
+        # ReceiverHost/ReceiverLive exist, inside _build_widgets(); no
+        # frame-visibility/close-routing setup needed here any more.
         self._webview_host = webview_host
-        # No WebSDR connection exists yet at startup -- hide the (empty)
-        # WebSDR window immediately rather than leaving it sitting on
-        # screen/in the taskbar until the first Connect. Symmetric with
-        # the show/hide calls around connect/disconnect below.
-        self._webview_host.set_frame_visible(False)
-        # The WebSDR window's own close (X) button is otherwise always
-        # vetoed (see WebViewHost.__init__) since the frame itself must
-        # never actually be destroyed mid-session -- but a user clicking
-        # it clearly means "disconnect this", not "do nothing".
-        self._webview_host.on_close_requested = self._on_websdr_window_close_requested
 
         self.status_queue: "queue.Queue[GuiMessage]" = queue.Queue()
         self.rig_test_thread: Optional[threading.Thread] = None
@@ -296,8 +289,18 @@ class MainFrame(wx.Frame):
         # GetLabel() can't be used for this.
         self._message_text: dict[wx.StaticText, str] = {}
 
+        # GUI REWRITE IN PROGRESS: StatusSnapshot now dispatches to the
+        # new _apply_status_snapshot() (drives AppState), NOT the old
+        # ~150-line _apply_snapshot() below (still defined, still bound
+        # to dead pre-rewrite widgets -- kept as reference for the phase
+        # 10 cleanup, never called). The other three entries stay bound
+        # to their original (also-currently-dead) handlers: nothing posts
+        # RigPreflightResult/WebsdrPreflightResult/DetectResult yet
+        # (Test/Detect are still deferred -- see settings_panels/), and
+        # SiteListFetchResult only fires if _maybe_auto_update_curated_sites()
+        # is re-enabled (it isn't).
         self._dispatch: dict[type, Callable[[GuiMessage], None]] = {
-            StatusSnapshot: self._apply_snapshot,
+            StatusSnapshot: self._apply_status_snapshot,
             RigPreflightResult: self._apply_rig_preflight,
             WebsdrPreflightResult: self._apply_websdr_preflight,
             DetectResult: self._apply_detect_result,
@@ -315,23 +318,35 @@ class MainFrame(wx.Frame):
             mock_rig=self.settings.use_mock_rig,
             sync_tx_vfo=self.settings.sync_tx_vfo,
         )
+        # Optimistic "Connecting.../Disconnecting.../Loading..." override
+        # for StripPanel's connect button while a WebSDR connect/switch/
+        # disconnect is in flight -- see _refresh_chrome(). None means
+        # "derive the label from self._state.sdr_connected as normal".
+        self._strip_connect_busy_label: Optional[str] = None
 
         self._build_widgets()
         self._restore_main_window_geometry()
+        # GUI REWRITE IN PROGRESS: _restore_custom_site_if_needed() still
+        # references self.site_combo/self.custom_url_entry/
+        # self.detect_result_text, which the new StripPanel/SettingsHost
+        # skeleton doesn't build (Custom URL entry lives in SitesPanel's
+        # Add-a-site form, not wired to Detect yet -- see sites_panel.py).
+        # Deferred to a later phase alongside Detect. Real, non-Custom-URL
+        # sites (the overwhelming common case) are unaffected: their
+        # names resolve fine via _find_selectable_site_by_url() inside
+        # _wire_strip_panel() above.
+        self._maybe_auto_update_curated_sites()
 
-        # GUI REWRITE IN PROGRESS (branch gui-pixel-perfect-redesign):
-        # engine/thread/timer construction and the old
-        # _restore_custom_site_if_needed()/_maybe_auto_update_curated_sites()
-        # calls are deferred until the new Sites panel + inline WebView
-        # land (plan phases 5-6) -- both reference widgets
-        # (self.site_combo, self.custom_url_entry, ...) that the new
-        # StripPanel/SettingsHost skeleton doesn't build yet. Until then
-        # these three stay None and _on_close()/_poll_status_queue() no-op
-        # on that. See project_brief.md's "GUI pixel-perfect rewrite"
-        # section for the full phase plan and progress log.
-        self.engine: Optional[SyncEngine] = None
-        self.thread: Optional[threading.Thread] = None
-        self._poll_timer: Optional[wx.Timer] = None
+        # One engine, one background thread, for the whole app session --
+        # NOT recreated per Connect click. The rig/WebSDR subsystems it
+        # owns are started/stopped independently via the buttons below.
+        self.engine = SyncEngine(self.settings, self.status_queue, webview_host=self._webview_host)
+        self.thread = threading.Thread(target=self._run_engine, args=(self.engine,), daemon=True)
+        self.thread.start()
+
+        self._poll_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._poll_status_queue, self._poll_timer)
+        self._poll_timer.Start(QUEUE_POLL_MS)
 
     def _restore_main_window_geometry(self) -> None:
         """Applies this window's own remembered POSITION from the last
@@ -454,8 +469,11 @@ class MainFrame(wx.Frame):
         root.Add(self.settings_host, 0, wx.EXPAND)
         self._build_settings_panels()
 
-        self.receiver_host = _PlaceholderBand(self, "ReceiverHost", fill=theme.BG, hairline_edge="top")
+        self.receiver_host = ReceiverHost(self)
         root.Add(self.receiver_host, 1, wx.EXPAND)
+        self._webview_host.attach(self.receiver_host.live.webview_parent)
+        self.receiver_host.idle.on_primary = self._on_idle_primary_clicked
+        self.receiver_host.idle.on_secondary = lambda: self._open_settings_panel("transceiver")
 
         self.status_bar_panel = _PlaceholderBand(
             self, "StatusBarPanel", height=theme.STATUS_BAR_HEIGHT, fill=theme.PANEL_ALT, hairline_edge="top",
@@ -467,24 +485,38 @@ class MainFrame(wx.Frame):
 
     def _refresh_chrome(self) -> None:
         """Pushes self._state to every chrome band that's real so far
-        (StripPanel/SectionBar; ReceiverHost/StatusBarPanel join once
-        their own phases land). One call after any state mutation --
-        matches the "no-op tick costs nothing" discipline each
-        refresh(state) individually keeps."""
+        (StatusBarPanel joins once its own phase lands). One call after
+        any state mutation -- matches the "no-op tick costs nothing"
+        discipline each refresh(state) individually keeps."""
         self.strip_panel.refresh(self._state)
+        if self._strip_connect_busy_label is not None:
+            # A click-site optimistic override while a connect/disconnect
+            # is in flight -- StripPanel.refresh() derives the label from
+            # state.sdr_connected alone, which hasn't flipped yet, so it
+            # would otherwise flicker back to "Connect"/"Disconnect"
+            # before the real StatusSnapshot resolves. Cleared by
+            # _apply_snapshot() once it does (mirrors the pre-rewrite
+            # _websdr_connect_pending gate).
+            self.strip_panel.connect_btn.SetLabel(self._strip_connect_busy_label)
+            self.strip_panel.connect_btn.Enable(False)
+        else:
+            self.strip_panel.connect_btn.Enable(self._state.rig_connected or self._state.sdr_connected)
         self.section_bar.refresh(self._state)
+        self.receiver_host.refresh(self._state)
 
     def _wire_strip_panel(self) -> None:
         sp = self.strip_panel
         sp.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
         sp.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
         sp.connect_btn.Bind(wx.EVT_BUTTON, self._on_strip_connect_clicked)
-        # GUI REWRITE IN PROGRESS: real site list + real Connect (engine)
-        # land in phases 5-6 -- populate with KNOWN_SITES now so the
-        # combo isn't empty, but selecting/connecting is demo-only (see
-        # _on_strip_connect_clicked) until then.
-        sp.site_choice.Set([s.name for s in KNOWN_SITES])
-        sp.site_choice.SetSelection(0)
+        # GUI REWRITE IN PROGRESS: populated from KNOWN_SITES + user_sites
+        # (no background thread needed for either) -- curated/imported
+        # sites reach this combo only via Sites panel's Load (see
+        # _on_sites_panel_load), which adds the clicked entry if it's not
+        # already here.
+        sp.site_choice.Set([s.name for s in KNOWN_SITES + self._user_sites])
+        selected = self._find_selectable_site_by_url(self.settings.last_site_url)
+        sp.site_choice.SetStringSelection(selected.name if selected else KNOWN_SITES[0].name)
 
     def _wire_section_bar(self) -> None:
         for key, btn in self.section_bar.panel_buttons.items():
@@ -505,37 +537,159 @@ class MainFrame(wx.Frame):
         self.settings.save()
         self._refresh_chrome()
 
-    def _on_strip_connect_clicked(self, _evt: wx.CommandEvent) -> None:
-        # GUI REWRITE IN PROGRESS: demo-only toggle so the Connect/
-        # Disconnect visual states (spec §3 item 11) can be exercised
-        # before the real WebView/engine wiring lands in phase 6.
-        self._state.sdr_connected = not self._state.sdr_connected
-        if self._state.sdr_connected:
-            self._state.site = self.strip_panel.site_choice.GetStringSelection()
-            self._state.sdr_hz = self._state.rx_hz
+    def _resolve_strip_selected_site(self) -> Optional[WebSDRSite]:
+        name = self.strip_panel.site_choice.GetStringSelection()
+        return next((s for s in self._all_selectable_sites() if s.name == name), None)
+
+    def _on_strip_connect_clicked(self, _evt: wx.CommandEvent = None) -> None:
+        if self.engine is None:
+            return
+        if self._websdr_active:
+            active = self._active_websdr_site
+            site = self._resolve_strip_selected_site()
+            if site is not None and active is not None and site.url == active.url:
+                self._disconnect_websdr()
+                return
+            if site is None:
+                return
+            self._begin_websdr_switch(site)
+            return
+        if not self._state.rig_connected:
+            return  # belt-and-suspenders -- the button is disabled in this state
+        site = self._resolve_strip_selected_site()
+        if site is None:
+            return
+        self._begin_websdr_connect(site)
+
+    def _begin_websdr_switch(self, site: WebSDRSite) -> None:
+        self.settings.last_site_url = site.url
+        self.settings.last_site_driver_type = site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
+        self.settings.save()
+        self._active_websdr_site = site
+        self._strip_connect_busy_label = "Loading..."
+        self._refresh_chrome()
+        self.engine.switch_websdr_from_other_thread(site)
+
+    def _begin_websdr_connect(self, site: WebSDRSite) -> None:
+        self._websdr_connect_pending = True
+        self.settings.last_site_url = site.url
+        self.settings.last_site_driver_type = site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
+        self.settings.save()
+        self._websdr_ever_connected = False
+        self._active_websdr_site = site
+        self._strip_connect_busy_label = "Connecting..."
+        self._state.sdr_active = True  # ReceiverHost must show Live now -- see AppState.sdr_active
+        self._refresh_chrome()
+        bring_pair_to_front(self)
+        self.engine.start_websdr_from_other_thread(site)
+
+    def _disconnect_websdr(self) -> None:
+        if not self._websdr_active:
+            return
+        self._websdr_connect_pending = False
+        self._strip_connect_busy_label = "Disconnecting..."
+        self._refresh_chrome()
+        self.engine.stop_websdr_from_other_thread()
+
+    def _on_idle_primary_clicked(self) -> None:
+        if not self._state.rig_connected:
+            self._on_transceiver_connect_clicked()
         else:
-            self._state.site = ""
+            self._open_settings_panel("sites")
+
+    def _open_settings_panel(self, key: Optional[str]) -> None:
+        self._state.open_panel = key
+        self.settings_host.show_panel(key)
         self._refresh_chrome()
 
     def _on_section_panel_toggled(self, key: str) -> None:
-        self._state.open_panel = None if self._state.open_panel == key else key
-        self.settings_host.show_panel(self._state.open_panel)
-        self._refresh_chrome()
+        self._open_settings_panel(None if self._state.open_panel == key else key)
 
     def _build_settings_panels(self) -> None:
         self.transceiver_panel = TransceiverPanel(self.settings_host, self.settings)
+        self.transceiver_panel.on_connect = self._on_transceiver_connect_clicked
+        self.transceiver_panel.mock_panel.on_set_freq = self._on_mock_set_freq
+        self.transceiver_panel.mock_panel.on_set_mode = self._on_mock_set_mode
+        self.transceiver_panel.mock_panel.on_ptt_toggled = self._on_mock_ptt_toggled
         self.settings_host.add_panel("transceiver", self.transceiver_panel)
 
         self.sites_panel = SitesPanel(self.settings_host, self.settings)
+        self.sites_panel.on_load_site = self._on_sites_panel_load
         self.settings_host.add_panel("sites", self.sites_panel)
 
         self.behaviour_panel = BehaviourPanel(self.settings_host, self.settings)
         self.behaviour_panel.on_sync_tx_vfo_changed = self._on_sync_tx_vfo_changed
+        self.behaviour_panel.on_sync_direction_changed = self._on_sync_direction_changed
         self.settings_host.add_panel("behaviour", self.behaviour_panel)
 
     def _on_sync_tx_vfo_changed(self, value: bool) -> None:
         self._state.sync_tx_vfo = value
         self._refresh_chrome()
+
+    def _on_sync_direction_changed(self, held: bool) -> None:
+        if self.engine is not None:
+            self.engine.set_reverse_sync_held(held)
+
+    def _on_sites_panel_load(self, site: WebSDRSite) -> None:
+        names = list(self.strip_panel.site_choice.GetStrings())
+        if site.name not in names:
+            names.append(site.name)
+            self.strip_panel.site_choice.Set(names)
+        self.strip_panel.site_choice.SetStringSelection(site.name)
+        self._open_settings_panel(None)
+        if self._websdr_active:
+            self._begin_websdr_switch(site)
+        elif self._state.rig_connected:
+            self._begin_websdr_connect(site)
+
+    # ------------------------------------------------------------------ Transceiver (real, phase 6)
+    def _on_transceiver_connect_clicked(self) -> None:
+        if self.engine is None:
+            return
+        if self._rig_active:
+            self.transceiver_panel.set_connection_state(True, busy_label="Disconnecting...")
+            self.engine.stop_rig_from_other_thread()
+            return
+        tp = self.transceiver_panel
+        backend = tp.backend_choice.GetStringSelection()
+        use_mock = tp.mock_rig_check.GetValue()
+        # A mock rig only ever exists on loopback -- ignore whatever's
+        # typed in the host field rather than silently trying to bind a
+        # mock server to some other address.
+        host = "127.0.0.1" if use_mock else (tp.host_entry.GetValue().strip() or "127.0.0.1")
+        port = tp.port_entry.GetValue()
+        if backend == "flrig":
+            self.settings.flrig_host, self.settings.flrig_port = host, port
+        else:
+            self.settings.rigctld_host, self.settings.rigctld_port = host, port
+        self.settings.rig_backend = backend
+        self.settings.use_mock_rig = use_mock
+        self.settings.save()
+        self._state.mock_rig = use_mock
+        self._rig_ever_connected = False
+        tp.set_connection_state(False, busy_label="Connecting...")
+        self.engine.start_rig_from_other_thread(backend, host, port, use_mock)
+
+    def _on_mock_set_freq(self, text: str) -> None:
+        if self.engine is None:
+            return
+        try:
+            self.engine.push_mock_freq(int(text.strip()))
+        except ValueError:
+            pass
+
+    def _on_mock_set_mode(self, mode: str, passband_text: str) -> None:
+        if self.engine is None:
+            return
+        try:
+            passband = int(passband_text.strip())
+        except ValueError:
+            passband = 2400
+        self.engine.push_mock_mode(mode, passband)
+
+    def _on_mock_ptt_toggled(self, is_tx: bool) -> None:
+        if self.engine is not None:
+            self.engine.push_mock_ptt(is_tx)
 
     def _build_websdr_panel(self, parent: wx.Window, outer: wx.BoxSizer) -> None:
         grid = wx.GridBagSizer(vgap=2, hgap=6)
@@ -1053,17 +1207,6 @@ class MainFrame(wx.Frame):
             self.websdr_connect_btn.SetLabel("Load")
         self.websdr_connect_btn.Enable(True)
 
-    def _disconnect_websdr(self) -> None:
-        """The actual Disconnect, shared by the Connect/Disconnect toggle
-        button (_on_websdr_connect_clicked, when already active) and the
-        WebSDR popup's own X button (_on_websdr_window_close_requested)."""
-        if not self._websdr_active:
-            return  # belt-and-suspenders -- callers already guard this too
-        self._websdr_connect_pending = False
-        self.websdr_connect_btn.Enable(False)
-        self.websdr_connect_btn.SetLabel("Disconnecting...")
-        self.engine.stop_websdr_from_other_thread()
-
     def _on_websdr_window_close_requested(self) -> None:
         """The WebSDR popup's own X button (see WebViewHost.on_close_requested)
         -- the frame's close is always vetoed there, so this is the only
@@ -1244,7 +1387,18 @@ class MainFrame(wx.Frame):
             WebSDRSite(name=d["name"], url=d["url"], driver_type=d["driver_type"])
             for d in self.settings.curated_sites
         ]
-        self._refresh_site_dropdown_values()
+        # GUI REWRITE: the new Sites panel keeps its own copy of the
+        # curated/imported buckets (loaded once at construction, same as
+        # this frame's own _curated_sites above) -- resync it now rather
+        # than the old _refresh_site_dropdown_values(), which targeted
+        # the removed self.site_combo. StripPanel's own chooser is
+        # intentionally NOT widened by a background auto-fetch (only by
+        # an explicit Sites-panel Load, see _on_sites_panel_load) -- it
+        # only ever needs to already contain the site the user is about
+        # to connect to, which curated entries reach via Load, not
+        # automatically.
+        if hasattr(self, "sites_panel"):
+            self.sites_panel.sync_from_settings()
         logger.info("Background curated-site auto-fetch populated %d site(s)", len(result.sites))
 
     def _restore_custom_site_if_needed(self) -> None:
@@ -1342,52 +1496,6 @@ class MainFrame(wx.Frame):
         self.websdr_test_btn.SetLabel("Test")
         self._set_message(self.websdr_preflight_text, ("OK: " if result.ok else "FAIL: ") + result.message)
 
-    def _save_current_webview_geometry(self) -> None:
-        """Remembers the WebSDR browser window's current size AND
-        position against whatever site is (still) active, keyed by
-        driver_type -- the position the user last had it at, e.g. on a
-        second monitor, so a later restore can put it straight back
-        there. A no-op if nothing is active. Call this BEFORE clearing/
-        reassigning self._active_websdr_site -- callers are the three
-        points where that site stops being current: switching to a
-        different site (_on_websdr_connect_clicked), a disconnect
-        completing of any kind including idle-disconnect
-        (_apply_snapshot), and app close (_on_close)."""
-        if self._active_websdr_site is None:
-            return
-        driver_type = self._active_websdr_site.driver_type
-        size = self._webview_host.frame.GetSize()
-        pos = self._webview_host.frame.GetPosition()
-        self.settings.webview_sizes[driver_type] = [size.width, size.height]
-        self.settings.webview_positions[driver_type] = [pos.x, pos.y]
-        self.settings.save()
-
-    def _restore_webview_geometry(self, driver_type: str) -> None:
-        """Applies the remembered window size/position for driver_type,
-        if any. Position falls back to on_screen_pos_for_monitor(self)
-        (the same monitor this control-panel window is on) both when
-        there's no remembered position yet, and when there IS one but it
-        no longer lands on any connected display (e.g. a docking
-        station's monitor got unplugged since it was saved) -- a stale
-        coordinate must not be allowed to place the frame somewhere
-        unreachable. Size falls back to leaving the frame at its current
-        size (webview_host clamps it to whichever monitor the position
-        above just picked) -- webview_host.VISIBLE_SIZE only ever applies
-        at the very first connect of a fresh app launch. Position is
-        applied first: size's clamp depends on knowing which monitor the
-        frame is headed to."""
-        pos = self.settings.webview_positions.get(driver_type)
-        target = wx.Point(pos[0], pos[1]) if pos and len(pos) == 2 else None
-        if target is not None and not has_display_at(target):
-            target = None
-        if target is None:
-            target = on_screen_pos_for_monitor(self)
-        self._webview_host.set_on_screen_position(target)
-
-        size = self.settings.webview_sizes.get(driver_type)
-        if size and len(size) == 2:
-            self._webview_host.set_size(size[0], size[1])
-
     def _on_websdr_connect_clicked(self, _event=None) -> None:
         if self._websdr_active:
             # Disconnect if the dropdown still matches what's active,
@@ -1420,79 +1528,6 @@ class MainFrame(wx.Frame):
             return
 
         self._begin_websdr_connect(site)
-
-    def _begin_websdr_switch(self, site: WebSDRSite) -> None:
-        """Loads `site` on the SAME already-open WebSDR window -- see
-        SyncEngine._switch_websdr()'s docstring for why this deliberately
-        does NOT touch set_frame_visible()/bring_to_front_over() the way
-        _begin_websdr_connect() does: the window is already visible and
-        correctly ordered, and re-doing either of those was exactly the
-        mechanism behind the z-order/visibility bugs this replaces. Only
-        ever called while _websdr_active is already True."""
-        self._save_current_webview_geometry()
-        self.settings.last_site_url = site.url
-        self.settings.last_site_driver_type = (
-            site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
-        )
-        self.settings.save()
-        self._active_websdr_site = site
-        self._restore_webview_geometry(site.driver_type)
-        self._websdr_conn_text = "connecting..."
-        self.websdr_conn_text.SetLabel("connecting...")
-        self.websdr_driver_text.SetLabel(site.driver_type)
-        self.websdr_freq_text.SetLabel("-")
-        self.websdr_mode_text.SetLabel("-")
-        self.websdr_audio_text.SetLabel("-")
-        self._set_message(self.websdr_err_text, "")
-        self.websdr_connect_btn.Enable(False)
-        self.websdr_connect_btn.SetLabel("Loading...")
-        self.engine.switch_websdr_from_other_thread(site)
-
-    def _begin_websdr_connect(self, site: WebSDRSite) -> None:
-        """The actual Connect: shows/positions the WebSDR frame and starts
-        the engine session. Only ever called with the WebSDR subsystem
-        NOT already active."""
-        self._websdr_connect_pending = True
-        self._save_current_webview_geometry()
-        self.settings.last_site_url = site.url
-        # Scoped to _find_selectable_site_by_url (the FULL dropdown, not
-        # just KNOWN_SITES+user_sites) -- a curated/imported site is
-        # already selectable by name on restart, same as a known one, so
-        # it doesn't need last_site_driver_type's synthetic Custom-URL
-        # reconstruction; only a URL absent from every list does.
-        self.settings.last_site_driver_type = (
-            site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
-        )
-        self.settings.headless = self.headless_check.GetValue()
-        self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
-        self.settings.save()
-        # Shown again before anything else touches the frame -- Connect
-        # always starts from the idle-hidden state set at startup/
-        # disconnect (see _apply_snapshot/_on_close).
-        self._webview_host.set_frame_visible(True)
-        self._webview_host.set_headless(self.settings.headless)
-
-        self._websdr_ever_connected = False
-        self._active_websdr_site = site
-        self._restore_webview_geometry(site.driver_type)
-        # Only now -- after the frame has been shown, had its headless
-        # style toggled (which internally re-shows it, resetting z-order)
-        # and been moved/resized -- is it worth settling where it sits:
-        # the WebSDR window directly over this one, and this app in front
-        # of whatever else is on the desktop. Runs synchronously inside
-        # the user's own button click, which is exactly when Windows
-        # allows a foreground change (see bring_pair_to_front()).
-        self._webview_host.bring_to_front_over(self)
-        self._websdr_conn_text = "connecting..."
-        self.websdr_conn_text.SetLabel("connecting...")
-        self.websdr_driver_text.SetLabel(site.driver_type)
-        self.websdr_freq_text.SetLabel("-")
-        self.websdr_mode_text.SetLabel("-")
-        self.websdr_audio_text.SetLabel("-")
-        self._set_message(self.websdr_err_text, "")
-        self.websdr_connect_btn.Enable(False)
-        self.websdr_connect_btn.SetLabel("Connecting...")
-        self.engine.start_websdr_from_other_thread(site)
 
     # ------------------------------------------------------------------ Transceiver panel
     def _on_mock_rig_toggled(self, _event=None) -> None:
@@ -1653,27 +1688,6 @@ class MainFrame(wx.Frame):
             # floor -- see _resize_main_window_to_content()'s docstring.
             self._resize_main_window_to_content()
 
-    def _on_mock_set_freq(self, _event=None) -> None:
-        try:
-            freq_hz = int(self.mock_freq_entry.GetValue())
-        except ValueError:
-            self._set_message(self.mock_err_text, "Frequency must be a whole number of Hz")
-            return
-        self._set_message(self.mock_err_text, "")
-        self.engine.push_mock_freq(freq_hz)
-
-    def _on_mock_set_mode(self, _event=None) -> None:
-        try:
-            passband_hz = int(self.mock_passband_entry.GetValue())
-        except ValueError:
-            self._set_message(self.mock_err_text, "Passband must be a whole number of Hz")
-            return
-        self._set_message(self.mock_err_text, "")
-        self.engine.push_mock_mode(self.mock_mode_combo.GetValue(), passband_hz)
-
-    def _on_mock_ptt_toggled(self, _event=None) -> None:
-        self.engine.push_mock_ptt(self.mock_ptt_check.GetValue())
-
     def _on_rig_test_clicked(self, _event=None) -> None:
         if self.rig_test_thread is not None and self.rig_test_thread.is_alive():
             return
@@ -1763,6 +1777,71 @@ class MainFrame(wx.Frame):
                 handler(item)
         except queue.Empty:
             pass
+
+    def _apply_status_snapshot(self, snap: StatusSnapshot) -> None:
+        """GUI REWRITE: drives AppState from a real StatusSnapshot -- the
+        phase-6 replacement for the old widget-mutating _apply_snapshot()
+        below (kept, unused, for reference until the phase 10 cleanup).
+        A full build_app_state()-style extraction (spec §8) lands in
+        phase 8 alongside the new `paused` engine flag; this is the
+        minimum needed to reconnect the engine now. Mirrors the old
+        method's _websdr_connect_pending gate exactly (see that flag's
+        own docstring above) so a stale "nothing to report" tick mid-
+        connect can't be mistaken for a real disconnect."""
+        if snap.fatal_error:
+            self._rig_active = False
+            self._websdr_active = False
+            self._websdr_connect_pending = False
+            self._strip_connect_busy_label = None
+            self._active_websdr_site = None
+            self._state.rig_connected = False
+            self._state.sdr_connected = False
+            self._state.sdr_active = False
+            self.transceiver_panel.set_connection_state(False)
+            self._refresh_chrome()
+            return
+
+        self._rig_active = snap.rig_active
+        self._state.rig_connected = bool(snap.rig_active and snap.rig_connected)
+        if snap.rig_active:
+            self._rig_ever_connected = self._rig_ever_connected or snap.rig_connected
+            self._state.rx_hz = snap.rig_freq_hz or 0
+            self._state.tx_hz = snap.rig_freq_hz or 0
+            self._state.mode = snap.rig_mode or self._state.mode
+            self._state.ptt = bool(snap.rig_ptt)
+        else:
+            self._state.rx_hz = 0
+            self._state.tx_hz = 0
+            self._state.ptt = False
+        self.transceiver_panel.set_connection_state(snap.rig_active)
+
+        self._websdr_active = snap.websdr_active
+        self._state.sdr_active = snap.websdr_active
+        if not snap.websdr_active:
+            if not self._websdr_connect_pending or snap.websdr is not None:
+                self._websdr_connect_pending = False
+                self._strip_connect_busy_label = None
+                self._active_websdr_site = None
+                self._state.sdr_connected = False
+                self._state.sdr_hz = 0
+                self._state.site = ""
+            else:
+                # Still mid-connect (pending, no explicit failure yet) --
+                # keep ReceiverHost on Live so the WebView stays part of
+                # the visible tree throughout the attempt, not just once
+                # it succeeds. See AppState.sdr_active's own docstring.
+                self._state.sdr_active = True
+        else:
+            self._websdr_connect_pending = False
+            self._strip_connect_busy_label = None
+            ws = snap.websdr
+            self._state.sdr_connected = bool(ws and ws.connected)
+            if ws is not None:
+                self._state.sdr_hz = ws.freq_hz or 0
+                if self._active_websdr_site is not None:
+                    self._state.site = self._active_websdr_site.name
+
+        self._refresh_chrome()
 
     def _apply_snapshot(self, snap: StatusSnapshot) -> None:
         # Every message row this method may touch is updated through
@@ -1939,10 +2018,6 @@ class MainFrame(wx.Frame):
         # phase 6 reconnects them (see __init__) -- nothing to stop/join
         # yet in that window.
         if self.engine is not None:
-            # Closing while connected doesn't go through _apply_snapshot's
-            # active->inactive transition (the engine thread is just killed
-            # below), so this needs its own save.
-            self._save_current_webview_geometry()
             self.engine.stop_from_other_thread()
             # A plain thread.join() here would block this thread -- but the
             # engine's own shutdown (_stop_websdr() -> WebViewHost.destroy_page())
@@ -1960,14 +2035,10 @@ class MainFrame(wx.Frame):
                 self.thread.join(timeout=0.05)
         if self._poll_timer is not None:
             self._poll_timer.Stop()
-        # The WebViewHost's frame is separate from this one and would
-        # otherwise keep the whole app alive after this window closes
-        # (wx's default "exit when no top-level windows exist" behavior
-        # only triggers once the LAST one closes) -- destroy it explicitly.
-        try:
-            self._webview_host.frame.Destroy()
-        except Exception:
-            pass
+        # GUI REWRITE: the WebView is now a child of this frame (inline
+        # embedding, spec §6.1), not a separate top-level frame -- no
+        # extra window to explicitly Destroy() any more; this frame's own
+        # Destroy() below takes the WebView with it.
         self.Destroy()
 
 
@@ -1989,7 +2060,7 @@ class SDRSyncApp(wx.App):
             return False
 
         settings = AppSettings.load()
-        host = WebViewHost(headless=settings.headless)
+        host = WebViewHost()
         frame = MainFrame(settings, host)
         self.SetTopWindow(frame)
         frame.Show(True)
