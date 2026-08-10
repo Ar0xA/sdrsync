@@ -528,12 +528,13 @@ class MainFrame(wx.Frame):
             btn.Bind(wx.EVT_TOGGLEBUTTON, lambda evt, k=key: self._on_section_panel_toggled(k))
 
     def _on_pause_toggled(self, _evt: wx.CommandEvent) -> None:
-        # GUI REWRITE IN PROGRESS: flips the display flag only -- phase 8
-        # replaces this with a real call to
-        # engine.set_forward_sync_paused_from_other_thread(), reading the
-        # displayed value back from the next StatusSnapshot rather than
-        # setting it optimistically here.
-        self._state.paused = not self._state.paused
+        # Tells the engine to flip forward-sync pause; the displayed
+        # state is read back from the next StatusSnapshot in
+        # _apply_status_snapshot, not set here -- mirrors
+        # _on_sync_direction_changed's same discipline for reverse sync,
+        # so a click can't desync from the engine's actual state.
+        if self.engine is not None:
+            self.engine.set_forward_sync_paused_from_other_thread(not self._state.paused)
         self._refresh_chrome()
 
     def _on_strip_mute_toggled(self, _evt: wx.CommandEvent) -> None:
@@ -1810,6 +1811,10 @@ class MainFrame(wx.Frame):
 
         self._rig_active = snap.rig_active
         self._state.rig_connected = bool(snap.rig_active and snap.rig_connected)
+        # Read back from the engine, never set optimistically on click --
+        # see _on_pause_toggled -- so a click can't desync the displayed
+        # state from what the engine is actually doing.
+        self._state.paused = snap.forward_sync_paused
         if snap.rig_active:
             self._rig_ever_connected = self._rig_ever_connected or snap.rig_connected
             self._state.rx_hz = snap.rig_freq_hz or 0
