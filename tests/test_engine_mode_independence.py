@@ -803,3 +803,54 @@ def test_forward_push_backoff_exponent_is_clamped():
         backoff.failures = failures - 1
         backoff.record_failure()  # must not raise
         assert backoff.next_attempt_at - time.monotonic() <= FORWARD_PUSH_BACKOFF_MAX_S + 0.5
+
+
+def test_forward_sync_paused_blocks_both_axes_and_unpausing_fires_the_pending_push():
+    """GUI rewrite's Pause sync toggle (rig -> WebSDR direction only).
+    Counterpart of test_engine_reverse_sync.py's
+    test_reverse_sync_held_suppresses_the_whole_reverse_tick(), for the
+    forward direction. Pending freq/mode bookkeeping must keep
+    accumulating while paused (no latch-clearing, unlike Hold) so
+    unpausing fires an immediate corrective push through the ordinary
+    debounce/threshold check rather than needing a resume step of its
+    own."""
+    engine = make_engine()
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig = stub_rig
+    engine._rig_active = True
+    engine._driver = stub_driver
+    engine._websdr_active = True
+    engine._forward_sync_paused = True
+
+    async def run_while_paused_then_unpause():
+        await engine._tick()  # baseline tick, nothing pending yet
+        stub_rig.state = RigState(freq_hz=14075000, mode="CW", passband_hz=500, ptt=False)
+        engine._pending_freq_since -= 1.0  # would clear the debounce window
+        _clear_websdr_write_gap(engine)
+        await engine._tick()  # still paused -- must be a complete no-op push-wise
+        assert stub_driver.tuned == []
+        assert stub_driver.modes == []
+
+        engine._forward_sync_paused = False
+        engine._pending_freq_since -= 1.0
+        _clear_websdr_write_gap(engine)
+        await engine._tick()  # unpaused -- the pending target must go out now
+
+    asyncio.run(run_while_paused_then_unpause())
+
+    assert stub_driver.tuned == [14075000]
+    assert stub_driver.modes == [("CW", 500)]
+
+
+def test_set_forward_sync_paused_from_other_thread_sets_directly_before_loop_starts():
+    """Mirrors set_reverse_sync_held's own before-loop-starts contract:
+    with no running loop yet, the setter must write the field directly
+    rather than silently drop the call (there is nothing to
+    call_soon_threadsafe onto)."""
+    engine = make_engine()
+    assert engine._loop is None
+    engine.set_forward_sync_paused_from_other_thread(True)
+    assert engine._forward_sync_paused is True
+    engine.set_forward_sync_paused_from_other_thread(False)
+    assert engine._forward_sync_paused is False

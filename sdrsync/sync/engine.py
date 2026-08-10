@@ -348,6 +348,11 @@ class StatusSnapshot(GuiMessage):
     # the Hold toggle -- distinct from both fields above (this is a
     # deliberate, ongoing choice, not an error or an in-progress retry).
     reverse_sync_held: bool = False
+    # GUI rewrite: True while the user has paused the rig -> WebSDR
+    # direction via the Pause sync toggle -- orthogonal to
+    # reverse_sync_held (that's the WebSDR -> rig direction). See
+    # SyncEngine._forward_sync_paused's docstring.
+    forward_sync_paused: bool = False
     # v14: True while the WebSDR was disconnected BY US for idleness (see
     # AppSettings.websdr_idle_disconnect_min) and is armed to reconnect
     # automatically. A separate field rather than a websdr.last_error
@@ -567,6 +572,17 @@ class SyncEngine:
         # never silently starts up already holding reverse sync from a
         # forgotten previous session. See set_reverse_sync_held().
         self._reverse_sync_held: bool = False
+        # v15/GUI-rewrite Pause sync toggle (rig -> WebSDR direction).
+        # Orthogonal to _reverse_sync_held -- this blocks the forward
+        # PUSH only (see the "not self._forward_sync_paused and" guards
+        # in _tick()'s mode/freq push conditions), never rig/WebSDR
+        # polling itself, and pending-freq/mode bookkeeping keeps
+        # accumulating while paused so unpausing fires an immediate
+        # corrective push through the existing debounce/threshold check
+        # rather than needing its own latch-clearing. Session-only, same
+        # reasoning as _reverse_sync_held: never persisted, always False
+        # on a fresh launch. See set_forward_sync_paused_from_other_thread().
+        self._forward_sync_paused: bool = False
 
     # ------------------------------------------------------------------
     # Thread-safe entry points -- call these from the GUI thread.
@@ -659,6 +675,7 @@ class SyncEngine:
             reverse_sync_error=self._reverse_sync_error,
             reverse_sync_pending=self._reverse_sync_pending_text(),
             reverse_sync_held=self._reverse_sync_held,
+            forward_sync_paused=self._forward_sync_paused,
             websdr_idle_stopped=self._websdr_idle_stopped,
             **overrides,
         )
@@ -1414,6 +1431,25 @@ class SyncEngine:
         self._reverse_sync_error = None
         self._sync_latch_generation += 1
 
+    # ------------------------------------------------------------------ Pause sync (rig -> WebSDR, GUI-driven)
+    def set_forward_sync_paused_from_other_thread(self, paused: bool) -> None:
+        """Thread-safe. Pauses/resumes the rig -> WebSDR direction only --
+        reverse sync, mute-on-TX, and both connections are completely
+        untouched (see _forward_sync_paused's own docstring for why no
+        latch-clearing is needed here, unlike set_reverse_sync_held).
+        Mirrors that method's loop-dispatch pattern exactly: set directly
+        if the engine loop hasn't started yet (nothing reads it
+        concurrently before the loop exists), otherwise dispatch onto the
+        loop so a concurrent _tick() can't read a half-updated value."""
+        loop = self._loop
+        if loop is None:
+            self._forward_sync_paused = paused
+            return
+        try:
+            loop.call_soon_threadsafe(setattr, self, "_forward_sync_paused", paused)
+        except RuntimeError:
+            pass  # loop already closed
+
     # ------------------------------------------------------------------
     def _reset_sync_latches(self) -> None:
         self._last_sent_freq = None
@@ -1869,7 +1905,8 @@ class SyncEngine:
                 # look like the user abandoned their own click and
                 # supersede the very push being retried.
                 if (
-                    mode_key is not None
+                    not self._forward_sync_paused
+                    and mode_key is not None
                     and (mode_key != self._last_sent_mode_key or due_for_periodic_resync)
                     and self._mode_push is None
                 ):
@@ -1930,7 +1967,8 @@ class SyncEngine:
                         self._pending_freq = state.freq_hz
                         self._pending_freq_since = now
                     elif (
-                        now - self._pending_freq_since >= FREQ_DEBOUNCE_S
+                        not self._forward_sync_paused
+                        and now - self._pending_freq_since >= FREQ_DEBOUNCE_S
                         and (self._last_sent_freq is None
                              or abs(self._pending_freq - self._last_sent_freq) > FREQ_CHANGE_THRESHOLD_HZ
                              or due_for_periodic_resync)

@@ -44,3 +44,10 @@ version = { attr = "sdrsync.__version__" }
 # the top-level tests/ package (it has its own __init__.py) and pip install
 # -e . fails with "multiple top-level packages discovered".
 include = ["sdrsync*"]
+
+[tool.setuptools.package-data]
+# Vendored Lora/Cormorant Garamond TTFs (GUI rewrite, spec §1) -- without
+# this, a plain `pip install` (as opposed to the PyInstaller build, which
+# has its own separate datas entry in SDRSync.spec) silently omits them
+# and gui/fonts.py falls back to system fonts.
+sdrsync = ["assets/fonts/*.ttf", "assets/fonts/*.txt"]
