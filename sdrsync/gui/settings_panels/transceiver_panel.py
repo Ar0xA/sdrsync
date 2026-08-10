@@ -53,6 +53,7 @@ class TransceiverPanel(wx.Panel):
         self.SetBackgroundColour(theme.BG)
         self.on_test: Optional[Callable[[], None]] = None
         self.on_connect: Optional[Callable[[], None]] = None
+        self._rig_active = False
 
         outer = wx.BoxSizer(wx.VERTICAL)
         pad_top, pad_side, pad_bottom = self.FromDIP(18), self.FromDIP(16), self.FromDIP(20)
@@ -128,10 +129,6 @@ class TransceiverPanel(wx.Panel):
         self.connect_btn = FlatButton(self, "Connect", is_primary=True)
         self.test_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_test and self.on_test())
         self.connect_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_connect and self.on_connect())
-        # GUI REWRITE IN PROGRESS: Test (a preflight-check call) is wired
-        # up in a later phase; Connect/Disconnect is real (phase 6).
-        self.test_btn.Enable(False)
-        self.test_btn.SetToolTip("Wired up in a later phase of the GUI rewrite")
         btn_box.Add(self.test_btn, 0, wx.RIGHT, self.FromDIP(9))
         btn_box.Add(self.connect_btn, 0)
         row1.Add(field("", btn_box), 0, wx.ALIGN_BOTTOM)
@@ -147,7 +144,15 @@ class TransceiverPanel(wx.Panel):
         self.poll_status_text.SetFont(label_font())
         self.poll_status_text.SetForegroundColour(theme.FAINT)
         row2.Add(self.poll_status_text, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(18))
+        # No spec-mandated slot for a Test result -- placed on its own
+        # row so it never fights the connection-state text above for the
+        # same line (spec §5.1's two-state text is about polling, not
+        # about a one-shot Test click).
+        self.test_status_text = wx.StaticText(self, label="")
+        self.test_status_text.SetFont(label_font())
+        self.test_status_text.SetForegroundColour(theme.FAINT)
         outer.Add(row2, 0, wx.TOP, self.FromDIP(14))
+        outer.Add(self.test_status_text, 0, wx.TOP, self.FromDIP(5))
 
         self.mock_panel = _MockRigPanel(self)
         outer.Add(self.mock_panel, 0, wx.EXPAND | wx.TOP, self.FromDIP(14))
@@ -177,6 +182,18 @@ class TransceiverPanel(wx.Panel):
         self.port_entry.Enable(editable)
         self.host_entry.Enable(editable and not self.mock_rig_check.GetValue())
         self.mock_rig_check.Enable(editable)
+        self._rig_active = active
+        self._refresh_poll_status()
+
+    def set_test_result(self, ok: bool, message: str) -> None:
+        self.test_btn.Enable(True)
+        self.test_btn.SetLabel("Test")
+        self.test_status_text.SetLabel(("OK: " if ok else "FAIL: ") + message)
+
+    def begin_test(self) -> None:
+        self.test_btn.Enable(False)
+        self.test_btn.SetLabel("Testing...")
+        self.test_status_text.SetLabel("")
 
     def _populate_host_port_for_backend(self, backend: str) -> None:
         if backend == "flrig":
@@ -191,6 +208,7 @@ class TransceiverPanel(wx.Panel):
         self.settings.rig_backend = backend
         self.settings.save()
         self._populate_host_port_for_backend(backend)
+        self._refresh_poll_status()
 
     def _on_host_port_edited(self, _evt: wx.CommandEvent) -> None:
         backend = self.backend_choice.GetStringSelection()
@@ -232,7 +250,15 @@ class TransceiverPanel(wx.Panel):
             top.Layout()
 
     def _refresh_poll_status(self) -> None:
-        text = f"polling every {self.settings.poll_interval_s:.2f} s -- frequency, mode, PTT"
+        # spec §5.1's literal two-state text -- connection-state-dependent,
+        # not just a poll-interval readout (a gap found during the phase
+        # 10 polish pass: this used to unconditionally show the "polling
+        # every..." text even while disconnected, which doesn't match
+        # either reference screenshot).
+        if self._rig_active:
+            text = f"polling every {self.settings.poll_interval_s:.2f} s -- frequency, mode, PTT"
+        else:
+            text = f"{self.backend_choice.GetStringSelection()} not reachable until connected"
         self.poll_status_text.SetLabel(text)
 
 
