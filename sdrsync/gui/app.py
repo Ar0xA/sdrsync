@@ -745,6 +745,7 @@ class MainFrame(wx.Frame):
             self.transceiver_panel.mock_panel.set_enabled(False)
             self.status_bar_panel.set_text(f"Sync engine crashed: {snap.fatal_error}", colour_mode="error")
             self.status_bar_panel.set_dot_mode("disconnected")
+            self._set_window_title()
             self._refresh_chrome()
             return
 
@@ -810,8 +811,28 @@ class MainFrame(wx.Frame):
         text, dot_mode, colour_mode = self._resolve_status_bar_text(snap)
         self.status_bar_panel.set_text(text, colour_mode=colour_mode)
         self.status_bar_panel.set_dot_mode(dot_mode)
+        self._set_window_title()
 
         self._refresh_chrome()
+
+    def _set_window_title(self) -> None:
+        """The titlebar was hardcoded to "... - not connected" at
+        construction and never updated afterward -- true even before
+        this GUI rewrite (the old titlebar had a static "rigctld ->
+        WebSDR" subtitle instead, also never touched again). Confirmed
+        live as user-visible and misleading: it kept reading "not
+        connected" with both the rig and the WebSDR actually connected
+        and syncing. Called every snapshot alongside the status bar, so
+        it always reflects AppState.rig_connected/sdr_connected."""
+        if self._state.rig_connected and self._state.sdr_connected:
+            subtitle = "connected"
+        elif self._state.rig_connected:
+            subtitle = "rig connected"
+        else:
+            subtitle = "not connected"
+        title = f"SDRSync {__version__} - {subtitle}"
+        if self.GetTitle() != title:
+            self.SetTitle(title)
 
     def _rig_status_text(self) -> str:
         if not self._state.rig_connected:
