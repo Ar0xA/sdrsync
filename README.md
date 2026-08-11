@@ -10,9 +10,10 @@ retunes the WebSDR, and clicking/tuning directly on the WebSDR page moves
 your radio's frequency and mode right back. **This means the WebSDR page
 can retune your transmitter.** PTT/transmit always wins (rig state is
 never overridden while you're transmitting), and there are two controls
-over the reverse direction: a **Hold** toggle that pauses it for the
-session, and an optional **frequency range guard** that rejects anything
-outside a min/max you set. Both are described under "Reverse sync" below
+over the reverse direction: a **Sync direction** dropdown that can pause
+it for the session, and an optional **frequency range guard** that
+rejects anything outside a min/max you set. Both are described under
+"Reverse sync" below
 — read it before connecting a real transceiver to a public WebSDR you
 don't control, because neither of them is a band-plan or legality check.
 
@@ -51,8 +52,8 @@ Beyond those, there is still **no other bound** on what gets sent: no
 band-plan check, no legality check for your licence or country, no "is
 this frequency even valid for my rig" check, no confirmation before a
 large jump inside an allowed range. Neither control makes reverse sync
-safe by itself — Hold is off unless you press it, and the range guard is
-only as good as the numbers you enter. If you're pointing a real
+safe by itself — one-way sync is off unless you select it, and the range
+guard is only as good as the numbers you enter. If you're pointing a real
 transceiver at a public WebSDR you don't control, be aware of this before
 leaving it connected unattended.
 
@@ -165,7 +166,11 @@ control functions. This means:
 
 ## Install
 
-**Windows / macOS:**
+**Windows (recommended):** download the latest `SDRSync-vX.Y.Z-windows.zip` from
+[Releases](https://github.com/Ar0xA/sdrsync/releases), unzip it, and run `SDRSync.exe` — no
+Python needed.
+
+**Running from source (Windows or macOS):**
 
 ```bash
 pip install -r requirements.txt
@@ -206,7 +211,8 @@ startup, the error message names the exact packages it's missing.
    (Or check **Use mock rig** in the Transceiver panel instead — see below
    — if you just want to try it out without a radio; works with either
    backend.)
-2. Start sdrsync:
+2. Start sdrsync — double-click `SDRSync.exe` if you're on the packaged Windows build, or from
+   source:
    ```bash
    python -m sdrsync.main
    ```

@@ -43,6 +43,7 @@ from sdrsync.browser.backend import WebViewBackendUnavailable, assert_backend_av
 from sdrsync.config import AppSettings, KNOWN_SITES, WebSDRSite
 from sdrsync.gui_messages import GuiMessage
 from sdrsync.gui import theme
+from sdrsync.gui.compact_frame import CompactFrame
 from sdrsync.gui.fonts import load_fonts
 from sdrsync.gui.format import fmt_hz
 from sdrsync.gui.receiver_host import ReceiverHost
@@ -54,7 +55,7 @@ from sdrsync.gui.settings_panels.transceiver_panel import TransceiverPanel
 from sdrsync.gui.state import AppState
 from sdrsync.gui.status_bar_panel import StatusBarPanel
 from sdrsync.gui.strip_panel import StripPanel
-from sdrsync.gui.webview_host import WebViewHost, bring_pair_to_front, has_display_at
+from sdrsync.gui.webview_host import WebViewHost, bring_pair_to_front, clamp_size_to_display, has_display_at
 from sdrsync.logging_setup import LOG_FILE
 from sdrsync.resources import ICON_PATH
 from sdrsync.preflight import (
@@ -106,6 +107,14 @@ class MainFrame(wx.Frame):
         # ReceiverHost/ReceiverLive exist, inside _build_widgets(); no
         # frame-visibility/close-routing setup needed here any more.
         self._webview_host = webview_host
+        # spec §9 (compact bar/undock) -- both None while docked (the
+        # normal state). _compact_frame is the small always-on-top-
+        # optional control bar; _receiver_frame is the WebView's second
+        # home while undocked, created every undock regardless of
+        # AppSettings.hide_receiver_when_undocked (only its Show() state
+        # differs) -- see _on_undock_clicked.
+        self._compact_frame: Optional[CompactFrame] = None
+        self._receiver_frame: Optional[wx.Frame] = None
 
         self.status_queue: "queue.Queue[GuiMessage]" = queue.Queue()
         self.rig_test_thread: Optional[threading.Thread] = None
@@ -293,6 +302,8 @@ class MainFrame(wx.Frame):
             self.strip_panel.connect_btn.Enable(self._state.rig_connected or self._state.sdr_connected)
         self.section_bar.refresh(self._state)
         self.receiver_host.refresh(self._state)
+        if self._compact_frame is not None:
+            self._compact_frame.refresh(self._state)
 
     def _wire_strip_panel(self) -> None:
         sp = self.strip_panel
@@ -305,6 +316,7 @@ class MainFrame(wx.Frame):
         # changing the dropdown while connected must re-derive it
         # immediately, not just on the next status-queue tick.
         sp.site_choice.Bind(wx.EVT_CHOICE, lambda evt: self._refresh_chrome())
+        sp.undock_btn.Bind(wx.EVT_BUTTON, self._on_undock_clicked)
         self._refresh_strip_site_dropdown()
         selected = self._find_selectable_site_by_url(self.settings.last_site_url)
         sp.site_choice.SetStringSelection(selected.name if selected else KNOWN_SITES[0].name)
@@ -326,6 +338,56 @@ class MainFrame(wx.Frame):
         names = [s.name for s in self._all_selectable_sites()]
         sp.site_choice.Set(names)
         sp.site_choice.SetStringSelection(current if current in names else KNOWN_SITES[0].name)
+
+    # ------------------------------------------------------------------ Undock / dock (spec §9)
+    def _on_undock_clicked(self, _evt: wx.CommandEvent) -> None:
+        if self._compact_frame is not None:
+            return  # already undocked -- the strip that would trigger this is hidden anyway
+        cf = CompactFrame(self, self.settings)
+        cf.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
+        cf.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
+        cf.on_dock = self._on_dock_clicked
+        cf.Bind(wx.EVT_CLOSE, lambda evt: self._shutdown_and_destroy())
+        self._compact_frame = cf
+
+        # Created every undock regardless of hide_receiver_when_undocked
+        # -- only its Show() differs -- so WebViewHost.reparent() always
+        # has a real second home for the WebView and dock's teardown
+        # path never has to branch on which variant was active.
+        rf = wx.Frame(self, title="SDRSync -- Receiver", style=wx.DEFAULT_FRAME_STYLE)
+        rf.SetBackgroundColour(theme.BG)
+        rf.SetSizer(wx.BoxSizer(wx.VERTICAL))
+        rf.SetSize(clamp_size_to_display(wx.Size(900, 650), cf.GetPosition()))
+        # The receiver frame's own close box just hides it (audio keeps
+        # playing) rather than tearing anything down -- closing the
+        # actual session lives on CompactFrame's close box / Dock.
+        rf.Bind(wx.EVT_CLOSE, lambda evt: rf.Hide())
+        self._receiver_frame = rf
+
+        self._webview_host.reparent(rf)
+        hide_receiver = self.settings.hide_receiver_when_undocked
+        if not hide_receiver:
+            rf.Show()
+
+        self.Hide()
+        cf.Show()
+        bring_pair_to_front(cf, rf if not hide_receiver else None)
+        self._state.undocked = True
+        self._refresh_chrome()
+
+    def _on_dock_clicked(self) -> None:
+        if self._compact_frame is None:
+            return
+        self._webview_host.reparent(self.receiver_host.live.webview_parent)
+        if self._receiver_frame is not None:
+            self._receiver_frame.Destroy()
+            self._receiver_frame = None
+        self._compact_frame.Destroy()
+        self._compact_frame = None
+        self._state.undocked = False
+        self.Show()
+        bring_pair_to_front(self)
+        self._refresh_chrome()
 
     def _wire_section_bar(self) -> None:
         for key, btn in self.section_bar.panel_buttons.items():
@@ -910,10 +972,20 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------------------------
     def _on_close(self, _event=None) -> None:
+        self._shutdown_and_destroy()
+
+    def _shutdown_and_destroy(self) -> None:
+        """The one teardown path for the whole app, regardless of which
+        frame's close box triggered it -- MainFrame's own (the normal,
+        docked case) or CompactFrame's (spec §9: the only quit
+        affordance while undocked, since MainFrame is Hidden, not
+        destroyed, and unreachable by its own titlebar then). Bound to
+        both frames' EVT_CLOSE; see _on_undock_clicked."""
         # This window's own position -- see _restore_main_window_geometry().
         # No matching size save: see AppSettings.main_window_position's
         # own comment for why this window's height is computed live
-        # instead of remembered.
+        # instead of remembered. Valid even while undocked/Hidden --
+        # Hide() doesn't change GetPosition()'s answer.
         pos = self.GetPosition()
         self.settings.main_window_position = [pos.x, pos.y]
         self.settings.save()
@@ -938,10 +1010,18 @@ class MainFrame(wx.Frame):
                 self.thread.join(timeout=0.05)
         if self._poll_timer is not None:
             self._poll_timer.Stop()
-        # GUI REWRITE: the WebView is now a child of this frame (inline
-        # embedding, spec §6.1), not a separate top-level frame -- no
-        # extra window to explicitly Destroy() any more; this frame's own
-        # Destroy() below takes the WebView with it.
+        # By this point the engine's own shutdown (above) has already
+        # destroyed the live WebView wherever it currently lives (docked
+        # or reparented into _receiver_frame -- WebViewHost tracks the
+        # widget, not which frame currently owns it). These two are
+        # whatever's left: the compact bar itself, and its receiver
+        # frame if undock ever happened this session.
+        if self._receiver_frame is not None:
+            self._receiver_frame.Destroy()
+            self._receiver_frame = None
+        if self._compact_frame is not None:
+            self._compact_frame.Destroy()
+            self._compact_frame = None
         self.Destroy()
 
 

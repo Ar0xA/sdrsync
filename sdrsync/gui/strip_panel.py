@@ -89,8 +89,22 @@ class _LabelValue(wx.Panel):
             self.Layout()
 
     def set_value(self, text: str, colour: wx.Colour) -> None:
+        # SetLabel() alone doesn't make an ancestor sizer reflow -- only
+        # a subsequent Layout() picks up the new best size. Rarely
+        # visible on RX/TX VFO (fmt_hz's fixed-width zero-padded groups
+        # barely change width) but MODE's text ("USB"/"LSB"/"-"/...)
+        # genuinely varies, and on StripPanel this was masked by
+        # incidental full-window Layout() calls elsewhere (opening a
+        # settings panel, etc.) -- CompactFrame (spec §9), a small
+        # fixed-size window with no such incidental relayout, exposed it
+        # directly: MODE showed a single clipped letter. Same root cause
+        # and fix as widgets.py's _relayout_after_label_change.
         if self._value.GetLabel() != text:
             self._value.SetLabel(text)
+            self.Layout()
+            top = self.GetTopLevelParent()
+            if top is not None:
+                top.Layout()
         if self._value.GetForegroundColour() != colour:
             self._value.SetForegroundColour(colour)
         self._value.Refresh()
@@ -191,18 +205,21 @@ class _VDivider(wx.Window):
 
 
 class _UndockButton(_OwnerDrawnMixin, wx.Control):
-    """28x26 flat icon button (spec §3 item 12). Inert this rewrite --
-    spec §9 (undock/compact bar) is out of scope; still fully interactive
-    (hover/focus feedback) so it reads as "not yet", not "broken"."""
+    """28x26 flat icon button (spec §3 item 12). Posts a real
+    wx.EVT_BUTTON-shaped event on click, same pattern FlatButton uses,
+    so MainFrame binds it exactly like every other strip control --
+    see app.py's _on_undock_clicked (spec §9's compact bar)."""
 
     def __init__(self, parent: wx.Window) -> None:
         wx.Control.__init__(self, parent, style=wx.BORDER_NONE)
         self._init_owner_drawn()
         self.SetMinSize(wx.Size(self.FromDIP(28), self.FromDIP(26)))
-        self.SetToolTip("Pop receiver out to its own window (coming soon)")
+        self.SetToolTip("Pop receiver out to its own window")
 
     def _activate(self) -> None:
-        pass  # deferred to a future undock implementation (spec §9)
+        evt = wx.CommandEvent(wx.wxEVT_BUTTON, self.GetId())
+        evt.SetEventObject(self)
+        wx.PostEvent(self, evt)
 
     def _paint(self, gc: "wx.GraphicsContext", rect: wx.Rect) -> None:
         radius = self.FromDIP(theme.RADIUS)

@@ -1,6 +1,6 @@
 """sdrsync.gui.format's fmt_hz/fmt_delta (spec §11) -- pure functions,
 no wx dependency, so importable without a display."""
-from sdrsync.gui.format import fmt_delta, fmt_hz
+from sdrsync.gui.format import fmt_delta, fmt_hz, fmt_hz_split
 
 
 def test_fmt_hz_basic():
@@ -29,3 +29,19 @@ def test_fmt_delta_negative():
 
 def test_fmt_delta_zero():
     assert fmt_delta(14_074_500, 14_074_500) == "+0 Hz"
+
+
+def test_fmt_hz_split_basic():
+    assert fmt_hz_split(14_074_500) == ("14.074", "500")
+
+
+def test_fmt_hz_split_zero():
+    assert fmt_hz_split(0) == ("0.000", "000")
+
+
+def test_fmt_hz_split_negative():
+    assert fmt_hz_split(-14_074_500) == ("-14.074", "500")
+
+
+def test_fmt_hz_split_sub_khz():
+    assert fmt_hz_split(500) == ("0.000", "500")

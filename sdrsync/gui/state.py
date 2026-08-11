@@ -27,9 +27,11 @@ class AppState:
     # from wx's own MSW backend. Mirrors the rig_active/rig_connected
     # distinction the rest of the app already uses for the same reason.
     sdr_active: bool = False
-    # Always False this rewrite -- spec §9 (compact bar/undock) is out
-    # of scope; kept as a real field so panels can already read it the
-    # way they will once undock exists.
+    # spec §9 (compact bar/undock) -- True whenever MainFrame is hidden
+    # in favour of CompactFrame. Set directly by MainFrame's
+    # _on_undock_clicked/_on_dock_clicked (there's no StatusSnapshot
+    # field for it -- this is pure GUI-side chrome state, not something
+    # the engine has any notion of).
     undocked: bool = False
     open_panel: Optional[str] = None  # "transceiver" | "sites" | "behaviour" | None
     rx_hz: int = 0

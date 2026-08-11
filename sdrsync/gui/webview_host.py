@@ -1,18 +1,21 @@
 """Bridges SyncEngine's background asyncio thread to the wx GUI thread for
 WebView creation/destruction and the audio-unlock click.
 
-GUI REWRITE (spec §6.1): the WebView is now embedded INLINE inside
-ReceiverHost/ReceiverLive rather than owning a separate persistent
-popup wx.Frame -- spec §9 (compact bar / undock, the only design use of
-an off-screen/hidden WebView) is out of scope for this rewrite, so the
-"headless off-screen window" model this file used to implement (see
-git history before the gui-pixel-perfect-redesign branch for that
-version) has no docked-mode use left. attach() gives WebViewHost the
-real parent panel (constructed once, at MainFrame build time, before
-the engine exists) that create_page()/destroy_page() add/remove the
-WebView widget from via a plain sizer -- mirrors the Browser/Page split
-Playwright had (WebViewHost = Browser-lifetime, the WxPageAdapter-
-wrapped WebView = Page-lifetime), just parented differently now.
+GUI REWRITE (spec §6.1): the WebView is embedded INLINE inside
+ReceiverHost/ReceiverLive while docked, rather than owning a separate
+persistent popup wx.Frame the way the pre-rewrite app did (see git
+history before the gui-pixel-perfect-redesign branch for that version).
+attach() gives WebViewHost the real parent panel (constructed once, at
+MainFrame build time, before the engine exists) that create_page()/
+destroy_page() add/remove the WebView widget from via a plain sizer --
+mirrors the Browser/Page split Playwright had (WebViewHost =
+Browser-lifetime, the WxPageAdapter-wrapped WebView = Page-lifetime),
+just parented differently now.
+
+spec §9 (compact bar / undock) moves the WebView to a second frame (or
+a hidden one) instead -- see reparent() below. attach()'s `_parent` is
+therefore not fixed for the process lifetime the way it used to be;
+reparent() is the only thing allowed to change it after construction.
 
 The audio-unlock click (WxPageAdapter._simulate_click, browser_shim.py)
 only needs webview.ClientToScreen() to resolve to real on-screen pixels
@@ -397,6 +400,43 @@ class WebViewHost:
         ReceiverHost/ReceiverLive are built."""
         assert wx.IsMainThread()
         self._parent = parent
+
+    def reparent(self, new_parent: "wx.Window") -> None:
+        """GUI-thread only, synchronous. Moves the live WebView (if any)
+        to `new_parent` in place -- spec §9's undock/dock requires this
+        explicitly ("reparent the WebView, do not recreate it (reloading
+        loses the audio session)"). A no-op if there's currently no
+        WebView (e.g. undocking before any WebSDR session started).
+
+        wx.Window.Reparent() issues a native SetParent() call on MSW --
+        the same primitive wx itself uses internally for things like
+        moving a control between notebook pages -- so this should carry
+        the underlying WebView2 HWND across cleanly. Unverified for a
+        WebView2 control specifically until confirmed live with real
+        playing audio; if Reparent() ever proves unreliable here, the
+        fallback is a one-time destroy_page()+create_page() into the
+        new parent (a visible reload -- worse than spec, but keeps
+        undock functional) rather than silently leaving the widget in a
+        broken state."""
+        assert wx.IsMainThread()
+        webview = self._current_webview
+        if webview is None:
+            self._parent = new_parent
+            return
+        old_parent = webview.GetParent()
+        old_sizer = old_parent.GetSizer() if old_parent is not None else None
+        if old_sizer is not None:
+            old_sizer.Detach(webview)
+        webview.Reparent(new_parent)
+        sizer = new_parent.GetSizer()
+        if sizer is None:
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            new_parent.SetSizer(sizer)
+        sizer.Add(webview, 1, wx.EXPAND)
+        new_parent.Layout()
+        if old_parent is not None:
+            old_parent.Layout()
+        self._parent = new_parent
 
     def present(self, on_screen: bool) -> None:
         """GUI-thread only. Passed to WxPageAdapter as its
