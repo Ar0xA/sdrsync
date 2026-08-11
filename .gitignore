@@ -12,3 +12,7 @@ venv/
 build/
 dist/
 *.spec
+
+# C# port (csharp/) build output
+csharp/**/bin/
+csharp/**/obj/

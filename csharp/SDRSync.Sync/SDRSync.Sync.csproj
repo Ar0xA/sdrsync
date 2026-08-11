@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\SDRSync.Core\SDRSync.Core.csproj" />
+    <ProjectReference Include="..\SDRSync.Rig\SDRSync.Rig.csproj" />
+    <ProjectReference Include="..\SDRSync.WebSdr\SDRSync.WebSdr.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Exposes internal engine state to SDRSync.Tests, the C# equivalent
+         of the Python original's tests reaching directly into engine._foo
+         private fields (Python enforces no privacy at all). -->
+    <InternalsVisibleTo Include="SDRSync.Tests" />
+  </ItemGroup>
+
+</Project>

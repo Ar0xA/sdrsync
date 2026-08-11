@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="SDRSync.Core/SDRSync.Core.csproj" />
+  <Project Path="SDRSync.Gui/SDRSync.Gui.csproj" />
+  <Project Path="SDRSync.Rig/SDRSync.Rig.csproj" />
+  <Project Path="SDRSync.Sync/SDRSync.Sync.csproj" />
+  <Project Path="SDRSync.Tests/SDRSync.Tests.csproj" />
+  <Project Path="SDRSync.WebSdr/SDRSync.WebSdr.csproj" />
+</Solution>
