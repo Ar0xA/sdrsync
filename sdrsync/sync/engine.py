@@ -54,7 +54,17 @@ logger = logging.getLogger("sdrsync.engine")
 
 DEFAULT_POLL_INTERVAL_S = 0.2  # see AppSettings.poll_interval_s -- now user-configurable, this is just the fallback
 FREQ_DEBOUNCE_S = 0.2          # candidate frequency must be stable this long before pushing
-FREQ_CHANGE_THRESHOLD_HZ = 10  # ignore rig jitter smaller than this
+FREQ_CHANGE_THRESHOLD_HZ = 1  # ignore rig jitter smaller than this
+# Was 10 Hz until a live bug report: rigctld/flrig frequency readbacks are
+# exact digital values (no analog noise), not a measurement subject to
+# real jitter, so 10 Hz was simply too coarse -- a genuine, intentional
+# 9-10 Hz fine-tune step (common CW/RTTY spotting granularity) never
+# exceeded the threshold with the strict '>' comparisons below, so it was
+# never even adopted as a new pending candidate and was silently dropped
+# forever, not just filtered once. FREQ_DEBOUNCE_S below already does the
+# real work of requiring a reading to be stable before it's pushed, so
+# this only needs to absorb sub-Hz rounding noise, not genuine retuning
+# of any size.
 # Belt-and-suspenders: forces a forward re-push of the rig's current
 # mode/freq onto the WebSDR every this-often, REGARDLESS of whether
 # _last_sent_mode_key/_last_sent_freq already look like a match. Purely

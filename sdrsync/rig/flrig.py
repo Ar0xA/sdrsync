@@ -299,7 +299,16 @@ class FlrigClient:
             return False
         freq_hz = int(freq_hz)
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
-        await self._call(lambda: self._proxy.rig.set_vfoA(freq_hz))
+        # rig.set_vfoA's registered XML-RPC signature is "d:d" (confirmed
+        # against flrig's actual source, src/server/xml_server.cxx: the
+        # handler casts params[0] via `(double)params[0]`). XmlRpc++ (the
+        # bundled library flrig uses) enforces the registered signature
+        # strictly by the XML-RPC type TAG, not just the numeric value --
+        # passing a plain Python int here serializes as <int> and flrig
+        # rejects it outright with Fault -1 "type error" before ever
+        # reaching the rig, confirmed live. float() forces xmlrpc.client
+        # to serialize it as <double> instead.
+        await self._call(lambda: self._proxy.rig.set_vfoA(float(freq_hz)))
         deadline = asyncio.get_running_loop().time() + budget
         while True:
             await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
