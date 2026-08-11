@@ -321,6 +321,7 @@ class MainFrame(wx.Frame):
         sp = self.strip_panel
         sp.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
         sp.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
+        sp.link_toggle.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_link_toggled)
         sp.connect_btn.Bind(wx.EVT_BUTTON, self._on_strip_connect_clicked)
         # EVT_CHOICE, not just click-time resolution -- the connect
         # button's own label (Connect/Load/Disconnect) depends on
@@ -517,6 +518,19 @@ class MainFrame(wx.Frame):
         self.settings_host.add_panel("behaviour", self.behaviour_panel)
 
     def _on_sync_tx_vfo_changed(self, value: bool) -> None:
+        self._state.sync_tx_vfo = value
+        self._refresh_chrome()
+
+    def _on_strip_link_toggled(self, evt: wx.CommandEvent) -> None:
+        # Second access point for the same AppSettings.sync_tx_vfo the
+        # Behaviour panel's checkbox controls (see _on_sync_tx_vfo_changed
+        # above) -- mirrors that handler's own settings-mutate-then-save
+        # step exactly, then keeps the Behaviour panel's checkbox in sync
+        # too, so opening it later doesn't show a stale value.
+        value = bool(evt.GetInt())
+        self.settings.sync_tx_vfo = value
+        self.settings.save()
+        self.behaviour_panel.sync_tx_vfo_check.SetValue(value)
         self._state.sync_tx_vfo = value
         self._refresh_chrome()
 

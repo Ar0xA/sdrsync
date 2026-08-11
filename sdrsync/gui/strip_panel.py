@@ -250,6 +250,76 @@ class _UndockButton(_OwnerDrawnMixin, wx.Control):
         self._draw_focus_ring(gc, rect, radius)
 
 
+class _LinkToggle(_OwnerDrawnMixin, wx.Control):
+    """Small horizontal chain-link icon between RX VFO and TX VFO
+    (user-requested, no spec equivalent). Toggles the same
+    AppState.sync_tx_vfo/AppSettings.sync_tx_vfo the Behaviour panel's
+    "Sync TX VFO" checkbox already controls -- this is a second,
+    quicker access point for it, not a new setting; StripPanel.refresh()
+    already dims/relabels TX VFO off that same field regardless of
+    which control changed it. Checked (default) = linked, MUTED glyph.
+    Unchecked = unlinked, glyph turns TRANSMIT red with a diagonal
+    strike, matching the app's existing "red = not doing the normal
+    thing" colour language (PTT tag, status bar errors)."""
+
+    def __init__(self, parent: wx.Window) -> None:
+        wx.Control.__init__(self, parent, style=wx.BORDER_NONE)
+        self._init_owner_drawn()
+        self._checked = True
+        self.SetMinSize(wx.Size(self.FromDIP(28), self.FromDIP(20)))
+        self._update_tooltip()
+
+    def SetValue(self, checked: bool) -> None:
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self._update_tooltip()
+        self.Refresh()
+
+    def GetValue(self) -> bool:
+        return self._checked
+
+    def _update_tooltip(self) -> None:
+        self.SetToolTip(
+            "TX VFO linked to RX (click to unlink)" if self._checked
+            else "TX VFO unlinked from RX (click to relink)"
+        )
+
+    def _activate(self) -> None:
+        self._checked = not self._checked
+        self._update_tooltip()
+        evt = wx.CommandEvent(wx.wxEVT_TOGGLEBUTTON, self.GetId())
+        evt.SetEventObject(self)
+        evt.SetInt(1 if self._checked else 0)
+        wx.PostEvent(self, evt)
+
+    def _paint(self, gc: "wx.GraphicsContext", rect: wx.Rect) -> None:
+        if not self.IsEnabled():
+            colour = theme.with_alpha(theme.FAINT, 115)
+        elif not self._checked:
+            colour = theme.TRANSMIT
+        elif self._hover:
+            colour = theme.ACCENT_TEXT
+        else:
+            colour = theme.MUTED
+        gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(colour).Width(1.4)))
+        cx, cy = rect.width / 2, rect.height / 2
+        link_w, link_h = rect.width * 0.32, rect.height * 0.55
+        left = gc.CreatePath()
+        left.AddRoundedRectangle(cx - link_w * 0.95, cy - link_h / 2, link_w, link_h, link_h / 2)
+        gc.StrokePath(left)
+        right = gc.CreatePath()
+        right.AddRoundedRectangle(cx - link_w * 0.05, cy - link_h / 2, link_w, link_h, link_h / 2)
+        gc.StrokePath(right)
+        if not self._checked:
+            diag = gc.CreatePath()
+            diag.MoveToPoint(rect.width * 0.12, rect.height * 0.85)
+            diag.AddLineToPoint(rect.width * 0.88, rect.height * 0.15)
+            gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(colour).Width(1.6)))
+            gc.StrokePath(diag)
+        self._draw_focus_ring(gc, rect, self.FromDIP(theme.RADIUS))
+
+
 class StripPanel(wx.Panel):
     """spec §3. Presentation only: reads AppState via refresh(state), and
     exposes its interactive children (pause_btn, mute_btn, site_choice,
@@ -276,8 +346,11 @@ class StripPanel(wx.Panel):
         self.rx_vfo = _LabelValue(self, "RX VFO")
         sizer.Add(self.rx_vfo, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
 
+        self.link_toggle = _LinkToggle(self)
+        sizer.Add(self.link_toggle, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(5))
+
         self.tx_vfo = _LabelValue(self, "TX VFO")
-        sizer.Add(self.tx_vfo, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
+        sizer.Add(self.tx_vfo, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(5))
 
         self.mode_group = _LabelValue(self, "MODE")
         sizer.Add(self.mode_group, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
@@ -319,6 +392,8 @@ class StripPanel(wx.Panel):
                                "paused" if (state.rig_connected and state.paused) else "disconnected")
 
         self.rx_vfo.set_value(fmt_hz(state.rx_hz) if state.rig_connected else "-", theme.TEXT)
+
+        self.link_toggle.SetValue(state.sync_tx_vfo)
 
         if not state.sync_tx_vfo:
             self.tx_vfo.set_label_text("TX VFO (not synced)")
