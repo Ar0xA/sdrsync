@@ -55,6 +55,7 @@ from sdrsync.gui.settings_panels.transceiver_panel import TransceiverPanel
 from sdrsync.gui.state import AppState
 from sdrsync.gui.status_bar_panel import StatusBarPanel
 from sdrsync.gui.strip_panel import StripPanel
+from sdrsync.gui.update_dialog import UpdateDialog
 from sdrsync.gui.webview_host import WebViewHost, bring_pair_to_front, clamp_size_to_display, has_display_at
 from sdrsync.logging_setup import LOG_FILE
 from sdrsync.resources import ICON_PATH
@@ -69,6 +70,7 @@ from sdrsync.preflight import (
 )
 from sdrsync.sitesource import CURATED_LIST_URL, SiteListFetchResult, fetch_site_list
 from sdrsync.sync.engine import StatusSnapshot, SyncEngine
+from sdrsync.update_check import UpdateCheckResult, check_for_update
 
 logger = logging.getLogger("sdrsync.gui")
 
@@ -185,6 +187,7 @@ class MainFrame(wx.Frame):
             WebsdrPreflightResult: self._apply_websdr_preflight,
             DetectResult: self._apply_detect_result,
             SiteListFetchResult: self._apply_curated_autofetch_result,
+            UpdateCheckResult: self._apply_update_check_result,
         }
 
         self.Bind(wx.EVT_CLOSE, self._on_close)
@@ -219,6 +222,15 @@ class MainFrame(wx.Frame):
         self._poll_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._poll_status_queue, self._poll_timer)
         self._poll_timer.Start(QUEUE_POLL_MS)
+
+        # One-shot, non-blocking; result (if any) arrives via the same
+        # status_queue/_dispatch machinery as everything else. Own thread
+        # rather than piggybacking on the engine thread/loop -- this has
+        # nothing to do with the rig/WebSDR subsystems and shouldn't be
+        # able to affect their startup timing.
+        threading.Thread(
+            target=self._run_update_check, args=(self.status_queue,), daemon=True,
+        ).start()
 
     def _restore_main_window_geometry(self) -> None:
         """Applies this window's own remembered POSITION from the last
@@ -597,6 +609,38 @@ class MainFrame(wx.Frame):
 
     def _apply_detect_result(self, result: DetectResult) -> None:
         self.sites_panel.apply_detect_result(result.url, result.driver_type, result.message)
+
+    # ------------------------------------------------------------------ Update check
+    @staticmethod
+    def _run_update_check(status_queue: "queue.Queue") -> None:
+        try:
+            result = check_for_update(__version__)
+        except Exception:
+            # check_for_update() already catches every failure mode it
+            # knows about and reports "nothing to show" -- this is only
+            # a last-resort guard against something unanticipated, so a
+            # broken update check can never take the rest of startup
+            # down with it.
+            logger.exception("Update check crashed")
+            result = UpdateCheckResult(latest_version=None, release_url=None)
+        try:
+            status_queue.put_nowait(result)
+        except queue.Full:
+            pass
+
+    def _apply_update_check_result(self, result: UpdateCheckResult) -> None:
+        if not result.latest_version or not result.release_url:
+            return
+        if result.latest_version == self.settings.dismissed_update_version:
+            return
+        dlg = UpdateDialog(self, __version__, result.latest_version, result.release_url)
+        try:
+            dlg.ShowModal()
+        finally:
+            if dlg.ignore_check.GetValue():
+                self.settings.dismissed_update_version = result.latest_version
+                self.settings.save()
+            dlg.Destroy()
 
     def _on_sites_test_clicked(self, url: str) -> None:
         if self.websdr_test_thread is not None and self.websdr_test_thread.is_alive():

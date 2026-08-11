@@ -190,6 +190,13 @@ class AppSettings:
     # user-resizable, with ReceiverHost (proportion=1) absorbing any
     # extra space -- nothing here needs remembering across restarts.
     main_window_position: Optional[list] = None
+    # Set when the user checks "Don't show this again for this version"
+    # on the startup update-available popup (see update_check.py /
+    # gui/app.py's _apply_update_check_result). Compared against the
+    # *specific* latest tag each check, not a bare bool -- so dismissing
+    # v2.1.0 silences only v2.1.0; the popup returns the moment a newer
+    # release ships.
+    dismissed_update_version: Optional[str] = None
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -260,6 +267,7 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "reverse_sync_min_hz": (int, type(None)),
     "reverse_sync_max_hz": (int, type(None)),
     "websdr_idle_disconnect_min": (int, type(None)),
+    "dismissed_update_version": (str, type(None)),
 }
 
 RIG_BACKENDS = {"rigctld", "flrig"}

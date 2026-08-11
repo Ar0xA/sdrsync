@@ -403,3 +403,26 @@ def test_save_then_load_round_trips_idle_disconnect(monkeypatch, tmp_path):
     _use_tmp_config(monkeypatch, tmp_path)
     AppSettings(websdr_idle_disconnect_min=45).save()
     assert AppSettings.load().websdr_idle_disconnect_min == 45
+
+
+def test_dismissed_update_version_defaults_to_none(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    assert AppSettings.load().dismissed_update_version is None
+
+
+def test_load_accepts_valid_dismissed_update_version(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"dismissed_update_version": "v2.2.0"}), encoding="utf-8")
+    assert AppSettings.load().dismissed_update_version == "v2.2.0"
+
+
+def test_load_rejects_wrong_type_dismissed_update_version(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(json.dumps({"dismissed_update_version": 210}), encoding="utf-8")
+    assert AppSettings.load().dismissed_update_version is None
+
+
+def test_save_then_load_round_trips_dismissed_update_version(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    AppSettings(dismissed_update_version="v2.2.0").save()
+    assert AppSettings.load().dismissed_update_version == "v2.2.0"
