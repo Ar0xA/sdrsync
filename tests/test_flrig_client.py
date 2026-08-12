@@ -71,14 +71,67 @@ def test_set_freq_success_applies_and_confirms():
     asyncio.run(run())
 
 
+def test_set_freq_sends_a_double_not_an_int_over_the_wire():
+    """Regression test for a live bug: real flrig's rig.set_vfoA is
+    registered with XML-RPC signature "d:d" (confirmed against flrig's
+    own C++ source, src/server/xml_server.cxx, which does
+    `(double)params[0]`) and its bundled XmlRpc++ library enforces that
+    signature strictly by wire type -- sending a plain Python int
+    serializes as <int> and real flrig rejects it outright with
+    Fault -1 'type error', before ever reaching the rig. This fake
+    server doesn't enforce that (see FakeFlrigState.last_set_vfoA_arg_type's
+    docstring), so a value-only assertion would pass even with the bug;
+    this checks the actual deserialized wire type instead."""
+    async def run():
+        handle, state = await start_server(port=0)
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_freq(7074000) is True
+            assert state.last_set_vfoA_arg_type is float
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_set_mode_success_applies_and_confirms():
     async def run():
         handle, state = await start_server(port=0)
         client = FlrigClient("127.0.0.1", handle.port)
         try:
             assert await client.connect() is True
-            assert await client.set_mode("LSB", None) is True
+            assert await client.set_mode("LSB") is True
             assert state.mode == "LSB"
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_set_mode_never_touches_the_rigs_bandwidth():
+    """Regression test for a live user report: an earlier version of
+    set_mode() also called flrig's separate rig.set_bandwidth RPC
+    (confirmed to genuinely exist against flrig's own C++ source,
+    src/server/xml_server.cxx) whenever a passband was supplied, but the
+    user found any reverse-sync filter change unwelcome, even a
+    "sensible" one -- matching the same "mode-only" ask that made
+    RigctldClient.set_mode() always send hamlib's -1 ("leave bandwidth
+    alone") sentinel instead. set_mode() now only ever calls
+    rig.set_mode; rig.set_bandwidth is never called at all."""
+    async def run():
+        handle, state = await start_server(port=0)
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            state.passband_hz = 1800  # whatever the user had manually set on the rig
+            assert await client.set_mode("USB") is True
+            assert state.mode == "USB"
+            assert state.passband_hz == 1800  # untouched
         finally:
             await client.close()
             handle.close()
@@ -123,7 +176,7 @@ def test_set_mode_transient_delay_succeeds_once_state_catches_up():
         client = FlrigClient("127.0.0.1", handle.port)
         try:
             assert await client.connect() is True
-            assert await client.set_mode("CW", None) is True
+            assert await client.set_mode("CW") is True
             assert state.mode == "CW"
         finally:
             await client.close()

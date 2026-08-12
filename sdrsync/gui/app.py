@@ -160,6 +160,21 @@ class MainFrame(wx.Frame):
         # subsequent poll tick while the same rig_error snapshot lingers
         # (the engine keeps publishing it until the next Connect/Disconnect).
         self._rig_connect_error_shown = False
+        # Mirrors the most recently observed StatusSnapshot.rig_generation
+        # (see that field's docstring). _on_transceiver_connect_clicked
+        # copies this into _rig_connect_generation_floor right before
+        # scheduling a new attempt -- engine.start_rig_from_other_thread()
+        # runs asynchronously on the engine's own thread, so at the moment
+        # of the click the status_queue can still hold a backlog of
+        # snapshots from the PREVIOUS attempt (the engine keeps publishing
+        # every idle tick, see _rig_error's docstring). Without the floor,
+        # one of those backlog snapshots gets drained right after the
+        # click -- when the one-shot popup guard has just been reset -- and
+        # re-triggers "connection failed" for an attempt that hasn't even
+        # started yet, confirmed live even when the new attempt goes on to
+        # succeed moments later.
+        self._last_seen_rig_generation = 0
+        self._rig_connect_generation_floor = 0
         self._websdr_active = False
         self._websdr_ever_connected = False
         # True from the moment Connect is clicked until the engine
@@ -576,6 +591,11 @@ class MainFrame(wx.Frame):
         self._state.mock_rig = use_mock
         self._rig_ever_connected = False
         self._rig_connect_error_shown = False
+        # See this field's docstring -- must be captured BEFORE scheduling
+        # the new attempt below, from whatever generation was last
+        # observed, so any already-queued backlog from the attempt this is
+        # replacing (necessarily <= this value) is excluded.
+        self._rig_connect_generation_floor = self._last_seen_rig_generation
         tp.set_connection_state(False, busy_label="Connecting...")
         self.engine.start_rig_from_other_thread(backend, host, port, use_mock)
 
@@ -852,6 +872,12 @@ class MainFrame(wx.Frame):
         method's _websdr_connect_pending gate exactly (see that flag's
         own docstring above) so a stale "nothing to report" tick mid-
         connect can't be mistaken for a real disconnect."""
+        # Unconditional, before any branch/early-return below -- every
+        # snapshot carries this attempt's generation regardless of what
+        # else it reports, and _rig_connect_generation_floor needs the
+        # true latest value even from a snapshot this method otherwise
+        # ignores (e.g. fatal_error).
+        self._last_seen_rig_generation = snap.rig_generation
         if snap.fatal_error:
             self._rig_active = False
             self._websdr_active = False
@@ -924,7 +950,18 @@ class MainFrame(wx.Frame):
         # easily miss entirely (confirmed live: user had mock rig off and
         # couldn't tell why the connect wasn't working). One-shot per
         # attempt via _rig_connect_error_shown, reset on every new click.
-        if snap.rig_error and not self._rig_ever_connected and not self._rig_connect_error_shown:
+        # The generation check additionally excludes queue backlog from
+        # BEFORE that click (see _rig_connect_generation_floor's
+        # docstring) -- without it, a stale snapshot from the PREVIOUS
+        # (already-failed) attempt could still be sitting in status_queue
+        # and get drained right after the click, popping this same error
+        # again even though the new attempt goes on to succeed.
+        if (
+            snap.rig_error
+            and not self._rig_ever_connected
+            and not self._rig_connect_error_shown
+            and snap.rig_generation > self._rig_connect_generation_floor
+        ):
             self._rig_connect_error_shown = True
             wx.MessageBox(snap.rig_error, "Rig connection failed", wx.OK | wx.ICON_ERROR)
 

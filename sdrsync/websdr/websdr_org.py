@@ -14,7 +14,15 @@ Confirmed global functions on the page:
     set_mode(mode: str)     -- "USB"/"USBN"/"LSB"/"LSBN"/"AM"/"AMN"/"FM"/"CW"/"AMSYNC"
     setband(idx: int)       -- switch which (possibly non-overlapping) band is active
     soundapplet.mute(1|0)   -- true mute/unmute of the WebSocket audio stream
-    #freqinput               -- text input reflecting the current frequency (kHz)
+    freq (global var)       -- the current carrier/BFO frequency in kHz, as
+                               last stored by setfreq(); this is what the page
+                               sends upstream ("f=" + freq.toFixed(3)), so it
+                               carries full 1 Hz resolution. Note the VISIBLE
+                               frequency box (document.freqform.frequency) is
+                               only nomfreq.toFixed(2), i.e. rounded to 10 Hz --
+                               a sub-10 Hz retune is real but invisible there.
+                               There is no #freqinput element on any websdr.org
+                               build (verified live against five instances).
 
 The Twente instance itself has a single band (nbands=1) spanning ~0-29 MHz,
 so band switching is a no-op there in practice, but the logic is generic so
@@ -24,7 +32,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Optional
 
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
@@ -44,8 +51,6 @@ FREQ_VERIFY_TOLERANCE_HZ = 10
 AUDIO_GATE_CHECK_DELAY_S = 1.0
 NARROW_USB_LSB_THRESHOLD_HZ = 2000
 NARROW_AM_THRESHOLD_HZ = 6000
-
-_NUMERIC_RE = re.compile(r"[-+]?\d*\.\d+|\d+")
 
 # hamlib mode name -> (webSDR base mode, supports an "N" narrow variant)
 _MODE_MAP: dict[str, tuple[str, bool]] = {
@@ -313,23 +318,51 @@ class WebsdrOrgDriver:
             self._verify_task.cancel()
         self._verify_task = asyncio.ensure_future(self._verify_freq_applied(expected_hz))
 
-    async def _read_freqinput_hz(self) -> Optional[int]:
+    async def _read_page_freq_hz(self) -> Optional[int]:
+        """Reads back the frequency the page itself currently holds.
+
+        Reads the page's own global `freq` (kHz), NOT a text input. The
+        previous implementation read `#freqinput`, an element that does
+        not exist on any websdr.org build -- verified live against the
+        real HTML of five instances (Twente, Hack Green, IS0GRB, NA5B,
+        Maasbree): the visible frequency box is
+        `document.freqform.frequency`, which carries a `name` and no
+        `id`. So every verification silently returned None and logged
+        "Could not read back #freqinput to verify setfreq()", leaving
+        _verify_freq_applied() permanently dead (hundreds of such
+        warnings in a real user's log).
+
+        `window.freq` is the right source rather than that text box for
+        two independent reasons, both read off websdr-base.js:
+          * the box is written as `nomfreq.toFixed(2)` -- rounded to 10
+            Hz, so it cannot confirm a sub-10 Hz tune at all; and
+          * in CW it shows nominalfreq() (carrier + (hi+lo)/2), whereas
+            tune_hz() passes the carrier/BFO frequency as expected_hz --
+            comparing against the box would be off by the CW filter
+            centre (~750 Hz with the site's default CW filter) and would
+            trip the mismatch retry on every single CW tune.
+        `freq` is exactly the value setfreq() stores and exactly what
+        gets sent upstream as "f=" + freq.toFixed(3), so it is both
+        unrounded and mode-independent.
+        """
         value = await self._page.evaluate(
-            "() => document.getElementById('freqinput') ? document.getElementById('freqinput').value : null"
+            "() => (typeof window.freq === 'number' && isFinite(window.freq)) ? window.freq : null"
         )
-        match = _NUMERIC_RE.search(value) if value else None
-        if not match:
+        if value is None:
             return None
-        return int(round(float(match.group()) * 1000))
+        try:
+            return int(round(float(value) * 1000))
+        except (TypeError, ValueError):
+            return None
 
     async def _verify_freq_applied(self, expected_hz: int) -> None:
         try:
             await asyncio.sleep(FREQ_VERIFY_DELAY_S)
             if not self._attached:
                 return
-            actual_hz = await self._read_freqinput_hz()
+            actual_hz = await self._read_page_freq_hz()
             if actual_hz is None:
-                logger.warning("Could not read back #freqinput to verify setfreq()")
+                logger.warning("Could not read back window.freq to verify setfreq()")
                 return
             if abs(actual_hz - expected_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
                 return
@@ -350,7 +383,7 @@ class WebsdrOrgDriver:
             await self._page.evaluate("(khz) => window.setfreq(khz)", expected_hz / 1000.0)
 
             await asyncio.sleep(FREQ_VERIFY_DELAY_S)
-            actual_hz = await self._read_freqinput_hz()
+            actual_hz = await self._read_page_freq_hz()
             if actual_hz is not None and abs(actual_hz - expected_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
                 self._last_tune_error = None
             else:

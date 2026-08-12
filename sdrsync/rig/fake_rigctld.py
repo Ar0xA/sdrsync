@@ -70,7 +70,15 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                         state.mode_apply_after_polls -= 1
                     else:
                         state.mode = state._pending_mode
-                        state.passband_hz = state._pending_passband_hz
+                        # -1 is real hamlib's "leave bandwidth alone"
+                        # sentinel (confirmed via hamlib's own rigctld
+                        # docs, not assumed) -- RigctldClient.set_mode()
+                        # always sends it now, so state.passband_hz must
+                        # NOT be overwritten in that case, or this fake
+                        # server couldn't actually prove the real client
+                        # leaves the rig's filter alone.
+                        if state._pending_passband_hz != -1:
+                            state.passband_hz = state._pending_passband_hz
                         state._pending_mode = None
                         state._pending_passband_hz = None
                 if state.mode_error:

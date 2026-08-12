@@ -75,6 +75,15 @@ class FakeFlrigState:
         self._pending_freq_countdown = 0
         self._pending_mode: "str | None" = None
         self._pending_mode_countdown = 0
+        # Records the raw Python type xmlrpc.server deserialized the last
+        # set_vfoA argument into: a wire <double> becomes a Python float,
+        # a wire <int>/<i4> becomes a Python int. Unlike real flrig's
+        # XmlRpc++ (see flrig.py's set_freq() comment), this fake server
+        # doesn't enforce the "d:d" signature -- it accepts either wire
+        # type silently -- so this is the only way a test here can catch
+        # a regression back to sending the wrong XML-RPC type, which a
+        # value-only assertion (state.freq_hz == ...) can't distinguish.
+        self.last_set_vfoA_arg_type: "type | None" = None
 
 
 class _FlrigXMLRPCServer(SimpleXMLRPCServer):
@@ -110,6 +119,7 @@ def _set_vfoA(state: FakeFlrigState, freq_hz) -> int:
     # Real flrig's set_vfoA success path never sets a meaningful `result`
     # either -- the RPC call always "succeeds" from the caller's
     # perspective, only the resulting state (or lack of it) differs.
+    state.last_set_vfoA_arg_type = type(freq_hz)
     if not state.set_rejected:
         freq_hz = int(freq_hz)
         if state.transient_delay_polls > 0:

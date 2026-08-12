@@ -39,7 +39,10 @@ class StubReverseRig:
     def __init__(self, state: RigState) -> None:
         self.state = state
         self.set_freqs: list[int] = []
-        self.set_modes: list[tuple] = []
+        # Mode name only -- RigClient.set_mode() no longer takes a
+        # passband_hz argument at all (see engine.py's RigClient Protocol
+        # docstring: reverse sync never touches filter/bandwidth).
+        self.set_modes: list[str] = []
         self.set_freq_result = True
         self.set_mode_result = True
 
@@ -56,8 +59,8 @@ class StubReverseRig:
         self.set_freqs.append(freq_hz)
         return self.set_freq_result
 
-    async def set_mode(self, mode_name: str, passband_hz, verify_budget_s=None) -> bool:
-        self.set_modes.append((mode_name, passband_hz))
+    async def set_mode(self, mode_name: str, verify_budget_s=None) -> bool:
+        self.set_modes.append(mode_name)
         return self.set_mode_result
 
 
@@ -204,6 +207,70 @@ def test_genuinely_new_freq_triggers_exactly_one_debounced_push():
     assert stub_rig.set_freqs == [14200000]
 
 
+def test_a_precise_10hz_page_step_pushes_immediately_not_after_accumulating():
+    """Regression test for a live bug: a discrete, EXACT step control on
+    the WebSDR page (e.g. a "+10 Hz" button) never individually exceeded
+    the old REVERSE_FREQ_CHANGE_THRESHOLD_HZ=50, so the pending-candidate
+    branch's strict '>' comparison never adopted it as a new candidate at
+    all -- every click just accumulated invisibly against the same stale
+    candidate until enough of them finally exceeded 50, at which point
+    the whole backlog fired as one sudden jump. Confirmed live: "nothing
+    happens for several clicks, then it suddenly changes." A single
+    genuine 10 Hz step must now reach the rig on its own, without needing
+    several more clicks first."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    # User clicks the page's own "+10 Hz" step button once.
+    status.freq_hz = 14074010
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the reverse debounce, no push yet
+    assert stub_rig.set_freqs == []
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+
+    asyncio.run(engine._tick())  # debounce elapsed -> pushes the single 10 Hz step
+    assert stub_rig.set_freqs == [14074010]
+
+
+def test_ten_rapid_clicks_coalesce_into_one_push_of_the_final_value():
+    """Companion to the precise-step test above, answering the natural
+    follow-up: with REVERSE_FREQ_CHANGE_THRESHOLD_HZ now 0, does mashing
+    the page's "+10 Hz" button 10 times fast hammer the rig with 10
+    separate SET commands? No -- REVERSE_FREQ_DEBOUNCE_S (0.5s) is what
+    prevents that, completely independent of the threshold: every new
+    click arriving before the debounce window elapses restarts
+    _pending_reverse_freq_since, so nothing pushes until the user
+    actually stops clicking for half a second, and only the LAST observed
+    value goes out, once."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    # 10 rapid +10 Hz clicks -- each tick sees a new value, but the
+    # debounce is deliberately NOT cleared between them, simulating
+    # clicks arriving faster than REVERSE_FREQ_DEBOUNCE_S apart.
+    for i in range(1, 11):
+        status.freq_hz = 14074000 + i * 10
+        _clear_holdoff(engine)
+        asyncio.run(engine._tick())
+    assert stub_rig.set_freqs == []  # nothing pushed mid-burst
+
+    # User stops clicking -- only now does the debounce window elapse.
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == [14074100]  # exactly one push, the final value
+
+
 def test_echo_of_own_pushed_value_does_not_trigger_a_reverse_push():
     """Right after _settle_and_capture_baseline()'s own forward pushes,
     reverse sync must still be inside the hold-off window and not act on
@@ -267,39 +334,12 @@ def test_genuinely_new_mode_triggers_exactly_one_push():
     # Base mode changed (USB -> LSB, StubReverseRig's own state.mode
     # never mutates) -> rig default passband (None), not the rig's
     # existing 2700.
-    assert stub_rig.set_modes == [("LSB", None)]
+    assert stub_rig.set_modes == ["LSB"]
 
     # Unchanged on the next tick must not re-push.
     _clear_holdoff(engine)
     asyncio.run(engine._tick())
-    assert stub_rig.set_modes == [("LSB", None)]
-
-
-def test_reverse_mode_push_reuses_rig_passband_when_base_mode_unchanged():
-    """engine.py's passband decision: reuse the rig's own current
-    passband_hz when the reverse-mapped mode's base is unchanged from
-    what the rig already reports (only narrow/wide varies) -- 0/None
-    only when the base mode itself changes (covered by
-    test_genuinely_new_mode_triggers_exactly_one_push above). Calls
-    _reverse_sync_tick() directly to isolate this one decision from the
-    discrete-event gating already covered elsewhere."""
-    engine = make_engine()
-    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=1800, ptt=False))
-    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
-    stub_driver = StubReverseDriver(status)
-    engine._rig, engine._driver = stub_rig, stub_driver
-    engine._reverse_baseline_captured = True
-    engine._last_observed_mode_key = "LSB"
-    engine._last_pushed_to_websdr_mode = "LSB"
-    # Bypass the mode debounce -- pretend "USB" has already been stable
-    # long enough, since this test isolates the passband decision, not
-    # the debounce timing (already covered elsewhere).
-    engine._pending_reverse_mode = "USB"
-    engine._pending_reverse_mode_since = 0.0
-
-    asyncio.run(engine._reverse_sync_tick(status, stub_rig.state))
-
-    assert stub_rig.set_modes == [("USB", 1800)]
+    assert stub_rig.set_modes == ["LSB"]
 
 
 class OutOfBandDriver(StubReverseDriver):
@@ -517,7 +557,7 @@ def test_mode_ladder_retries_and_succeeds_before_giving_up():
     _clear_reverse_mode_debounce(engine)
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # attempt 1: fails
-    assert stub_rig.set_modes == [("LSB", None)]
+    assert stub_rig.set_modes == ["LSB"]
     assert engine._mode_push is not None
     assert engine._reverse_sync_error is None  # not final yet -- still retrying
 
@@ -527,7 +567,7 @@ def test_mode_ladder_retries_and_succeeds_before_giving_up():
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # attempt 2: succeeds
 
-    assert stub_rig.set_modes == [("LSB", None), ("LSB", None)]
+    assert stub_rig.set_modes == ["LSB", "LSB"]
     assert engine._mode_push is None
     assert engine._reverse_sync_error is None
 
@@ -559,7 +599,7 @@ def test_mode_ladder_gives_up_after_max_attempts_and_reverts_to_rig():
         _clear_holdoff(engine)
         asyncio.run(engine._tick())
 
-    assert stub_rig.set_modes.count(("LSB", None)) == REVERSE_PUSH_MAX_ATTEMPTS
+    assert stub_rig.set_modes.count("LSB") == REVERSE_PUSH_MAX_ATTEMPTS
     assert engine._mode_push is None  # ladder gave up, not left dangling
     assert engine._reverse_sync_error is not None
     assert engine._last_sent_mode_key is None  # forces forward re-assert of the rig's real mode
@@ -568,7 +608,7 @@ def test_mode_ladder_gives_up_after_max_attempts_and_reverts_to_rig():
     # must not keep retrying it.
     _clear_holdoff(engine)
     asyncio.run(engine._tick())
-    assert stub_rig.set_modes.count(("LSB", None)) == REVERSE_PUSH_MAX_ATTEMPTS
+    assert stub_rig.set_modes.count("LSB") == REVERSE_PUSH_MAX_ATTEMPTS
 
 
 def test_rapid_mode_switch_supersedes_stale_in_flight_push():
@@ -591,7 +631,7 @@ def test_rapid_mode_switch_supersedes_stale_in_flight_push():
     _clear_reverse_mode_debounce(engine)
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # attempt 1 for CW: fails, ladder now in flight
-    assert stub_rig.set_modes == [("CW", None)]
+    assert stub_rig.set_modes == ["CW"]
     assert engine._mode_push is not None
     assert engine._mode_push.target == "CW"
 
@@ -601,7 +641,7 @@ def test_rapid_mode_switch_supersedes_stale_in_flight_push():
     asyncio.run(engine._tick())  # drops the stale CW ladder; arms LSB's debounce instead
 
     assert engine._mode_push is None
-    assert stub_rig.set_modes == [("CW", None)]  # no further CW attempts, no LSB attempt yet (debouncing)
+    assert stub_rig.set_modes == ["CW"]  # no further CW attempts, no LSB attempt yet (debouncing)
 
 
 def test_reverse_sync_pending_text_blank_on_first_attempt_shown_from_second():
@@ -649,7 +689,7 @@ def test_rig_write_rate_limiter_blocks_a_different_axis_write_after_a_failed_pus
     _clear_reverse_mode_debounce(engine)
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # attempt 1: fails -- does NOT touch _forward_push_completed_at
-    assert stub_rig.set_modes == [("LSB", None)]
+    assert stub_rig.set_modes == ["LSB"]
     assert engine._mode_push is not None  # still retrying, not given up yet
 
     status.freq_hz = 14_200_000
@@ -673,9 +713,7 @@ def test_reverse_cw_push_echoes_rigs_own_cw_variant_instead_of_canonical_cw():
     no way to signal which CW variant it means (its observable mode is
     always the canonical 'CW'), so when the rig is ALREADY in some
     CW-family mode, the push must echo the rig's own current mode name
-    back instead of forcing it to 'CW'. Also confirms the passband is
-    preserved in this case (mirrors the narrow/wide-variant preservation
-    this logic is modeled on)."""
+    back instead of forcing it to 'CW'."""
     engine = make_engine()
     stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW-L", passband_hz=500, ptt=False))
     status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
@@ -690,7 +728,7 @@ def test_reverse_cw_push_echoes_rigs_own_cw_variant_instead_of_canonical_cw():
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # pushes -- must echo "CW-L", not "CW"
 
-    assert stub_rig.set_modes == [("CW-L", 500)]
+    assert stub_rig.set_modes == ["CW-L"]
 
 
 def test_reverse_cw_push_falls_back_to_canonical_cw_when_rig_has_no_cw_family_mode():
@@ -712,7 +750,7 @@ def test_reverse_cw_push_falls_back_to_canonical_cw_when_rig_has_no_cw_family_mo
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # pushes -- no CW-family value to echo, sends canonical "CW"
 
-    assert stub_rig.set_modes == [("CW", None)]
+    assert stub_rig.set_modes == ["CW"]
 
 
 def test_mode_giveup_error_names_the_string_actually_sent_not_the_canonical_mode():
@@ -742,7 +780,7 @@ def test_mode_giveup_error_names_the_string_actually_sent_not_the_canonical_mode
         asyncio.run(engine._tick())
 
     # Every attempt really did send the echoed variant, not bare "CW".
-    assert stub_rig.set_modes.count(("CW-L", 500)) == REVERSE_PUSH_MAX_ATTEMPTS
+    assert stub_rig.set_modes.count("CW-L") == REVERSE_PUSH_MAX_ATTEMPTS
     assert engine._reverse_sync_error is not None
     assert "CW-L" in engine._reverse_sync_error
     # Bookkeeping unchanged: still keyed on the canonical, page-observable mode.
@@ -832,7 +870,7 @@ def test_reverse_sync_held_clears_in_flight_ladder_on_release_and_resumes_cleanl
     _clear_holdoff(engine)
     asyncio.run(engine._tick())
     assert engine._reverse_baseline_captured is True
-    assert stub_rig.set_modes == [("LSB", None)]
+    assert stub_rig.set_modes == ["LSB"]
 
 
 def test_reverse_sync_range_guard_rejects_frequency_above_max():
@@ -969,8 +1007,8 @@ def test_hold_engaged_mid_await_discards_the_stale_pushs_giveup_error():
     async def hold_during_the_final_attempt() -> None:
         entered_set_mode = asyncio.Event()
 
-        async def slow_set_mode(mode_name, passband_hz, verify_budget_s=None):
-            stub_rig.set_modes.append((mode_name, passband_hz))
+        async def slow_set_mode(mode_name, verify_budget_s=None):
+            stub_rig.set_modes.append(mode_name)
             entered_set_mode.set()
             await asyncio.sleep(0.02)  # real suspension, like the verify-readback loop
             return False

@@ -36,7 +36,7 @@ class StubRig:
     async def set_freq(self, freq_hz: int) -> bool:
         return True
 
-    async def set_mode(self, mode_name: str, passband_hz) -> bool:
+    async def set_mode(self, mode_name: str) -> bool:
         return True
 
 
