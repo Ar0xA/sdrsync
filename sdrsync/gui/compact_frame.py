@@ -16,7 +16,7 @@ from .fonts import big_freq_font, value_font_at
 from .format import fmt_hz_split
 from .state import AppState
 from .strip_panel import _Dot, _LabelValue, _PttTag, _VDivider
-from .widgets import FlatButton, ToggleButton
+from .widgets import CheckBox, FlatButton, ToggleButton
 
 FRAME_SIZE = (720, 92)
 
@@ -102,7 +102,7 @@ class CompactFrame(wx.Frame):
         self.pause_btn = ToggleButton(self, "Pause sync")
         sizer.Add(self.pause_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
 
-        self.mute_btn = ToggleButton(self, "Mute on TX")
+        self.mute_btn = CheckBox(self, "mute tx", emphasize_when_checked=True)
         sizer.Add(self.mute_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
 
         self.dock_btn = FlatButton(self, "Dock", is_primary=True)

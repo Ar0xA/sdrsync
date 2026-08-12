@@ -11,7 +11,7 @@ from . import theme
 from .fonts import label_font, value_font
 from .format import fmt_delta, fmt_hz
 from .state import AppState
-from .widgets import FlatButton, ToggleButton, _OwnerDrawnMixin
+from .widgets import CheckBox, FlatButton, ToggleButton, _OwnerDrawnMixin
 
 
 class _Dot(wx.Window):
@@ -363,7 +363,7 @@ class StripPanel(wx.Panel):
         self.pause_btn = ToggleButton(self, "Pause sync")
         sizer.Add(self.pause_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
 
-        self.mute_btn = ToggleButton(self, "Mute on TX")
+        self.mute_btn = CheckBox(self, "mute tx", emphasize_when_checked=True)
         sizer.Add(self.mute_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
 
         sizer.Add(_VDivider(self), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)

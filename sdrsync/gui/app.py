@@ -335,7 +335,7 @@ class MainFrame(wx.Frame):
     def _wire_strip_panel(self) -> None:
         sp = self.strip_panel
         sp.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
-        sp.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
+        sp.mute_btn.Bind(wx.EVT_CHECKBOX, self._on_strip_mute_toggled)
         sp.link_toggle.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_link_toggled)
         sp.connect_btn.Bind(wx.EVT_BUTTON, self._on_strip_connect_clicked)
         # EVT_CHOICE, not just click-time resolution -- the connect
@@ -373,7 +373,7 @@ class MainFrame(wx.Frame):
             return  # already undocked -- the strip that would trigger this is hidden anyway
         cf = CompactFrame(self, self.settings)
         cf.pause_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_pause_toggled)
-        cf.mute_btn.Bind(wx.EVT_TOGGLEBUTTON, self._on_strip_mute_toggled)
+        cf.mute_btn.Bind(wx.EVT_CHECKBOX, self._on_strip_mute_toggled)
         cf.on_dock = self._on_dock_clicked
         cf.Bind(wx.EVT_CLOSE, lambda evt: self._shutdown_and_destroy())
         self._compact_frame = cf

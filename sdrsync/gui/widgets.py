@@ -278,11 +278,20 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
     BOX_SIZE_DIP = 14
     GAP_DIP = 7
 
-    def __init__(self, parent: wx.Window, label: str = "", **kwargs) -> None:
+    def __init__(self, parent: wx.Window, label: str = "", emphasize_when_checked: bool = False, **kwargs) -> None:
         style = kwargs.pop("style", 0)
         wx.Control.__init__(self, parent, style=wx.BORDER_NONE | style, **kwargs)
         self._init_owner_drawn()
         self._label = label
+        # Opt-in (default False, preserving every existing CheckBox's look
+        # unchanged): dims the label to MUTED gray while unchecked and
+        # lifts it to ACCENT_TEXT while checked, instead of the flat TEXT
+        # colour every other CheckBox uses regardless of state. For a
+        # checkbox whose checked state has a live, ongoing effect (e.g.
+        # "Mute on TX" actually muting audio right now), the box's own
+        # small tint/checkmark wasn't obvious enough on its own -- see
+        # strip_panel.py's mute_btn.
+        self.emphasize_when_checked = emphasize_when_checked
         self.SetFont(value_font())
         self._recompute_min_size()
 
@@ -305,6 +314,15 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
 
     def GetLabel(self) -> str:  # noqa: N802
         return self._label
+
+    def _text_colour(self):
+        if self.emphasize_when_checked:
+            colour = theme.ACCENT_TEXT if self._checked else theme.MUTED
+        else:
+            colour = theme.TEXT
+        if not self.IsEnabled():
+            return theme.with_alpha(colour, 115)
+        return colour
 
     def _recompute_min_size(self) -> None:
         dc = wx.ClientDC(self)
@@ -354,7 +372,6 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
         if self.HasFocus():
             self._draw_focus_ring(gc, wx.Rect(0, int(box_y), box, box), radius)
 
-        text_colour = theme.with_alpha(theme.TEXT, 115) if not self.IsEnabled() else theme.TEXT
-        gc.SetFont(self.GetFont(), text_colour)
+        gc.SetFont(self.GetFont(), self._text_colour())
         _, th = gc.GetTextExtent(self._label)
         gc.DrawText(self._label, box + gap, (rect.height - th) / 2)
