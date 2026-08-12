@@ -409,6 +409,15 @@ class UberSDRDriver:
     # /v2/ one -- the root serves the older interface, which this driver then
     # navigates away from (see v2_page_url).
     FINGERPRINT_MARKERS = ("dist/v2.js", "browser-extension-detector.js")
+    # UNLIKE the other three drivers: CW and CWR forward-map to DISTINCT
+    # page modes (cwu/cwl -- see the module-level mode map above), and
+    # _REVERSE_MODE_MAP keeps them distinct on the way back too
+    # (CWU -> "CW", CWL -> "CWR") -- an observed "CW" here unambiguously
+    # means cwu, never cwl. sync/engine.py's reverse-sync CW echo must NOT
+    # treat this as ambiguous, or a genuine cwl<->cwu click gets silently
+    # overridden by the rig's own (possibly different) current CW-family
+    # mode.
+    CW_VARIANT_IS_AMBIGUOUS = False
 
     def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
         self.url = v2_page_url(url)

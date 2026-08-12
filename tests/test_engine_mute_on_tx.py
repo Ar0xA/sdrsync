@@ -41,6 +41,8 @@ class StubRig:
 
 
 class StubDriver:
+    CW_VARIANT_IS_AMBIGUOUS = True
+
     def __init__(self) -> None:
         self.attached = True
         self.mute_calls: list[bool] = []

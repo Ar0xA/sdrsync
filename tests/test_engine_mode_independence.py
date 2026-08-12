@@ -54,6 +54,8 @@ class StubDriver:
     """attached=True and no-op close() so it stands in for WebsdrOrgDriver in
     engine-level tests without a browser."""
 
+    CW_VARIANT_IS_AMBIGUOUS = True
+
     def __init__(self) -> None:
         self.attached = True
         self.tuned: list[int] = []

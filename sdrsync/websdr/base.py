@@ -59,6 +59,21 @@ class WebSDRDriver(Protocol):
     # driver can list multiple known marker variants without an API change.
     FINGERPRINT_MARKERS: ClassVar[tuple[str, ...]]
 
+    # True if this driver's OWN forward mode map collapses every rig-native
+    # CW-family name (CW/CWR/CW-U/CW-L) onto the SAME single observable
+    # page-mode value, making an observed "CW" genuinely ambiguous as to
+    # which rig-native variant the page wants (sync/engine.py's reverse-
+    # sync CW echo relies on this: it's only correct to substitute the
+    # rig's OWN current CW-family name back for an ambiguous observation).
+    # False for a driver whose reverse map (like UberSDR's CWU->"CW" /
+    # CWL->"CWR") already keeps the variants distinct -- for those, an
+    # observed mode UNAMBIGUOUSLY names one specific rig-native mode, and
+    # echoing the rig's current (possibly different) CW-family name back
+    # would silently override a real page click. Every new driver must
+    # state this explicitly, not inherit a default -- confirmed against
+    # each driver's own forward/reverse maps, not assumed.
+    CW_VARIANT_IS_AMBIGUOUS: ClassVar[bool]
+
     @property
     def attached(self) -> bool:
         """True once attach() has fully succeeded and stayed healthy since.

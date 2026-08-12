@@ -137,6 +137,9 @@ class KiwiSDRDriver:
     """
 
     FINGERPRINT_MARKERS = ("kiwisdr.min.js",)
+    # CW and CWR both forward-map to page mode "cw"/"cwn" (see _MODE_MAP
+    # above) and _REVERSE_MODE_MAP only has "CW" -> "CW" -- ambiguous.
+    CW_VARIANT_IS_AMBIGUOUS = True
 
     def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
         self.url = url

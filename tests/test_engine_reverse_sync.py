@@ -71,6 +71,12 @@ class StubReverseDriver:
     mode-mapping/CW-offset (already covered by their own pure-function
     tests)."""
 
+    # Matches websdr.org/KiwiSDR/OpenWebRX (the ambiguous-CW drivers) --
+    # these tests predate the ambiguous/unambiguous distinction and were
+    # written/passing under that assumption throughout. The UberSDR-
+    # specific (unambiguous) case has its own dedicated test below.
+    CW_VARIANT_IS_AMBIGUOUS = True
+
     def __init__(self, status: WebSDRStatus) -> None:
         self.attached = True
         self.status = status
@@ -831,6 +837,41 @@ def test_mode_giveup_error_names_the_string_actually_sent_not_the_canonical_mode
     assert "CW-L" in engine._reverse_sync_error
     # Bookkeeping unchanged: still keyed on the canonical, page-observable mode.
     assert engine._last_observed_mode_key == "CW"
+
+
+class UnambiguousCWDriver(StubReverseDriver):
+    """Stands in for UberSDR: unlike websdr.org/KiwiSDR/OpenWebRX, its
+    reverse map keeps CW-family variants distinct (CWU -> "CW", CWL ->
+    "CWR" -- see ubersdr.py's own CW_VARIANT_IS_AMBIGUOUS docstring), so
+    an observed "CW" here is NOT ambiguous."""
+
+    CW_VARIANT_IS_AMBIGUOUS = False
+
+
+def test_reverse_cw_push_does_not_echo_for_a_driver_with_unambiguous_cw_variants():
+    """UberSDR-shaped regression guard: the CW echo above is WRONG for a
+    driver whose reverse map already keeps CW-family variants distinct.
+    Confirmed live: a user on UberSDR clicks cwu on the page while the rig
+    is on CWR (cwl) -- obs_mode becomes the canonical "CW", but that
+    UNAMBIGUOUSLY means cwu here, not "whichever CW variant the rig
+    already happens to be in". Echoing the rig's stale "CW-L"/CWR back
+    would silently revert the user's real click. Must send the canonical
+    obs_mode untouched instead."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW-L", passband_hz=500, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = UnambiguousCWDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "CW"  # user clicks cwu on the page; rig is still on CW-L (cwl)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # pushes -- must send canonical "CW", NOT echo "CW-L"
+
+    assert stub_rig.set_modes == ["CW"]
 
 
 def test_reverse_sync_held_suppresses_the_whole_reverse_tick():

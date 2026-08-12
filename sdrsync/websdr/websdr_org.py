@@ -124,6 +124,10 @@ class WebsdrOrgDriver:
     """
 
     FINGERPRINT_MARKERS = ("websdr-base.js",)
+    # CW/CWR/CW-U/CW-L all forward-map to the single page mode "CW" (see
+    # _MODE_MAP above) and _REVERSE_MODE_MAP only has "CW" -> "CW" -- a
+    # genuinely ambiguous observation.
+    CW_VARIANT_IS_AMBIGUOUS = True
 
     def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
         self.url = url

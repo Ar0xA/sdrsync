@@ -936,6 +936,25 @@ class MainFrame(wx.Frame):
             self._strip_connect_busy_label = None
             ws = snap.websdr
             self._state.sdr_connected = bool(ws and ws.connected)
+            # Reconcile from the engine's own reported site identity
+            # whenever the GUI's locally-tracked one is missing or stale.
+            # Covers the idle auto-resume path specifically: SyncEngine.
+            # _resume_websdr_after_idle() brings a session back with no
+            # click at all, so _begin_websdr_connect/_begin_websdr_switch
+            # (the only places that otherwise set _active_websdr_site)
+            # never run -- without this, the strip shows a blank site name
+            # and its Connect/Disconnect button reads "Load" (comparing
+            # against an empty state.site) instead of "Disconnect", and
+            # clicking it does a full switch/reload instead of
+            # disconnecting.
+            if snap.websdr_site_url is not None and (
+                self._active_websdr_site is None or self._active_websdr_site.url != snap.websdr_site_url
+            ):
+                self._active_websdr_site = WebSDRSite(
+                    name=snap.websdr_site_name,
+                    url=snap.websdr_site_url,
+                    driver_type=snap.websdr_site_driver_type,
+                )
             if ws is not None:
                 self._state.sdr_hz = ws.freq_hz or 0
                 if self._active_websdr_site is not None:

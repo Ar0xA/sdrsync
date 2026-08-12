@@ -42,6 +42,8 @@ class DisconnectingDriver:
     would raise AttributeError if called on self.engine._driver afterward
     without a None-check."""
 
+    CW_VARIANT_IS_AMBIGUOUS = True
+
     def __init__(self, engine: SyncEngine) -> None:
         self.attached = True
         self.engine = engine

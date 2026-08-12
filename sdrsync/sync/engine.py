@@ -409,6 +409,20 @@ class StatusSnapshot(GuiMessage):
     # string for the same reason reverse_sync_held is separate: this is a
     # deliberate, healthy state, and must not render as a failure.
     websdr_idle_stopped: bool = False
+    # Mirrors SyncEngine.site (None when no WebSDR session is active).
+    # gui/app.py tracks its OWN _active_websdr_site, set only from its
+    # click handlers (_begin_websdr_connect/_begin_websdr_switch) -- an
+    # idle auto-resume (SyncEngine._resume_websdr_after_idle) brings a
+    # session back with no click at all, so without these the GUI has no
+    # way to learn which site actually reconnected: the strip shows a
+    # blank site name and its Connect/Disconnect button reads "Load"
+    # (comparing against an empty state.site) instead of "Disconnect",
+    # and clicking it does a full switch/reload instead of disconnecting.
+    # Split into 3 plain strings rather than a WebSDRSite object so this
+    # stays a trivial dataclass-of-primitives like every other field here.
+    websdr_site_name: Optional[str] = None
+    websdr_site_url: Optional[str] = None
+    websdr_site_driver_type: Optional[str] = None
 
 
 class SyncEngine:
@@ -752,6 +766,9 @@ class SyncEngine:
             reverse_sync_held=self._reverse_sync_held,
             forward_sync_paused=self._forward_sync_paused,
             websdr_idle_stopped=self._websdr_idle_stopped,
+            websdr_site_name=self.site.name if self.site is not None else None,
+            websdr_site_url=self.site.url if self.site is not None else None,
+            websdr_site_driver_type=self.site.driver_type if self.site is not None else None,
             rig_connect_remaining_s=(
                 max(0.0, self._rig_connect_deadline - time.monotonic())
                 if self._rig_connect_deadline is not None else None
@@ -908,21 +925,33 @@ class SyncEngine:
         self._publish()
 
     # ------------------------------------------------------------------ websdr
-    async def _start_websdr(self, site: WebSDRSite, user_initiated: bool = True) -> None:
+    async def _start_websdr(self, site: WebSDRSite, user_initiated: bool = True) -> bool:
         """user_initiated=False marks an INTERNAL restart (recovering from
         a dead WebView), which must NOT reset the attach-failure ladder --
         that's the exact laundering path that let a site failing every
         few seconds be retried forever at the base delay. Defaults to True
         so the GUI-facing entry point (start_websdr_from_other_thread)
         needs no change: a real Connect/Switch click is a fresh human
-        decision and deserves a clean ladder."""
+        decision and deserves a clean ladder.
+
+        Returns True if this call's own outcome (success OR a genuine
+        failure) is authoritative and the caller should act on it; False
+        only for the superseded case below, where a concurrent event
+        already decided this attempt's fate and its outcome must be
+        ignored. _resume_websdr_after_idle() is the one caller that needs
+        this distinction -- without it, "was I superseded" and "did I
+        genuinely fail" are both just "_websdr_active is still False" from
+        the caller's point of view, and re-arming auto-resume for the
+        superseded case would silently undo whatever superseded it (a
+        Disconnect, or a competing Connect/Switch to a different site).
+        Every other caller is fire-and-forget and ignores this."""
         driver_cls = DRIVERS.get(site.driver_type)
         if driver_cls is None:
             logger.error("No WebSDR driver registered for type %r", site.driver_type)
             self._publish(websdr=WebSDRStatus(
                 connected=False, last_error=f"No WebSDR driver registered for type {site.driver_type!r}"
             ))
-            return
+            return True
 
         if self._websdr_active:
             await self._stop_websdr()
@@ -957,7 +986,7 @@ class SyncEngine:
         except Exception as e:
             logger.exception("Failed to create WebView for WebSDR session")
             self._publish(websdr=WebSDRStatus(connected=False, last_error=_describe_webview_create_error(e)))
-            return
+            return True
 
         if self._websdr_generation != my_generation:
             # Something else -- a user Disconnect, another Start/Switch --
@@ -977,7 +1006,18 @@ class SyncEngine:
                 await self._webview_host.destroy_page(page, self._loop)
             except Exception:
                 logger.exception("Error destroying superseded WebView")
-            return
+            # Every OTHER exit from this method publishes a snapshot
+            # carrying a non-None `websdr` -- gui/app.py's
+            # _apply_status_snapshot() uses exactly that ("websdr_active
+            # is False, but websdr is not None") as its only signal that a
+            # pending Connect is genuinely OVER, not just "no news yet".
+            # A silent return here left _websdr_connect_pending latched
+            # forever: the strip's Connect button stuck disabled, reading
+            # "Connecting..." indefinitely, with no click able to clear it
+            # (reachable for real once _stop_rig() started unconditionally
+            # bumping the generation for this exact race).
+            self._publish(websdr=WebSDRStatus(connected=False))
+            return False
 
         self._page = page
         self.site = site
@@ -990,6 +1030,7 @@ class SyncEngine:
         self._attach_task = asyncio.ensure_future(self._attach_supervisor(self._page))
         logger.info("WebSDR session started: %s (%s)", site.name, site.url)
         self._publish()
+        return True
 
     def _on_page_dead(self, generation: int, reason: str) -> None:
         """Called by WxPageAdapter (via wx.CallAfter) when a script timeout
@@ -1319,8 +1360,15 @@ class SyncEngine:
         # stale and no longer describes the network, so starting the
         # ladder clean is right; the ladder rebuilds within seconds if the
         # site really is still down.
-        await self._start_websdr(site, user_initiated=True)
-        if not self._websdr_active:
+        # authoritative=False means _start_websdr() was superseded by a
+        # concurrent event (a Disconnect, a competing Connect/Switch click)
+        # while create_page() was in flight -- see that method's own
+        # docstring for why this must NOT be treated as a failure: without
+        # it, re-arming here would silently undo the Disconnect (the exact
+        # thing _stop_rig()'s unconditional generation bump exists to
+        # prevent), or clobber a session the user just switched to by hand.
+        authoritative = await self._start_websdr(site, user_initiated=True)
+        if authoritative and not self._websdr_active:
             # _start_websdr() has early-return failure paths (no driver
             # registered for the site's type, create_page() raising). We
             # already cleared the idle-stopped flags above, so without
@@ -1731,21 +1779,36 @@ class SyncEngine:
                 push = self._mode_push
                 if push is not None and can_write_rig and time.monotonic() >= push.next_attempt_at:
                     # CW is the one mode family where multiple rig-native
-                    # names (CW, CWR, CW-U, CW-L) all collapse to the same
+                    # names (CW, CWR, CW-U, CW-L) can collapse to the same
                     # WebSDR-observable value ("CW") -- the page has no way
-                    # to tell us which variant it wants. Some rigctld
+                    # to tell us which variant it wants, for a driver whose
+                    # OWN reverse map is that ambiguous (self._driver.
+                    # CW_VARIANT_IS_AMBIGUOUS -- true for websdr.org/
+                    # KiwiSDR/OpenWebRX, false for UberSDR, which keeps
+                    # cwu/cwl -- and so CW/CWR -- distinct both ways; see
+                    # each driver's own flag for why). Some rigctld
                     # backends/rig models only accept "CW-U"/"CW-L" as valid
                     # SET-mode strings and reject a bare "CW" outright
                     # (confirmed live: KiwiSDR + a rig with no plain CW
                     # mode). So when the rig is ALREADY in some CW-family
-                    # mode, echo its own current name back instead of
-                    # forcing it to "CW" -- only a genuine transition INTO
-                    # CW from a different mode family falls back to the
-                    # canonical "CW", since there's no rig-native value to
-                    # echo in that case. No other standard hamlib mode name
-                    # starts with "CW", so this check is safe.
+                    # mode AND the observation is genuinely ambiguous, echo
+                    # the rig's own current name back instead of forcing it
+                    # to "CW" -- but only then: for an unambiguous driver,
+                    # obs_mode already names one specific rig-native mode,
+                    # and echoing the rig's current (possibly DIFFERENT)
+                    # CW-family name back would silently override a real
+                    # page click (e.g. UberSDR cwl->cwu confirmed live to
+                    # revert to the rig's stale CWR ~30s later). A genuine
+                    # transition INTO CW from a different mode family falls
+                    # back to the canonical obs_mode either way, since
+                    # there's no rig-native value to echo in that case.
                     mode_to_send = obs_mode
-                    if obs_mode == "CW" and state.mode is not None and state.mode.upper().startswith("CW"):
+                    if (
+                        obs_mode == "CW"
+                        and self._driver.CW_VARIANT_IS_AMBIGUOUS
+                        and state.mode is not None
+                        and state.mode.upper().startswith("CW")
+                    ):
                         mode_to_send = state.mode
                     # Mode-only -- filter/bandwidth is never touched by a
                     # reverse-sync push (see RigClient.set_mode()'s own

@@ -22,6 +22,8 @@ from sdrsync.websdr.base import WebSDRStatus
 
 
 class StubDriver:
+    CW_VARIANT_IS_AMBIGUOUS = True
+
     def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
         self.url = url
         self.attached = True
@@ -394,23 +396,35 @@ class GatedWebViewHost(StubWebViewHost):
     the test releases it -- lets a test suspend a coroutine PRECISELY
     inside the create_page() await, the exact race window
     _start_websdr()'s post-create_page() generation re-check guards
-    against (a Disconnect racing a page-death recovery)."""
+    against (a Disconnect racing a page-death recovery).
+
+    Supports more than one outstanding gate (FIFO): each block_next_create()
+    call queues a fresh Event for the NEXT create_page() call specifically
+    (each call claims the next queued gate in order, never the same one
+    twice), and returns that Event so a test needing precise control over
+    TWO overlapping create_page() calls can release them independently and
+    in either order -- release() is a convenience for the common
+    single-gate case, releasing the oldest still-queued gate."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._gate: "asyncio.Event | None" = None
+        self._pending_gates: "list[asyncio.Event]" = []
+        self._claim_index = 0
 
-    def block_next_create(self) -> None:
-        self._gate = asyncio.Event()
+    def block_next_create(self) -> "asyncio.Event":
+        gate = asyncio.Event()
+        self._pending_gates.append(gate)
+        return gate
 
     def release(self) -> None:
-        if self._gate is not None:
-            self._gate.set()
+        if self._pending_gates:
+            self._pending_gates.pop(0).set()
 
     async def create_page(self, loop, on_dead=None):
-        if self._gate is not None:
-            await self._gate.wait()
-            self._gate = None
+        if self._claim_index < len(self._pending_gates):
+            gate = self._pending_gates[self._claim_index]
+            self._claim_index += 1  # claimed synchronously, before awaiting
+            await gate.wait()
         return await super().create_page(loop, on_dead=on_dead)
 
 
@@ -461,6 +475,80 @@ def test_page_death_recovery_racing_a_disconnect_does_not_resurrect_the_session(
         # the stale recovery's own (immediately-superseded) page.
         assert len(host.created) == 2
         assert len(host.destroyed) == 2
+
+    asyncio.run(run())
+
+
+def test_superseded_start_publishes_a_terminal_snapshot(monkeypatch):
+    """Every OTHER exit from _start_websdr() publishes a snapshot carrying
+    a non-None `websdr` -- gui/app.py's _apply_status_snapshot() uses
+    exactly that ("websdr_active is False, but websdr is not None") as
+    its only signal that a pending Connect is genuinely over, not just
+    "no news yet". A silent return on the superseded path left the GUI's
+    _websdr_connect_pending latch stuck forever (Connect button disabled,
+    reading "Connecting..." indefinitely, with no click able to clear
+    it)."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    host = GatedWebViewHost()
+    settings = AppSettings()
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=host)
+    engine._attach_supervisor = _noop_attach_supervisor
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        while not engine.status_queue.empty():
+            engine.status_queue.get_nowait()
+
+        host.block_next_create()
+        start_task = asyncio.ensure_future(engine._start_websdr(site))
+        await asyncio.sleep(0)  # suspend inside create_page()
+
+        # Something else supersedes this attempt (a Disconnect is the
+        # simplest way to bump the generation without needing a second
+        # concurrent task).
+        await engine._stop_websdr()
+        host.release()
+        committed = await start_task
+        assert committed is False  # superseded, per _start_websdr()'s own contract
+
+        snapshots = []
+        while not engine.status_queue.empty():
+            snapshots.append(engine.status_queue.get_nowait())
+        terminal = [s for s in snapshots if not s.websdr_active and s.websdr is not None]
+        assert terminal, "no snapshot carried a non-None websdr after the superseded start"
+
+    asyncio.run(run())
+
+
+def test_publish_carries_the_active_sites_identity(monkeypatch):
+    """StatusSnapshot.websdr_site_name/url/driver_type mirror
+    SyncEngine.site -- gui/app.py reconciles its own locally-tracked
+    _active_websdr_site from these fields specifically to cover the idle
+    auto-resume path, which brings a session back with no click at all
+    (see test_idle_resume_racing_a_rig_disconnect_does_not_undo_it_or_
+    rearm's docstring for why _active_websdr_site can otherwise go
+    stale)."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    engine = make_engine()
+    site = WebSDRSite(name="A Receiver", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        while not engine.status_queue.empty():
+            engine.status_queue.get_nowait()
+
+        await engine._start_websdr(site)
+
+        snap = engine.status_queue.get_nowait()
+        assert snap.websdr_site_name == "A Receiver"
+        assert snap.websdr_site_url == "http://a.invalid/"
+        assert snap.websdr_site_driver_type == "websdr_org"
+
+        await engine._stop_websdr()
+        snap2 = engine.status_queue.get_nowait()
+        assert snap2.websdr_site_name is None
+        assert snap2.websdr_site_url is None
+        assert snap2.websdr_site_driver_type is None
 
     asyncio.run(run())
 
@@ -585,6 +673,8 @@ class ScriptedAttachDriver:
     """Driver whose attach() outcome the test controls, and whose
     `attached` flag the test can flip between supervisor iterations to
     simulate a real drop."""
+
+    CW_VARIANT_IS_AMBIGUOUS = True
 
     def __init__(self, url: str = "http://a.invalid/", cw_offset_hz: int = 0) -> None:
         self.url = url
@@ -1124,6 +1214,121 @@ def test_a_repeatedly_failing_idle_resume_is_rate_limited(monkeypatch):
 
         assert len(attempts) == 1  # not ten
         assert engine._websdr_idle_stopped is True  # still armed for a real retry
+
+    asyncio.run(run())
+
+
+def test_idle_resume_racing_a_rig_disconnect_does_not_undo_it_or_rearm(monkeypatch):
+    """_resume_websdr_after_idle() awaits _start_websdr(), which can be
+    superseded (its own generation guard silently drops the attempt) by a
+    real rig Disconnect landing during create_page(). Before the fix, the
+    resume read "not _websdr_active" as a plain failure and RE-ARMED
+    auto-resume right after the Disconnect -- silently undoing it: the
+    next time the rig reconnects and the VFO moves, sdrsync would reopen
+    a session on a receiver the user explicitly disconnected from."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    settings = AppSettings()
+    settings.websdr_idle_disconnect_min = 1
+    host = GatedWebViewHost()
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=host)
+    engine._attach_supervisor = _noop_attach_supervisor
+    engine._rig = IdleStubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    engine._rig_active = True
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        # Arm the idle-stopped state directly -- this test is about the
+        # resume racing a Disconnect, not idle-detection itself (already
+        # covered by test_idle_threshold_disconnects_the_websdr_and_arms_
+        # auto_resume above).
+        engine._websdr_idle_stopped = True
+        engine._idle_stopped_site = site
+        engine._idle_stopped_site_was_listed = False
+
+        host.block_next_create()
+        resume_task = asyncio.ensure_future(engine._resume_websdr_after_idle())
+        await asyncio.sleep(0)  # let it reach and suspend inside create_page()
+
+        # A real rig Disconnect races in and completes first.
+        await engine._stop_rig()
+        assert engine._rig_active is False
+
+        host.release()
+        await resume_task
+
+        # Must not have been silently undone, and must not be re-armed --
+        # re-arming here would itself constitute undoing the Disconnect
+        # the moment the rig reconnects and the VFO moves.
+        assert engine._websdr_active is False
+        assert engine._websdr_idle_stopped is False
+        assert engine._idle_stopped_site is None
+        assert engine.site is None
+
+    asyncio.run(run())
+
+
+def test_idle_resume_racing_a_user_switch_does_not_clobber_it(monkeypatch):
+    """Same supersede race, different winner: the user picks a DIFFERENT
+    site and clicks Connect while the idle resume is still suspended
+    creating its WebView. The exact interleaving that exposes the bug:
+    the winning _start_websdr(NEW) bumps the generation (poisoning the
+    resume's attempt) but hasn't YET set _websdr_active=True when the
+    resume's own post-create_page() check runs -- so "not self.
+    _websdr_active" reads True even though a winner already exists, and
+    the resume misreads its own supersession as a genuine failure,
+    re-arming to reconnect the OLD site. IDLE_RESUME_RETRY_GAP_S later,
+    that would tear down the user's freshly-chosen live session and
+    replace it with the stale one."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    monkeypatch.setitem(engine_module.DRIVERS, "kiwisdr", StubDriver)
+    settings = AppSettings()
+    settings.websdr_idle_disconnect_min = 1
+    host = GatedWebViewHost()
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=host)
+    engine._attach_supervisor = _noop_attach_supervisor
+    engine._rig = IdleStubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    engine._rig_active = True
+    old_site = WebSDRSite(name="OLD", url="http://old.invalid/", driver_type="websdr_org")
+    new_site = WebSDRSite(name="NEW", url="http://new.invalid/", driver_type="kiwisdr")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        engine._websdr_idle_stopped = True
+        engine._idle_stopped_site = old_site
+        engine._idle_stopped_site_was_listed = False
+
+        resume_gate = host.block_next_create()
+        resume_task = asyncio.ensure_future(engine._resume_websdr_after_idle())
+        await asyncio.sleep(0)  # resume claims resume_gate, suspends inside create_page()
+
+        # The user picks a DIFFERENT site and clicks Connect while the
+        # resume is still suspended. Also gated -- suspends too, so it
+        # bumps the generation (poisoning the resume's own my_generation)
+        # WITHOUT yet committing _websdr_active=True.
+        winner_gate = host.block_next_create()
+        start_task = asyncio.ensure_future(engine._start_websdr(new_site, user_initiated=True))
+        await asyncio.sleep(0)  # winner bumps generation, claims winner_gate, suspends
+        assert engine._websdr_active is False  # not committed yet -- this is the exact window
+
+        # Release the RESUME first, while the winner is still suspended:
+        # its post-create_page() generation check now correctly sees it
+        # was superseded, but _websdr_active is STILL False at this
+        # instant -- exactly the ambiguity _start_websdr()'s authoritative
+        # return value exists to resolve.
+        resume_gate.set()
+        await resume_task
+
+        # Now let the winner finish committing.
+        winner_gate.set()
+        await start_task
+
+        # The resume must not have overwritten the user's live choice, or
+        # re-armed to reconnect the OLD site out from under it.
+        assert engine.site is new_site
+        assert engine._websdr_active is True
+        assert engine._websdr_idle_stopped is False
+        assert engine._idle_stopped_site is None
 
     asyncio.run(run())
 
