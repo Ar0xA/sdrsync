@@ -876,6 +876,16 @@ class SyncEngine:
         # disarms auto-resume; this is that promise for the rig-stop path.
         self._websdr_idle_stopped = False
         self._idle_stopped_site = None
+        # Also unconditional, same reasoning: a WebSDR _start_websdr() can
+        # be mid-flight (suspended in its own create_page() await) with
+        # _websdr_active still False -- the cascade above only fires once
+        # that flag is already True, which it isn't yet during that
+        # window. _start_websdr()'s own post-await generation re-check is
+        # what actually catches this, but only if this bump happens here;
+        # without it, a rig Disconnect landing during that window is
+        # silently undone once the in-flight start resumes and commits a
+        # full WebSDR session against a rig that's already gone.
+        self._websdr_generation += 1
         if self._rig is not None:
             await self._rig.close()
             self._rig = None
@@ -1051,20 +1061,46 @@ class SyncEngine:
             return
 
         self._websdr_generation += 1  # invalidates any in-flight on_dead notification
-        if self._attach_task is not None:
-            self._attach_task.cancel()
+        # Captured BEFORE the awaits below, and never re-read from
+        # self._attach_task/self._driver afterward -- a concurrent second
+        # switch (e.g. a double-click on the Sites panel's Load button,
+        # which nothing disables mid-switch) can suspend here too and
+        # install ITS OWN attach_task/driver on self while this call is
+        # still awaiting; operating on live self.-attributes after that
+        # point could cancel/close the WINNING switch's objects instead of
+        # this call's own stale ones.
+        my_generation = self._websdr_generation
+        old_attach_task = self._attach_task
+        old_driver = self._driver
+        if old_attach_task is not None:
+            old_attach_task.cancel()
             try:
-                await self._attach_task
+                await old_attach_task
             except asyncio.CancelledError:
                 pass
             except Exception:
                 logger.exception("Attach supervisor raised while switching WebSDR sites")
-            self._attach_task = None
-        if self._driver is not None:
+        if old_driver is not None:
             try:
-                await self._driver.close()
+                await old_driver.close()
             except Exception:
                 logger.exception("Error closing WebSDR driver during switch")
+
+        if self._websdr_generation != my_generation:
+            # Superseded by another concurrent switch/start/stop while the
+            # awaits above were in flight -- whatever superseded us
+            # already owns (or is about to own) self.site/self._driver/
+            # self._attach_task. Don't touch any of it: no bookkeeping
+            # reset, no new driver, no second attach supervisor. Without
+            # this, both calls would install their own attach_task
+            # (overwriting, not cancelling, whichever the other one just
+            # set), leaving two supervisors driving the same page forever.
+            logger.info(
+                "Dropping stale WebSDR switch to %s (superseded while tearing down the old driver)", site.name,
+            )
+            return
+
+        self._attach_task = None
 
         # A user-picked switch is a fresh human decision, same reasoning as
         # _start_websdr(user_initiated=True)'s identical reset.
@@ -1079,7 +1115,6 @@ class SyncEngine:
         self.site = site
         self._driver = driver_cls(site.url, cw_offset_hz=self.settings.cw_offset_hz)
         self._reset_sync_latches()
-        my_generation = self._websdr_generation
         # Re-bound against the SAME page for the new generation -- see
         # WxPageAdapter.set_on_dead()'s docstring for why this can't be
         # skipped just because create_page() (which normally wires this

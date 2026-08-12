@@ -465,6 +465,117 @@ def test_page_death_recovery_racing_a_disconnect_does_not_resurrect_the_session(
     asyncio.run(run())
 
 
+def test_rig_disconnect_during_an_in_flight_websdr_connect_is_not_undone(monkeypatch):
+    """_start_websdr()'s post-await generation re-check only catches a
+    concurrent _stop_rig() if something actually bumps the generation
+    while _websdr_active is still False (i.e. before the in-flight start
+    has committed) -- _stop_rig()'s own cascade only fires once
+    _websdr_active is True, which it isn't yet during create_page(). Must
+    bump the generation unconditionally, or a rig Disconnect landing in
+    that window is silently undone once the in-flight start resumes."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    settings = AppSettings()
+    host = GatedWebViewHost()
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=host)
+    engine._attach_supervisor = _noop_attach_supervisor
+    engine._rig_active = True
+    rig_stub = StubRig()
+    engine._rig = rig_stub
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        host.block_next_create()
+        start_task = asyncio.ensure_future(engine._start_websdr(site))
+        await asyncio.sleep(0)  # let it reach and suspend inside create_page()
+
+        # A real rig Disconnect races in and completes first.
+        await engine._stop_rig()
+        assert engine._rig_active is False
+        assert engine._rig is None
+
+        host.release()
+        await start_task
+
+        # The Disconnect must not have been silently undone.
+        assert engine._websdr_active is False
+        assert engine.site is None
+        assert engine._page is None
+        assert engine._driver is None
+        assert len(host.created) == 1
+        assert len(host.destroyed) == 1  # the orphaned page must not leak
+
+    asyncio.run(run())
+
+
+class GatedDriver(StubDriver):
+    """StubDriver whose close() can fire a one-shot callback -- lets a
+    test simulate a concurrent second _switch_websdr() completing and
+    installing its own state PRECISELY while this call is suspended
+    inside its own 'await old_driver.close()' step, the exact race window
+    the post-await generation re-check guards against."""
+
+    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+        super().__init__(url, cw_offset_hz)
+        self.on_close = None
+
+    async def close(self) -> None:
+        if self.on_close is not None:
+            cb, self.on_close = self.on_close, None
+            cb()
+        await super().close()
+
+
+def test_switch_websdr_racing_a_second_switch_does_not_clobber_the_winner(monkeypatch):
+    """Two overlapping _switch_websdr() calls (nothing disables the Sites
+    panel's Load button mid-switch, so a double-click or Load-then-Load
+    on two rows reaches this) must not both install their own attach_task
+    -- the loser overwriting (not cancelling) the winner's attach_task
+    would leave two supervisors driving the same page forever."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", GatedDriver)
+    monkeypatch.setitem(engine_module.DRIVERS, "kiwisdr", StubDriver)
+    engine = make_engine()
+    site_a = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+    site_b = WebSDRSite(name="B", url="http://b.invalid/", driver_type="kiwisdr")
+    winner_site = WebSDRSite(name="Winner", url="http://winner.invalid/", driver_type="kiwisdr")
+
+    async def run():
+        await engine._start_websdr(site_a)
+        original_driver = engine._driver  # a GatedDriver
+
+        winner_driver = StubDriver("http://winner.invalid/")
+        winner_task = asyncio.ensure_future(_noop_attach_supervisor(None))
+
+        def simulate_concurrent_winner():
+            # What a second, faster _switch_websdr() call would have
+            # installed while this call was suspended closing the old
+            # driver -- mutating engine state directly (rather than
+            # racing a second real _switch_websdr() call, which would
+            # itself contend on the SAME old_driver.close() this callback
+            # fires from) keeps the test deterministic.
+            engine._websdr_generation += 1
+            engine.site = winner_site
+            engine._driver = winner_driver
+            engine._attach_task = winner_task
+
+        original_driver.on_close = simulate_concurrent_winner
+
+        await engine._switch_websdr(site_b)  # the stale, slower switch
+
+        # Must not have overwritten the "winner"'s state.
+        assert engine.site is winner_site
+        assert engine._driver is winner_driver
+        assert engine._attach_task is winner_task
+
+        winner_task.cancel()
+        try:
+            await winner_task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+
 # ----------------------------------------------------------------------
 # v14 attach-supervisor redesign (Item 5) and idle disconnect (Item 7).
 # ----------------------------------------------------------------------
