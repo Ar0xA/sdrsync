@@ -33,7 +33,17 @@ public sealed class SyncEngine
 {
     // ------------------------------------------------------------------ constants
     public const double FreqDebounceS = 0.2;
-    public const int FreqChangeThresholdHz = 10;
+    // 0, not a small positive jitter margin: the same constant gated BOTH
+    // "is this reading different enough to become a new pending candidate"
+    // AND "is the candidate different enough from what was last sent to
+    // bother pushing", both with a strict >. A change at-or-below a
+    // positive threshold never even registered as a candidate, so it
+    // wasn't filtered once -- it got permanently stuck (accumulating
+    // invisibly) until enough small changes crossed the threshold
+    // cumulatively, producing a "nothing happens, then it suddenly jumps"
+    // symptom live users reported. FreqDebounceS already does the actual
+    // job of coalescing a burst of rapid small changes into one push.
+    public const int FreqChangeThresholdHz = 0;
     public const double FullResyncIntervalS = 30.0;
     public const double WebsdrMinWriteGapS = 0.5;
     public const double ForwardPushBackoffBaseS = 1.0;
@@ -52,7 +62,9 @@ public sealed class SyncEngine
 
     public const double ReverseHoldoffS = 1.0;
     public const double ReverseFreqDebounceS = 0.5;
-    public const int ReverseFreqChangeThresholdHz = 50;
+    // 0 -- see FreqChangeThresholdHz's comment; same stuck-candidate bug,
+    // same fix, mirrored for the reverse (WebSDR -> rig) direction.
+    public const int ReverseFreqChangeThresholdHz = 0;
     public const double ReverseModeDebounceS = 0.35;
     public const double ReversePushAttemptVerifyS = 1.0;
     public const int ReversePushMaxAttempts = 2;
@@ -80,6 +92,17 @@ public sealed class SyncEngine
     internal string? _rigHost;
     internal int? _rigPort;
     internal double? _rigConnectDeadline;
+
+    // Bumped as the FIRST action of every StartRigAsync() call -- including
+    // a same-tick mock-bind failure -- so every snapshot published from one
+    // attempt (through its eventual give-up) shares one generation, and a
+    // fresh Connect click's first snapshot always carries a strictly
+    // greater one. Without this, a GUI status-queue backlog from a FAILED
+    // attempt can still be draining at the exact moment the user clicks
+    // Connect again, re-popping a stale error for an attempt that hasn't
+    // started -- see StatusSnapshot.RigGeneration's doc comment for the
+    // GUI-side half of this fix.
+    internal int _rigGeneration;
 
     // WebSDR subsystem.
     internal IWebSdrPage? _page;
@@ -230,6 +253,7 @@ public sealed class SyncEngine
 
         var snapshot = new StatusSnapshot
         {
+            RigGeneration = _rigGeneration,
             RigActive = _rigActive,
             RigConnected = rigConnected ?? false,
             RigFreqHz = rigFreqHz,
@@ -299,6 +323,8 @@ public sealed class SyncEngine
     /// </summary>
     internal async Task StartRigAsync(string backend, string host, int port, bool useMock)
     {
+        _rigGeneration++;
+
         if (_rigActive)
         {
             await StopRigAsync();
@@ -1072,6 +1098,10 @@ public sealed class SyncEngine
                         modeToSend = state.Mode;
                     }
 
+                    // passbandHz is computed for observability/test purposes
+                    // only -- neither RigctldClient nor FlrigClient's
+                    // SetModeAsync ever puts it on the wire (see their doc
+                    // comments); a mode change here is mode-only, always.
                     var passbandHz = modeToSend == state.Mode ? state.PassbandHz : null;
                     var ok = await _rig!.SetModeAsync(modeToSend, passbandHz, ReversePushAttemptVerifyS);
                     _lastRigWriteAt = MonotonicClock.NowS();

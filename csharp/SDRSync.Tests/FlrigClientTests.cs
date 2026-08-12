@@ -70,6 +70,35 @@ public class FlrigClientTests
     }
 
     [Fact]
+    public async Task SetFreq_SendsADoubleNotAnIntOverTheWire()
+    {
+        // Regression test for a live bug: real flrig's rig.set_vfoA is
+        // registered with XML-RPC signature "d:d" (confirmed against
+        // flrig's own C++ source, src/server/xml_server.cxx, which does
+        // `(double)params[0]`) and its bundled XmlRpc++ library enforces
+        // that signature strictly by wire type -- sending a plain <i4>
+        // serializes as the wrong type and real flrig rejects it outright
+        // with Fault -1 "type error", before ever reaching the rig. This
+        // fake server doesn't enforce that (see
+        // FakeFlrigState.LastSetVfoAArgType's doc comment), so a
+        // value-only assertion would pass even with the bug; this checks
+        // the actual deserialized wire type instead.
+        var server = await FakeFlrigServer.StartAsync(port: 0);
+        var client = new FlrigClient("127.0.0.1", server.Port);
+        try
+        {
+            Assert.True(await client.ConnectAsync());
+            Assert.True(await client.SetFreqAsync(7074000));
+            Assert.Equal(typeof(double), server.State.LastSetVfoAArgType);
+        }
+        finally
+        {
+            await client.DisposeAsync();
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task SetMode_SuccessAppliesAndConfirms()
     {
         var server = await FakeFlrigServer.StartAsync(port: 0);
@@ -79,6 +108,36 @@ public class FlrigClientTests
             Assert.True(await client.ConnectAsync());
             Assert.True(await client.SetModeAsync("LSB", null));
             Assert.Equal("LSB", server.State.Mode);
+        }
+        finally
+        {
+            await client.DisposeAsync();
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task SetMode_NeverTouchesTheRigsBandwidth()
+    {
+        // Regression test for a live user report: an earlier version of
+        // SetModeAsync() also called flrig's separate rig.set_bandwidth
+        // RPC (confirmed to genuinely exist against flrig's own C++
+        // source, src/server/xml_server.cxx) whenever a passband was
+        // supplied, but the user found any reverse-sync filter change
+        // unwelcome, even a "sensible" one -- matching the same
+        // "mode-only" ask that made RigctldClient.SetModeAsync always
+        // send hamlib's -1 ("leave bandwidth alone") sentinel instead.
+        // SetModeAsync() only ever calls rig.set_mode; rig.set_bandwidth
+        // is never called at all.
+        var server = await FakeFlrigServer.StartAsync(port: 0);
+        var client = new FlrigClient("127.0.0.1", server.Port);
+        try
+        {
+            Assert.True(await client.ConnectAsync());
+            server.State.PassbandHz = 1800; // whatever the user had manually set on the rig
+            Assert.True(await client.SetModeAsync("USB", null));
+            Assert.Equal("USB", server.State.Mode);
+            Assert.Equal(1800, server.State.PassbandHz); // untouched
         }
         finally
         {

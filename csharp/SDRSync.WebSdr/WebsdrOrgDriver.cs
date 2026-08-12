@@ -21,7 +21,15 @@ namespace SDRSync.WebSdr;
 ///     set_mode(mode: str)     -- "USB"/"USBN"/"LSB"/"LSBN"/"AM"/"AMN"/"FM"/"CW"/"AMSYNC"
 ///     setband(idx: int)       -- switch which (possibly non-overlapping) band is active
 ///     soundapplet.mute(1|0)   -- true mute/unmute of the WebSocket audio stream
-///     #freqinput               -- text input reflecting the current frequency (kHz)
+///     freq (global var)       -- the current carrier/BFO frequency in kHz, as
+///                                last stored by setfreq(); this is what the page
+///                                sends upstream ("f=" + freq.toFixed(3)), so it
+///                                carries full 1 Hz resolution. Note the VISIBLE
+///                                frequency box (document.freqform.frequency) is
+///                                only nomfreq.toFixed(2), i.e. rounded to 10 Hz --
+///                                a sub-10 Hz retune is real but invisible there.
+///                                There is no #freqinput element on any websdr.org
+///                                build (verified live against five instances).
 ///
 /// The Twente instance itself has a single band (nbands=1) spanning ~0-29 MHz,
 /// so band switching is a no-op there in practice, but the logic is generic so
@@ -298,27 +306,49 @@ public sealed class WebsdrOrgDriver : IWebSDRDriver
         _verifyTask = VerifyFreqAppliedAsync(expectedHz, cts.Token);
     }
 
-    private async Task<int?> ReadFreqinputHzAsync()
+    /// <summary>
+    /// Reads back the frequency the page itself currently holds. Reads the
+    /// page's own global `window.freq` (kHz), NOT a text input. The
+    /// previous implementation read `#freqinput`, an element that does not
+    /// exist on any websdr.org build (verified live against five real
+    /// instances: Twente, Hack Green, IS0GRB, NA5B, Maasbree -- the
+    /// visible frequency box is `document.freqform.frequency`, which
+    /// carries a `name` and no `id`). So every verification silently
+    /// returned null and logged "Could not read back #freqinput to verify
+    /// setfreq()", leaving VerifyFreqAppliedAsync() permanently dead
+    /// (hundreds of such warnings in a real user's log).
+    ///
+    /// `window.freq` is the right source rather than that text box for two
+    /// independent reasons, both read off websdr-base.js:
+    ///   * the box is written as `nomfreq.toFixed(2)` -- rounded to 10 Hz,
+    ///     so it cannot confirm a sub-10 Hz tune at all; and
+    ///   * in CW it shows nominalfreq() (carrier + (hi+lo)/2), whereas
+    ///     TuneHzAsync() passes the carrier/BFO frequency as expectedHz --
+    ///     comparing against the box would be off by the CW filter centre
+    ///     (~750 Hz with the site's default CW filter) and would trip the
+    ///     mismatch retry on every single CW tune.
+    /// `freq` is exactly the value setfreq() stores and exactly what gets
+    /// sent upstream as "f=" + freq.toFixed(3), so it is both unrounded
+    /// and mode-independent.
+    /// </summary>
+    internal async Task<int?> ReadPageFreqHzAsync()
     {
         var value = await _page!.EvaluateAsync(
-            "() => document.getElementById('freqinput') ? document.getElementById('freqinput').value : null");
-        if (value is not { ValueKind: JsonValueKind.String } s) return null;
-        var str = s.GetString();
-        var match = System.Text.RegularExpressions.Regex.Match(str ?? "", @"[-+]?\d*\.\d+|\d+");
-        if (!match.Success) return null;
-        return (int)Math.Round(double.Parse(match.Value, System.Globalization.CultureInfo.InvariantCulture) * 1000);
+            "() => (typeof window.freq === 'number' && isFinite(window.freq)) ? window.freq : null");
+        if (value is not { ValueKind: JsonValueKind.Number } n) return null;
+        return (int)Math.Round(n.GetDouble() * 1000);
     }
 
-    private async Task VerifyFreqAppliedAsync(int expectedHz, CancellationToken ct)
+    internal async Task VerifyFreqAppliedAsync(int expectedHz, CancellationToken ct)
     {
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(FreqVerifyDelayS), ct);
             if (!_attached) return;
-            var actualHz = await ReadFreqinputHzAsync();
+            var actualHz = await ReadPageFreqHzAsync();
             if (actualHz is null)
             {
-                CoreLog.Logger.LogWarning("Could not read back #freqinput to verify setfreq()");
+                CoreLog.Logger.LogWarning("Could not read back window.freq to verify setfreq()");
                 return;
             }
 
@@ -341,7 +371,7 @@ public sealed class WebsdrOrgDriver : IWebSDRDriver
             await _page.EvaluateAsync("(khz) => window.setfreq(khz)", expectedHz / 1000.0);
 
             await Task.Delay(TimeSpan.FromSeconds(FreqVerifyDelayS), ct);
-            actualHz = await ReadFreqinputHzAsync();
+            actualHz = await ReadPageFreqHzAsync();
             _lastTuneError = actualHz is not null && Math.Abs(actualHz.Value - expectedHz) <= FreqVerifyToleranceHz
                 ? null
                 : "WebSDR frequency mismatch persists after retry; see log";

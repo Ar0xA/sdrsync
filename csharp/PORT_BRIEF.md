@@ -1,8 +1,8 @@
 # SDRSync — C# port brief
 
-_Last updated: 2026-08-11 (step 5 DONE: WebSDR/browser layer complete -- Avalonia WebView
-page adapter, all 4 concrete drivers, fingerprint registry, trusted-click P/Invoke; 361 tests
-total passing across the whole solution -- see step 5 below for exact status)_
+_Last updated: 2026-08-12 (interim: ported the Python side's live-testing bug-fix round into
+the already-completed Rig/Sync/WebSdr layers -- see "Bug-fix port" section below; 372 tests
+total passing. Step 6 (GUI shell) still not started.)_
 
 Running log for the Python → C#/.NET port, kept separate from the main
 `project_brief.md` (that file covers the Python app's own history). Steps
@@ -585,6 +585,67 @@ package. WSL Debian verification has still not happened for this step (or any st
 flagging again per this port's standing practice; the console-log-polling design (finding 5)
 was specifically chosen to reduce, not eliminate, that risk when Linux verification does
 eventually happen.
+
+## Interim — Bug-fix port (2026-08-12) — DONE
+
+Before resuming step 6, ported the Python side's v2.2.1–v2.2.4 live-testing bug-fix round
+(released on `master`, merged into `csharp-port` at `a86b7b8` with zero conflicts since the two
+branches touch disjoint file sets) into the C# Rig/Sync/WebSdr layers, which had been ported
+from OLDER Python source and so still carried the now-fixed bugs:
+
+- **flrig `set_vfoA` wire type** (`FlrigClient.cs`): now sends `(double)freqHz`, not `int` --
+  real flrig registers `rig.set_vfoA` with XML-RPC signature `"d:d"` and its XmlRpc++ library
+  enforces that strictly. Added `double` encoding to `XmlRpcCodec.EncodeValue` (previously only
+  string/int/bool/array). `FakeFlrigServer`/`FakeFlrigState` gained `LastSetVfoAArgType` so the
+  regression test can check the actual decoded wire type, not just the value (the fake server
+  doesn't enforce the real signature, so a value-only assertion would pass even with the bug).
+- **rigctld mode-only `SetModeAsync`** (`RigctldClient.cs`): now always sends hamlib's real `-1`
+  ("leave bandwidth alone") sentinel on the wire, ignoring whatever `passbandHz` is passed --
+  previously sent `0` for null/0, which is a real, different hamlib value ("rig default for this
+  mode"). **Deliberately did NOT remove `passbandHz` from the `IRigClient`/`SyncEngine`
+  interface** the way the Python original did (which dropped the parameter entirely) -- the C#
+  engine-level test suite (`EngineReverseSyncTests.cs`, 1100+ lines) has ~15 assertions on the
+  `(Mode, PassbandHz)` tuple `SyncEngine` passes into `SetModeAsync`, and the actual bug is
+  entirely in what reaches the wire, which `FlrigClient` already ignored and `RigctldClient` now
+  also ignores -- fixing the wire behavior alone is faithful to the real bug without the
+  large, error-prone mechanical rewrite the parameter removal would have forced. `FakeRigctldServer`
+  updated to model the `-1` sentinel correctly (only applies a pending passband that isn't `-1`).
+  `FlrigClient.SetModeAsync` needed no change -- it already only ever called `rig.set_mode`, never
+  `rig.set_bandwidth`.
+- **Stuck-candidate threshold bug** (`SyncEngine.cs`): `FreqChangeThresholdHz` 10→0 and
+  `ReverseFreqChangeThresholdHz` 50→0 -- same shared-constant-with-strict-`>`-for-two-jobs bug
+  as the Python original (a change at-or-below the threshold never registered as a candidate at
+  all, so it wasn't filtered once, it got permanently stuck). `FreqDebounceS`/
+  `ReverseFreqDebounceS` already do debouncing's actual job.
+- **Rig-connect generation counter** (`SyncEngine.cs`/`StatusSnapshot.cs`): added `_rigGeneration`
+  (bumped as the literal first line of `StartRigAsync`, before any other logic) and
+  `StatusSnapshot.RigGeneration`, mirroring the Python engine-side fix for the "stale backlog
+  snapshot re-pops a connection-failed popup for an attempt that hasn't started" bug. Only the
+  engine-side half is ported -- there is no C# GUI yet (step 6) to wire the consuming half
+  (`_lastSeenRigGeneration`/`_rigConnectGenerationFloor`) into, so that's deferred to step 7.
+- **websdr.org verify-readback** (`WebsdrOrgDriver.cs`): `ReadFreqinputHzAsync` (read
+  `document.getElementById('freqinput')`, an element that doesn't exist on any real websdr.org
+  build) renamed to `ReadPageFreqHzAsync`, now reads `window.freq` directly via
+  `typeof window.freq === 'number' && isFinite(window.freq)`. `GetStatusAsync`'s own forward-status
+  read was already correct (already read `window.freq`/`window.mode` directly) -- only the
+  verify-after-tune path had the bug. Both methods' visibility bumped `private` → `internal` to
+  let tests drive them directly, matching this class's existing testability-seam pattern
+  (`_bands`/`_currentBand`/`_attached`/`_page` are already `internal` for the same reason).
+
+**Issue hit (real bug in test infrastructure, not in the port)**: the new websdr.org readback
+verify test holds `CoreLog.Logger` (a shared static swapped for log capture) open across a real
+~0.6s delay (`FreqVerifyDelayS`) -- long enough that another test class running in xUnit's
+default cross-class parallelism reliably logged through the same swapped-in `ListLogger`
+concurrently, corrupting a plain `List<T>` mid-enumeration (`InvalidOperationException:
+Collection was modified`). Fixed by changing `ListLogger.Records` to a
+`System.Collections.Concurrent.ConcurrentQueue<T>` -- confirmed fixed by running the full suite
+4 times in a row post-fix (previously reproduced on the very first run).
+
+**Verified**: `dotnet build` 0 warnings/errors; `dotnet test` 372/372 passing (up from 361 --
+11 new: 2 flrig regression tests, 1 rigctld regression test replacing an old one that tested
+the now-removed behavior, 1 rig-generation test, 4 parametrized + 4 plain websdr.org readback
+tests). Ran the full suite 4 times total to confirm no flakiness from the parallel-logger fix.
+Not yet re-verified on WSL Debian (same standing gap as every other step).
 
 ## Step 6 — GUI shell — NOT STARTED
 

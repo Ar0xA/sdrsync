@@ -91,7 +91,6 @@ public class RigctldClientTests
             Assert.True(await client.ConnectAsync());
             Assert.True(await client.SetModeAsync("LSB", 1800));
             Assert.Equal("LSB", server.State.Mode);
-            Assert.Equal(1800, server.State.PassbandHz);
         }
         finally
         {
@@ -101,16 +100,26 @@ public class RigctldClientTests
     }
 
     [Fact]
-    public async Task SetMode_ZeroPassbandMeansRigDefault()
+    public async Task SetMode_NeverTouchesTheRigsPassband()
     {
+        // Regression test for a live user report: reverse-sync mode
+        // changes used to also set the rig's filter/passband (0 = "rig
+        // default" is a real hamlib value, not "leave alone"), which the
+        // user found unwelcome even though a "sensible" value was being
+        // sent. SetModeAsync() now always sends hamlib's real -1 ("leave
+        // bandwidth alone") sentinel -- confirmed via hamlib's own
+        // rigctld documentation -- so the rig's passband must be
+        // completely unaffected by a mode change, whatever it was set to
+        // beforehand, and regardless of whatever passbandHz is passed in.
         var server = await FakeRigctldServer.StartAsync(port: 0);
+        server.State.PassbandHz = 1800; // whatever the user had manually set on the rig
         var client = new RigctldClient("127.0.0.1", server.Port);
         try
         {
             Assert.True(await client.ConnectAsync());
             Assert.True(await client.SetModeAsync("CW", null));
             Assert.Equal("CW", server.State.Mode);
-            Assert.Equal(0, server.State.PassbandHz);
+            Assert.Equal(1800, server.State.PassbandHz); // untouched
         }
         finally
         {
@@ -172,7 +181,6 @@ public class RigctldClientTests
             Assert.True(await client.ConnectAsync());
             Assert.True(await client.SetModeAsync("LSB", 1800));
             Assert.Equal("LSB", server.State.Mode);
-            Assert.Equal(1800, server.State.PassbandHz);
         }
         finally
         {

@@ -172,7 +172,13 @@ public sealed class FakeRigctldServer : IMockRigServer, IAsyncDisposable
                 else
                 {
                     _state.Mode = _state.PendingMode;
-                    _state.PassbandHz = _state.PendingPassbandHz ?? _state.PassbandHz;
+                    // -1 is hamlib's real "leave bandwidth alone" sentinel
+                    // -- only apply a pending passband that isn't it.
+                    if (_state.PendingPassbandHz is not null and not -1)
+                    {
+                        _state.PassbandHz = _state.PendingPassbandHz.Value;
+                    }
+
                     _state.PendingMode = null;
                     _state.PendingPassbandHz = null;
                 }

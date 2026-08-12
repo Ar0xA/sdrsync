@@ -93,6 +93,7 @@ public static class XmlRpcCodec
             null => new XElement("value", new XElement("string", "")),
             string s => new XElement("value", new XElement("string", s)),
             int i => new XElement("value", new XElement("i4", i.ToString(CultureInfo.InvariantCulture))),
+            double d => new XElement("value", new XElement("double", d.ToString(CultureInfo.InvariantCulture))),
             bool b => new XElement("value", new XElement("boolean", b ? "1" : "0")),
             System.Collections.IEnumerable arr and not string =>
                 new XElement("value", new XElement("array", new XElement("data", arr.Cast<object?>().Select(EncodeValue)))),

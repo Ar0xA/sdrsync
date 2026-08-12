@@ -12,6 +12,19 @@ namespace SDRSync.Sync;
 /// </summary>
 public sealed record StatusSnapshot : GuiMessage
 {
+    /// <summary>
+    /// Strictly increases on every StartRigAsync() call (including a
+    /// same-tick mock-bind failure), never on a give-up alone -- so every
+    /// snapshot published from one connect attempt, through its eventual
+    /// give-up, shares one generation. Lets a future GUI distinguish a
+    /// backlog of stale snapshots from a FAILED attempt (still draining
+    /// from the status channel) from the first snapshot of a fresh
+    /// attempt the user just started by clicking Connect again: filter out
+    /// any snapshot whose generation isn't strictly newer than the
+    /// generation captured at the moment of the click.
+    /// </summary>
+    public int RigGeneration { get; init; }
+
     public bool RigActive { get; init; }
     public bool RigConnected { get; init; }
     public int? RigFreqHz { get; init; }

@@ -328,18 +328,23 @@ public sealed class RigctldClient : IRigClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// Reverse-sync (WebSDR -> rig): sets the rig's mode + passband.
-    /// passbandHz of null or 0 means "rig default for this mode" -- a
-    /// valid hamlib/rigctld convention, not a sentinel for "unset".
+    /// Reverse-sync (WebSDR -> rig): sets the rig's mode only. passbandHz
+    /// is accepted for interface parity with FlrigClient.SetModeAsync (see
+    /// that method's doc comment) but is otherwise unused -- this always
+    /// sends hamlib's real -1 "leave bandwidth alone" sentinel (confirmed
+    /// via hamlib's own rigctld documentation), never passbandHz's value.
+    /// 0 is a real, different hamlib value ("rig default for this mode",
+    /// not "leave alone"), and a live user report found ANY reverse-sync
+    /// bandwidth change unwelcome, even a "sensible" one -- so a mode
+    /// change here must never touch the rig's filter/passband at all.
     /// </summary>
     public async Task<bool> SetModeAsync(string modeName, int? passbandHz, double? verifyBudgetS = null)
     {
-        var pb = (passbandHz is null or 0) ? 0 : passbandHz.Value;
         var budget = verifyBudgetS ?? SetVerifyBudgetS;
-        var resp = await SendRawAsync($"M {modeName} {pb}");
+        var resp = await SendRawAsync($"M {modeName} -1");
         if (!ParseSetResponse(resp))
         {
-            CoreLog.Logger.LogWarning("rigctld rejected M {Mode} {Pb}: {Resp}", modeName, pb, resp);
+            CoreLog.Logger.LogWarning("rigctld rejected M {Mode} -1: {Resp}", modeName, resp);
             return false;
         }
 
@@ -366,7 +371,7 @@ public sealed class RigctldClient : IRigClient, IAsyncDisposable
         }
 
         CoreLog.Logger.LogWarning(
-            "rigctld accepted M {Mode} {Pb} but the rig never confirmed it within {Budget:F1}s", modeName, pb, budget);
+            "rigctld accepted M {Mode} -1 but the rig never confirmed it within {Budget:F1}s", modeName, budget);
         return false;
     }
 

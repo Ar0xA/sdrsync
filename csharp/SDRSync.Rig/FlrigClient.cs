@@ -243,12 +243,20 @@ public sealed class FlrigClient : IRigClient, IAsyncDisposable
     /// Reverse-sync (WebSDR -> rig). set_vfoA's RPC response is not a
     /// reliable success signal, so this verifies via a bounded
     /// poll-until-match readback of GetFreqAsync() instead.
+    ///
+    /// Sends freqHz as a double, not an int: real flrig registers
+    /// rig.set_vfoA with XML-RPC signature "d:d" (confirmed against
+    /// flrig's own C++ source, src/server/xml_server.cxx, which does
+    /// `(double)params[0]`), and its bundled XmlRpc++ library enforces
+    /// that signature strictly by wire type -- sending a plain &lt;i4&gt;
+    /// serializes as the wrong type and real flrig rejects it outright
+    /// with Fault -1 "type error", before ever reaching the rig.
     /// </summary>
     public async Task<bool> SetFreqAsync(int freqHz, double? verifyBudgetS = null)
     {
         if (_http is null) return false;
         var budget = verifyBudgetS ?? SetVerifyBudgetS;
-        await CallAsync("rig.set_vfoA", new object?[] { freqHz });
+        await CallAsync("rig.set_vfoA", new object?[] { (double)freqHz });
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(budget);
         while (true)

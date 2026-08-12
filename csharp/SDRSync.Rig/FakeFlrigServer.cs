@@ -70,6 +70,18 @@ public sealed class FakeFlrigState : IMockRigState
     }
 
     /// <summary>
+    /// The .NET type XmlRpcCodec decoded the last set_vfoA argument to
+    /// (typeof(double) for a wire &lt;double&gt;, typeof(int) for a wire
+    /// &lt;i4&gt;/&lt;int&gt;) -- set by FakeFlrigServer.Dispatch before it
+    /// normalizes the value with Convert.ToInt32 for SetVfoA() below. This
+    /// server doesn't enforce flrig's strict "d:d" signature the way real
+    /// flrig's XmlRpc++ does, so a value-only assertion on FreqHz would
+    /// pass even if FlrigClient regressed to sending an int -- tests must
+    /// check this field instead to catch that.
+    /// </summary>
+    public Type? LastSetVfoAArgType;
+
+    /// <summary>
     /// When &gt; 0, a set_vfoA()/set_mode() call doesn't apply immediately --
     /// it's staged as pending and only takes effect after this many
     /// subsequent get_vfo()/get_mode() polls, simulating real CAT-bus
@@ -284,10 +296,16 @@ public sealed class FakeFlrigServer : IMockRigServer, IAsyncDisposable
         "rig.get_mode" => _state.GetMode(),
         "rig.get_bw" => _state.GetBw(),
         "rig.get_ptt" => _state.GetPtt(),
-        "rig.set_vfoA" => _state.SetVfoA(Convert.ToInt32(parameters[0], CultureInfo.InvariantCulture)),
+        "rig.set_vfoA" => SetVfoAAndTrackWireType(parameters[0]),
         "rig.set_mode" => _state.SetMode((string)parameters[0]!),
         _ => throw new InvalidOperationException($"Unknown method {methodName}"),
     };
+
+    private int SetVfoAAndTrackWireType(object? arg)
+    {
+        _state.LastSetVfoAArgType = arg?.GetType();
+        return _state.SetVfoA(Convert.ToInt32(arg, CultureInfo.InvariantCulture));
+    }
 
     /// <summary>
     /// Reads one HTTP/1.1 request off the stream and returns its body
