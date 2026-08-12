@@ -8,6 +8,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Protocol
+from urllib.parse import urlsplit
+
+
+def same_site(current_url: str, expected_url: str) -> bool:
+    """True if two page URLs point at the same site (scheme+host+port+path,
+    ignoring query string, fragment, and a trailing slash).
+
+    Used by drivers whose attach() can reuse an already-loaded page
+    (engine.py's _switch_websdr(), which navigates the SAME WxPageAdapter
+    to a new site rather than tearing the window down) to tell "this is
+    still our own site, no need to reload" apart from "a DIFFERENT but
+    same-family site happens to already be loaded and ready." Without this
+    check, a same-family readiness/handshake probe (OpenWebRX's
+    _READY_PREDICATE, UberSDR's agent handshake) passes against ANY live
+    instance of that software, not specifically the one just switched to
+    -- so attach() would silently skip navigation and every subsequent
+    tune/mode/mute call would keep controlling the previous site while the
+    GUI shows the new one selected."""
+    a, b = urlsplit(current_url), urlsplit(expected_url)
+    return (a.scheme, a.netloc, a.path.rstrip("/")) == (b.scheme, b.netloc, b.path.rstrip("/"))
 
 
 class WebSDRIncompatibleError(Exception):

@@ -49,7 +49,7 @@ from typing import Optional
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
 
-from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, same_site
 
 logger = logging.getLogger("sdrsync.websdr.openwebrx")
 
@@ -203,7 +203,14 @@ class OpenWebRXDriver:
             # check readiness in place first and only goto() if it's not
             # already satisfied (a fresh, never-navigated page safely
             # evaluates to "not ready" here rather than erroring).
-            already_ready = await page.evaluate(_READY_PREDICATE)
+            # _READY_PREDICATE alone isn't enough to decide that, though --
+            # it's true for ANY ready OpenWebRX instance, including a
+            # DIFFERENT site than self.url that happens to still be loaded
+            # (e.g. engine.py's _switch_websdr() reusing the same page for
+            # a switch between two OpenWebRX stations). Gate on same_site()
+            # first so a genuine site switch always navigates.
+            current_url = await page.evaluate("window.location.href")
+            already_ready = same_site(current_url, self.url) and await page.evaluate(_READY_PREDICATE)
             if not already_ready:
                 await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
                 await page.wait_for_function(_READY_PREDICATE, timeout=LOAD_TIMEOUT_MS)

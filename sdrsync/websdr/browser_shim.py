@@ -273,6 +273,22 @@ class WxPageAdapter:
         # there is deliberately no separate "the current pending call"
         # slot to keep in sync with it.
         self._dispatch_queue: "deque[asyncio.Future]" = deque()
+        # Guards self._dispatch_queue specifically. The "wx's single-
+        # threaded event dispatch serializes append/pop, no lock needed"
+        # reasoning above only holds if EVERY mutation happens on the GUI
+        # thread -- but _fail_pending() (via _mark_dead()) is also
+        # reachable from the background asyncio thread, via
+        # _await_ready()'s and _run_script()'s own timeout paths and via
+        # close(). A GUI-thread _on_script_result() doing its
+        # "if not queue: return" check followed by popleft() is not atomic
+        # against a concurrent background-thread _fail_pending() draining
+        # the same deque between those two steps -- confirmed reachable,
+        # not just theoretical: a script timeout racing a real (slightly
+        # delayed) SCRIPT_RESULT event hits exactly this window. A plain
+        # threading.Lock, not asyncio.Lock, since the background side is
+        # not necessarily running on this adapter's event loop when it
+        # takes the lock.
+        self._dispatch_queue_lock = threading.Lock()
         # Armed on the GUI thread, immediately before LoadURL() actually
         # runs (not when goto() is called) -- see _on_loaded for why.
         self._nav_generation = 0
@@ -502,7 +518,8 @@ class WxPageAdapter:
                 # single FIFO queue can't fall out of sync with itself:
                 # every dispatch that actually happened is in it exactly
                 # once, in order, whether or not it was later abandoned.
-                self._dispatch_queue.append(fut)
+                with self._dispatch_queue_lock:
+                    self._dispatch_queue.append(fut)
 
             wx.CallAfter(do_run)
             try:
@@ -535,8 +552,10 @@ class WxPageAdapter:
             wx.CallAfter(cb, reason)
 
     def _fail_pending(self, exc: BrowserError) -> None:
-        while self._dispatch_queue:
-            fut = self._dispatch_queue.popleft()
+        with self._dispatch_queue_lock:
+            pending = list(self._dispatch_queue)
+            self._dispatch_queue.clear()
+        for fut in pending:
             if not fut.done():
                 self._loop.call_soon_threadsafe(_safe_set_exception, fut, exc)
         goto = self._pending_goto
@@ -633,13 +652,17 @@ class WxPageAdapter:
         assert wx.IsMainThread()
         if not self._alive:
             return
-        if not self._dispatch_queue:
-            # Nothing was dispatched that could produce this -- shouldn't
-            # happen (every RunScriptAsync call has a matching queue
-            # entry), but silently dropping an unexplained event is safer
-            # than raising out of a wx event handler.
-            return
-        fut = self._dispatch_queue.popleft()
+        with self._dispatch_queue_lock:
+            if not self._dispatch_queue:
+                # Nothing was dispatched that could produce this --
+                # shouldn't happen (every RunScriptAsync call has a
+                # matching queue entry) unless a concurrent
+                # _fail_pending() (background thread, via _mark_dead())
+                # just drained it -- silently dropping an unexplained
+                # event is safer than raising out of a wx event handler
+                # either way.
+                return
+            fut = self._dispatch_queue.popleft()
         if fut.done():
             # The caller that dispatched this one was cancelled before
             # its result came back (see _dispatch_queue's doc comment) --

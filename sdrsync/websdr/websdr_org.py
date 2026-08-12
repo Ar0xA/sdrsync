@@ -133,6 +133,12 @@ class WebsdrOrgDriver:
         self._bands: list[tuple[float, float]] = []  # (low_hz, high_hz) per band index
         self._current_band: Optional[int] = None
         self._current_mode: Optional[str] = None
+        # Full web-mode string as last pushed to window.set_mode(), narrow
+        # ("N") suffix included -- unlike self._current_mode (which strips
+        # it for the CW-offset check), this is what setband()'s silent
+        # mode-flip fixup below needs to restore the EXACT mode (including
+        # filter width), not just the base name.
+        self._current_web_mode: Optional[str] = None
         # True only once attach() has fully succeeded (band table loaded,
         # audio gate handled). tune_hz/set_mode/set_muted/get_status all
         # gate on this -- NOT on `self._page is None` -- because attach()
@@ -184,6 +190,7 @@ class WebsdrOrgDriver:
         # recovering from an outage, silently tuning the wrong band.
         self._current_band = None
         self._current_mode = None
+        self._current_web_mode = None
 
         try:
             await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
@@ -326,6 +333,15 @@ class WebsdrOrgDriver:
             if band_idx != self._current_band:
                 await self._page.evaluate("(idx) => window.setband(idx)", band_idx)
                 self._current_band = band_idx
+                # setband() silently flips window.mode USB<->LSB (and swaps
+                # its hi/lo filter offsets) whenever the crossing changes
+                # islsbband() -- confirmed against the live websdr-base.js
+                # source, not inferred. Re-assert whatever mode we last
+                # pushed so a band crossing can't leave the page on the
+                # wrong sideband with no error and no verification catching
+                # it (window.freq is unaffected by the flip).
+                if self._current_web_mode is not None:
+                    await self._page.evaluate("(m) => window.set_mode(m)", self._current_web_mode)
             await self._page.evaluate("(khz) => window.setfreq(khz)", effective_hz / 1000.0)
             self._last_tune_error = None
         except PlaywrightError as e:
@@ -428,6 +444,10 @@ class WebsdrOrgDriver:
                 return
             await self._page.evaluate("(idx) => window.setband(idx)", band_idx)
             self._current_band = band_idx
+            # Same silent USB<->LSB flip risk as tune_hz()'s setband() call --
+            # see that call site's comment.
+            if self._current_web_mode is not None:
+                await self._page.evaluate("(m) => window.set_mode(m)", self._current_web_mode)
             await self._page.evaluate("(khz) => window.setfreq(khz)", expected_hz / 1000.0)
 
             await asyncio.sleep(FREQ_VERIFY_DELAY_S)
@@ -462,6 +482,7 @@ class WebsdrOrgDriver:
 
         try:
             await self._page.evaluate("(m) => window.set_mode(m)", web_mode)
+            self._current_web_mode = web_mode
             # base mode without the "N" (narrow) suffix, used e.g. to detect CW for cw_offset_hz
             self._current_mode = web_mode[:-1] if web_mode.endswith("N") else web_mode
             self._last_mode_error = None

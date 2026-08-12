@@ -68,7 +68,7 @@ from urllib.parse import urlsplit, urlunsplit
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
 
-from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, same_site
 
 logger = logging.getLogger("sdrsync.websdr.ubersdr")
 
@@ -451,7 +451,17 @@ class UberSDRDriver:
         # to make room (the page keeps at most eight clients and evicts the
         # stalest), or a single script call can have timed out. So: say hello to
         # what is already there, and only navigate if that gets no answer.
-        if not await self._handshake(RETRY_HANDSHAKE_MS):
+        #
+        # But the handshake alone can't tell "the right page, just reachable
+        # again" apart from "a DIFFERENT UberSDR site that happens to still be
+        # loaded and already speaks v2" (e.g. engine.py's _switch_websdr()
+        # reusing the same page to switch between two UberSDR stations) --
+        # the previous site's agent is still installed and ready, so it would
+        # answer hello too. Gate on same_site() first so a genuine switch
+        # always navigates instead of silently continuing to control the old
+        # receiver.
+        current_url = await page.evaluate("window.location.href")
+        if not (same_site(current_url, self.url) and await self._handshake(RETRY_HANDSHAKE_MS)):
             try:
                 await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
             except PlaywrightError as e:

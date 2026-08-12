@@ -134,6 +134,19 @@ def parse_ptt_response(resp: Any) -> Optional[bool]:
     return resp != 0
 
 
+def parse_xcvr_online_response(resp: Any) -> bool:
+    """Pure parser for rig.get_xcvr's response: the transceiver's name
+    when flrig has a live serial link to it, or "" under the EXACT same
+    `!xcvr_online || disable_xmlrpc->value()` guard (confirmed against
+    flrig's own source, src/server/xml_server.cxx) that makes
+    get_vfo/get_mode/get_bw fall back to safe placeholder values ("14070000"
+    Hz, etc.) instead of erroring -- so those placeholders are otherwise
+    indistinguishable from a genuine reading of a rig that's actually
+    offline (powered off, cable unplugged, or flrig's own XML-RPC
+    toggle switched off)."""
+    return isinstance(resp, str) and resp != ""
+
+
 class FlrigClient:
     def __init__(
         self,
@@ -153,6 +166,9 @@ class FlrigClient:
 
         self._proxy: Optional[xmlrpc.client.ServerProxy] = None
         self._reconnect_failures = 0
+        # Edge-tracked so "flrig is up but the transceiver is offline"
+        # logs once per transition, not every poll tick.
+        self._xcvr_was_online = True
 
     @property
     def connected(self) -> bool:
@@ -294,8 +310,15 @@ class FlrigClient:
         comment for why. verify_budget_s overrides the module default
         (used by sync/engine.py's reverse-sync retry ladder, which wants a
         shorter per-attempt budget and retries several times itself rather
-        than one long wait)."""
-        if self._proxy is None:
+        than one long wait). Also refuses outright if the transceiver
+        itself is offline (see _xcvr_online()'s docstring) -- without
+        this, set_vfoA's own readback would poll the same "14070000" Hz
+        placeholder get_state() already knows to distrust, never confirm
+        the requested value, and after REVERSE_PUSH_MAX_ATTEMPTS the
+        engine's retry ladder would give up and revert the WebSDR page
+        back onto that placeholder -- fighting the operator's real tuning
+        for no reason."""
+        if self._proxy is None or not await self._xcvr_online():
             return False
         freq_hz = int(freq_hz)
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
@@ -342,8 +365,8 @@ class FlrigClient:
         Verified via a bounded poll-until-match readback of get_mode() --
         set_mode's own RPC response silently no-ops on an unrecognized
         mode string rather than erroring. verify_budget_s: see
-        set_freq()."""
-        if self._proxy is None:
+        set_freq() -- including the same xcvr-offline refusal."""
+        if self._proxy is None or not await self._xcvr_online():
             return False
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
         await self._call(lambda: self._proxy.rig.set_mode(mode_name))
@@ -361,6 +384,34 @@ class FlrigClient:
         logger.warning("flrig did not confirm set_mode(%r) within %.2fs", mode_name, budget)
         return False
 
+    async def _xcvr_online(self) -> bool:
+        """True if flrig reports a live transceiver -- see
+        parse_xcvr_online_response's docstring for why this probe exists:
+        without it, an offline rig's fixed freq/mode placeholders
+        ("14070000" Hz / "USB", confirmed via source) are silently
+        indistinguishable from genuine readings, and the sync engine
+        would happily retune a public WebSDR to them. rig.get_ptt is a
+        separate risk of its own: it is NOT gated by xcvr_online in
+        flrig's source at all, so it keeps returning whatever PTT state
+        it last tracked -- possibly stale and no longer meaningful once
+        the transceiver connection is actually gone. Treating the whole
+        reading as untrustworthy while offline covers both cases."""
+        if self._proxy is None:
+            return False
+        resp = await self._call(self._proxy.rig.get_xcvr)
+        online = parse_xcvr_online_response(resp)
+        if online != self._xcvr_was_online:
+            if online:
+                logger.info("flrig reports the transceiver back online")
+            else:
+                logger.warning(
+                    "flrig is connected but reports no transceiver online "
+                    "(rig off/unplugged, or flrig's own XML-RPC toggle is "
+                    "disabled) -- pausing sync until it reappears"
+                )
+            self._xcvr_was_online = online
+        return online
+
     async def get_state(self) -> RigState:
         """Convenience: fetch freq/mode/bandwidth/ptt in one call -- 4
         sequential XML-RPC round-trips (vs. rigctld's 3), each
@@ -369,7 +420,17 @@ class FlrigClient:
         its result iterator raises per-sub-call faults lazily, which
         doesn't compose cleanly with this file's per-call fail-to-None
         convention, and batching isn't justified at typical
-        poll_interval_s defaults (0.2s) unless profiling shows otherwise."""
+        poll_interval_s defaults (0.2s) unless profiling shows otherwise.
+
+        Probes _xcvr_online() first (a 5th round-trip) and returns an
+        all-None RigState if the transceiver isn't actually there -- every
+        caller in sync/engine.py already treats a None field as "nothing
+        to sync" (state.freq_hz is not None / state.mode is not None /
+        the documented state.ptt is None fallback), so this needs no
+        further special-casing upstream; it just stops a fabricated
+        placeholder reading from being trusted as real."""
+        if not await self._xcvr_online():
+            return RigState(freq_hz=None, mode=None, passband_hz=None, ptt=None)
         freq = await self.get_freq()
         mode = await self.get_mode()
         passband = await self.get_bandwidth()

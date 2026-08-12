@@ -2,8 +2,8 @@
 flrig software.
 
 Registers the RPC methods sdrsync.rig.flrig.FlrigClient actually calls:
-main.get_version, rig.get_vfo, rig.get_mode, rig.get_bw, rig.get_ptt,
-and (v11 reverse sync) rig.set_vfoA, rig.set_mode. Run standalone
+main.get_version, rig.get_xcvr, rig.get_vfo, rig.get_mode, rig.get_bw,
+rig.get_ptt, and (v11 reverse sync) rig.set_vfoA, rig.set_mode. Run standalone
 (`python -m sdrsync.rig.fake_flrig`) to get an interactive prompt that
 lets you change frequency/mode/PTT while the rest of the app polls this
 server exactly like a real flrig instance.
@@ -48,6 +48,15 @@ class FakeFlrigState:
         self.mode = "USB"
         self.passband_hz = 2400
         self.ptt = "0"
+        # Mirrors real flrig's xcvr_online flag: rig.get_xcvr (and every
+        # get_vfo/get_mode/get_bw/get_ptt call) returns a fixed placeholder
+        # instead of live state whenever this is False -- see
+        # flrig.py's parse_xcvr_online_response()/_xcvr_online() docstrings
+        # for why FlrigClient probes this before trusting a reading.
+        # Defaults True so every existing test/manual session behaves like
+        # a normal connected rig unless a test explicitly flips it.
+        self.xcvr_online = True
+        self.xcvr_name = "FakeRig"
         # v11 reverse-sync (WebSDR -> rig) SET testing, mirrors real
         # flrig's own confirmed-unreliable set_vfoA/set_mode RPC
         # responses (see flrig.py's module docstring) -- both test flags
@@ -97,7 +106,18 @@ class _FlrigXMLRPCServer(SimpleXMLRPCServer):
     allow_reuse_address = False
 
 
+def _get_xcvr(state: FakeFlrigState) -> str:
+    return state.xcvr_name if state.xcvr_online else ""
+
+
 def _get_vfo(state: FakeFlrigState) -> str:
+    # Real flrig's rig.get_vfo returns this exact fixed placeholder while
+    # xcvr_online is False, unconditionally, before ever touching the real
+    # VFO state -- confirmed against xml_server.cxx. Mirrored here so a
+    # test exercising FlrigClient's offline handling sees the same string
+    # a real flrig instance would send.
+    if not state.xcvr_online:
+        return "14070000"
     if state._pending_freq_hz is not None:
         state._pending_freq_countdown -= 1
         if state._pending_freq_countdown <= 0:
@@ -107,6 +127,10 @@ def _get_vfo(state: FakeFlrigState) -> str:
 
 
 def _get_mode(state: FakeFlrigState) -> str:
+    # Same fixed-placeholder behavior as _get_vfo above, confirmed against
+    # the real rig.get_mode handler.
+    if not state.xcvr_online:
+        return "USB"
     if state._pending_mode is not None:
         state._pending_mode_countdown -= 1
         if state._pending_mode_countdown <= 0:
@@ -142,6 +166,7 @@ def _set_mode(state: FakeFlrigState, mode_name) -> int:
 
 def _register_methods(server: _FlrigXMLRPCServer, state: FakeFlrigState) -> None:
     server.register_function(lambda: FLRIG_MOCK_VERSION, "main.get_version")
+    server.register_function(lambda: _get_xcvr(state), "rig.get_xcvr")
     server.register_function(lambda: _get_vfo(state), "rig.get_vfo")
     server.register_function(lambda: _get_mode(state), "rig.get_mode")
     server.register_function(lambda: [str(state.passband_hz), ""], "rig.get_bw")
@@ -227,14 +252,17 @@ async def _repl(state: FakeFlrigState) -> None:
             # would tolerate it.
             state.ptt = parts[1]
             print(f"ptt -> {state.ptt}")
+        elif parts[0] == "x" and len(parts) == 2 and parts[1] in ("0", "1"):
+            state.xcvr_online = parts[1] == "1"
+            print(f"xcvr_online -> {state.xcvr_online}")
         else:
-            print("usage: f <hz> | m <mode> <passband_hz> | t <0|1> | q")
+            print("usage: f <hz> | m <mode> <passband_hz> | t <0|1> | x <0|1> | q")
 
 
 async def main(host: str = "127.0.0.1", port: int = 12345) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     handle, state = await start_server(host, port)
-    print("Commands: f <hz> | m <mode> <passband_hz> | t <0|1> | q")
+    print("Commands: f <hz> | m <mode> <passband_hz> | t <0|1> | x <0|1> | q")
     try:
         await _repl(state)
     finally:

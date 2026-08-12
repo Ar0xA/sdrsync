@@ -1903,6 +1903,17 @@ class SyncEngine:
         self._rig_was_connected_last_tick = True
         if rig_reconnected:
             self._last_rig_activity_at = time.monotonic()
+        if self._rig is None:
+            # A concurrent Disconnect (_stop_rig(), which cascades to
+            # _stop_websdr() too) can null this while the ensure_connected()
+            # await above was suspended -- there is no rig state left to
+            # read this tick. Same not-connected publish/return as the
+            # guard at the top of this method for the identical condition.
+            self._rig_was_connected_last_tick = False
+            if await self._idle_disconnect_if_due():
+                websdr_status = None
+            self._publish(rig_connected=False, websdr=websdr_status)
+            return
         state = await self._rig.get_state()
         # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq's docstring.
         if state.freq_hz is not None and state.freq_hz != self._last_logged_rig_freq:
@@ -2016,7 +2027,14 @@ class SyncEngine:
                         # mid-outage) or a failed page call, and either would
                         # otherwise be wrongly recorded as delivered, silencing
                         # all further retries even after the WebSDR recovers.
-                        applied = await self._driver.set_mode(state.mode, state.passband_hz)
+                        # self._driver can turn None here -- a concurrent
+                        # _stop_websdr()/_switch_websdr() can run during the
+                        # PTT-mute await earlier this same tick -- so this is
+                        # a genuine no-op, not just "not attached yet".
+                        if self._driver is not None:
+                            applied = await self._driver.set_mode(state.mode, state.passband_hz)
+                        else:
+                            applied = False
                         # Stamped unconditionally, before the generation
                         # guard, for the same reason the reverse side does
                         # it: the command physically went to the far end
@@ -2115,7 +2133,13 @@ class SyncEngine:
                         if can_write_websdr and time.monotonic() >= backoff.next_attempt_at:
                             # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq.
                             logger.info("forward freq push: attempting %d Hz (verify=%s)", self._pending_freq, verify)
-                            applied = await self._driver.tune_hz(self._pending_freq, verify=verify)
+                            # See the mode branch's identical comment: a
+                            # concurrent stop/switch can null self._driver
+                            # during an earlier await this same tick.
+                            if self._driver is not None:
+                                applied = await self._driver.tune_hz(self._pending_freq, verify=verify)
+                            else:
+                                applied = False
                             self._last_websdr_write_at = time.monotonic()  # see the mode branch
                             resync_push_attempted = True
                             if forward_generation != self._forward_latch_generation:
@@ -2154,7 +2178,16 @@ class SyncEngine:
                     if not forward_superseded:
                         self._last_full_resync_at = now
 
-            websdr_status = await self._driver.get_status()
+            if self._driver is not None:
+                websdr_status = await self._driver.get_status()
+            else:
+                # Torn down mid-tick by a concurrent stop/switch (see the
+                # mode/freq branches' identical comments) -- nothing left
+                # to read or reverse-sync against this tick. The
+                # "if not self._websdr_active" guard below the whole block
+                # already re-nulls websdr_status for the outer publish
+                # either way; this just stops the read from crashing first.
+                websdr_status = None
 
             # v11 reverse sync (WebSDR -> rig). Prefer this tick's fresh
             # state.ptt over self._last_ptt -- _reset_sync_latches() can
@@ -2171,7 +2204,8 @@ class SyncEngine:
             # self._last_ptt post-await.
             reverse_ptt = state.ptt if state.ptt is not None else last_ptt_before_awaits
             if (
-                not reverse_ptt
+                websdr_status is not None
+                and not reverse_ptt
                 and websdr_status.connected
                 and not self._reverse_sync_held
                 and time.monotonic() - self._forward_push_completed_at >= REVERSE_HOLDOFF_S

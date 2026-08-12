@@ -76,7 +76,12 @@ class BehaviourPanel(wx.Panel):
 
         self.sync_direction_choice = wx.Choice(self, choices=SYNC_DIRECTION_CHOICES)
         self.sync_direction_choice.SetFont(value_font())
-        self.sync_direction_choice.SetSelection(0)
+        # Must mirror the engine's own never-persisted default
+        # (SyncEngine._reverse_sync_held = False, i.e. bidirectional) --
+        # this dropdown never gets an init-time reconciliation call, so
+        # whatever index is selected here IS the displayed state for the
+        # entire session until the user changes it themselves.
+        self.sync_direction_choice.SetSelection(SYNC_DIRECTION_CHOICES.index(SYNC_DIRECTION_BIDIRECTIONAL))
         self.sync_direction_choice.Bind(wx.EVT_CHOICE, self._on_sync_direction_changed)
         grid.Add(field("Sync direction", self.sync_direction_choice), 1, wx.EXPAND)
 
