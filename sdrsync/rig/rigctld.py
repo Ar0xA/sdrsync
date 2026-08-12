@@ -310,18 +310,27 @@ class RigctldClient:
         )
         return False
 
-    async def set_mode(self, mode_name: str, passband_hz: Optional[int], verify_budget_s: Optional[float] = None) -> bool:
-        """Reverse-sync (WebSDR -> rig): sets the rig's mode + passband.
+    async def set_mode(self, mode_name: str, verify_budget_s: Optional[float] = None) -> bool:
+        """Reverse-sync (WebSDR -> rig): sets ONLY the rig's mode, never
+        its filter/passband width -- the WebSDR page has no reliable way
+        to say which specific filter width it wants (WebSDRStatus.mode is
+        already base-collapsed, e.g. narrow/wide USB both just report
+        "USB"), and a user reported live that having reverse sync touch
+        the filter at all was unwelcome even when a "sensible" value was
+        being sent, e.g. the rig's own current width or its mode default.
+        rigctld's 'M' command has a real "leave bandwidth alone" input for
+        exactly this: -1, distinct from 0 ("use the rig's default for
+        this mode") -- confirmed via hamlib's own rigctld documentation,
+        not assumed. Every reverse-sync mode push now sends -1
+        unconditionally.
 
-        passband_hz=0 (or None) means "rig default for this mode" -- valid
-        hamlib/rigctld convention, not a sentinel for "unset". Verified
-        via a poll-until-match readback of get_mode(), same reasoning
-        (and cadence) as set_freq() above. verify_budget_s: see set_freq()."""
-        pb = 0 if not passband_hz else int(passband_hz)
+        Verified via a poll-until-match readback of get_mode(), same
+        reasoning (and cadence) as set_freq() above. verify_budget_s: see
+        set_freq()."""
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s
-        resp = await self._send_raw(f"M {mode_name} {pb}")
+        resp = await self._send_raw(f"M {mode_name} -1")
         if not parse_set_response(resp):
-            logger.warning("rigctld rejected M %s %d: %r", mode_name, pb, resp)
+            logger.warning("rigctld rejected M %s -1: %r", mode_name, resp)
             return False
         deadline = asyncio.get_running_loop().time() + budget
         while True:
@@ -335,8 +344,8 @@ class RigctldClient:
             if asyncio.get_running_loop().time() >= deadline:
                 break
         logger.warning(
-            "rigctld accepted M %s %d but the rig never confirmed it within %.1fs",
-            mode_name, pb, budget,
+            "rigctld accepted M %s -1 but the rig never confirmed it within %.1fs",
+            mode_name, budget,
         )
         return False
 

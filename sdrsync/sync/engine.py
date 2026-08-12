@@ -54,17 +54,19 @@ logger = logging.getLogger("sdrsync.engine")
 
 DEFAULT_POLL_INTERVAL_S = 0.2  # see AppSettings.poll_interval_s -- now user-configurable, this is just the fallback
 FREQ_DEBOUNCE_S = 0.2          # candidate frequency must be stable this long before pushing
-FREQ_CHANGE_THRESHOLD_HZ = 1  # ignore rig jitter smaller than this
-# Was 10 Hz until a live bug report: rigctld/flrig frequency readbacks are
-# exact digital values (no analog noise), not a measurement subject to
-# real jitter, so 10 Hz was simply too coarse -- a genuine, intentional
-# 9-10 Hz fine-tune step (common CW/RTTY spotting granularity) never
-# exceeded the threshold with the strict '>' comparisons below, so it was
-# never even adopted as a new pending candidate and was silently dropped
-# forever, not just filtered once. FREQ_DEBOUNCE_S below already does the
-# real work of requiring a reading to be stable before it's pushed, so
-# this only needs to absorb sub-Hz rounding noise, not genuine retuning
-# of any size.
+FREQ_CHANGE_THRESHOLD_HZ = 0  # ignore rig jitter smaller than this
+# Was 10 Hz, then 1 Hz, until live testing with a real rig: rigctld/flrig
+# frequency readbacks are exact digital values (no analog noise), not a
+# measurement subject to real jitter, so any nonzero threshold ends up
+# blocking some genuine step size sooner or later -- 10 Hz blocked a
+# 9-10 Hz CW/RTTY spotting step, and 1 Hz (the first fix) still blocked a
+# rig's own finest tuning-step button (confirmed live: many rigs offer an
+# exact 1 Hz step, which never exceeded a threshold of 1). 0 means "any
+# actual change is real" -- a reading that hasn't changed at all still
+# compares equal and is correctly ignored, and FREQ_DEBOUNCE_S below
+# already does the real work of requiring a reading to be stable before
+# it's pushed, so there is nothing left for a nonzero threshold to usefully
+# filter here.
 # Belt-and-suspenders: forces a forward re-push of the rig's current
 # mode/freq onto the WebSDR every this-often, REGARDLESS of whether
 # _last_sent_mode_key/_last_sent_freq already look like a match. Purely
@@ -174,9 +176,27 @@ REVERSE_HOLDOFF_S = 1.0
 # continuous human drag/click gesture on the page, not rig hardware
 # jitter, which would otherwise hammer set_freq() many times per second.
 REVERSE_FREQ_DEBOUNCE_S = 0.5
-# Coarser than the forward direction's FREQ_CHANGE_THRESHOLD_HZ -- a
-# waterfall click readback isn't pixel-exact.
-REVERSE_FREQ_CHANGE_THRESHOLD_HZ = 50
+# Was 50 Hz ("coarser than the forward direction's FREQ_CHANGE_THRESHOLD_HZ
+# -- a waterfall click readback isn't pixel-exact") until a live user
+# report: that reasoning only fits a mouse-drag/click on the waterfall,
+# where the landed frequency genuinely isn't exact -- it doesn't fit a
+# discrete, EXACT step button (e.g. a page's own "+10 Hz" control), and
+# this engine has no way to tell which UI element produced an observed
+# change, only the resulting value. With a strict '>' comparison used to
+# decide BOTH "is this a new candidate" and "is it different enough to
+# push" (same bug shape FREQ_CHANGE_THRESHOLD_HZ had on the forward side,
+# see that constant's own history), a run of +10 Hz clicks never
+# individually exceeded 50 -- so the candidate never updated at all,
+# every click just accumulated invisibly, until enough of them finally
+# pushed the total past 50, at which point the whole backlog fired at
+# once. That is exactly "nothing happens for several clicks, then it
+# suddenly jumps", confirmed live. REVERSE_FREQ_DEBOUNCE_S below already
+# does the real job of absorbing an in-progress drag/click gesture (it
+# requires the observed value to stop changing before pushing), so this
+# only needs to absorb genuine read noise, not gate legitimate small
+# changes -- 0 means only a truly unchanged reading is ignored, same
+# reasoning as the forward-direction fix.
+REVERSE_FREQ_CHANGE_THRESHOLD_HZ = 0
 # Debounces a discrete mode click/button the same way REVERSE_FREQ_DEBOUNCE_S
 # debounces a continuous drag -- shorter than the freq value since a mode
 # click is terminal (no "still moving" case to wait out), this only exists
@@ -270,7 +290,13 @@ class RigClient(Protocol):
 
     async def set_freq(self, freq_hz: int, verify_budget_s: Optional[float] = None) -> bool: ...
 
-    async def set_mode(self, mode_name: str, passband_hz: Optional[int], verify_budget_s: Optional[float] = None) -> bool: ...
+    # Mode-only, deliberately -- neither backend implementation touches
+    # filter/bandwidth on a reverse-sync mode push (see RigctldClient/
+    # FlrigClient.set_mode()'s own docstrings for why: the WebSDR page
+    # can't reliably say which specific width it wants, and a user
+    # reported live that any reverse-sync filter change was unwelcome
+    # even when a "sensible" value was being sent).
+    async def set_mode(self, mode_name: str, verify_budget_s: Optional[float] = None) -> bool: ...
 
 
 @dataclass
@@ -349,6 +375,12 @@ class StatusSnapshot(GuiMessage):
     # was confirmed live as part of why a failed connect attempt read as
     # the app doing nothing.
     rig_connect_remaining_s: Optional[float] = None
+    # Mirrors SyncEngine._rig_generation -- lets the GUI recognize a
+    # snapshot published by a rig connect attempt from BEFORE the most
+    # recent Connect click (queue backlog) and skip it for one-shot
+    # popup purposes, rather than misreading it as this attempt's result.
+    # See that field's own docstring for the race this closes.
+    rig_generation: int = 0
     websdr_active: bool = False
     websdr: Optional[WebSDRStatus] = None
     fatal_error: Optional[str] = None
@@ -406,6 +438,20 @@ class SyncEngine:
         self._mock_state: "Optional[FakeRigState | FakeFlrigState]" = None
         self._rig_active = False
         self._rig_error: Optional[str] = None
+        # Bumped on every _start_rig() call -- mirrors _websdr_generation
+        # below (same staleness problem, different subsystem). While the
+        # rig is idle after a failed connect, _tick() keeps publishing a
+        # snapshot every poll carrying the same self._rig_error (see that
+        # field's docstring), so the GUI's status_queue can be holding a
+        # backlog of stale "still shows the old error" snapshots at the
+        # exact moment the user clicks Connect again. The GUI resets its
+        # one-shot popup guard synchronously on click, but this engine call
+        # only runs later, asynchronously, on this loop's own thread --
+        # without a generation tag, one of those backlog snapshots gets
+        # drained right after the click and re-triggers the "connection
+        # failed" popup for an attempt that hasn't even started yet,
+        # confirmed live even when the new attempt goes on to succeed.
+        self._rig_generation = 0
         # Remembered from _start_rig()'s params, purely for the give-up
         # error message below -- RigClient itself doesn't expose these
         # uniformly enough to read back out.
@@ -497,6 +543,16 @@ class SyncEngine:
         self._last_sent_freq: Optional[int] = None
         self._pending_freq: Optional[int] = None
         self._pending_freq_since: float = 0.0
+        # Diagnostic only (v2.2.2): tracks the last rig freq_hz value this
+        # instance already logged, so the forward-push trace below logs on
+        # a real CHANGE instead of every poll tick. Added to trace a live
+        # report that a rig's own single-Hz step button never reaches the
+        # WebSDR even after FREQ_CHANGE_THRESHOLD_HZ was lowered to 0 --
+        # this narrows down whether the raw rig reading itself carries
+        # Hz-level resolution at all (some rigctld/hamlib backends round
+        # their own reported frequency) versus the engine seeing the
+        # right value but not acting on it.
+        self._last_logged_rig_freq: Optional[int] = None
         self._last_sent_mode_key: Optional[tuple[str, Optional[int]]] = None
         self._last_ptt: Optional[bool] = None
         # See FULL_RESYNC_INTERVAL_S.
@@ -689,6 +745,7 @@ class SyncEngine:
         snapshot = StatusSnapshot(
             rig_active=self._rig_active,
             rig_error=self._rig_error,
+            rig_generation=self._rig_generation,
             websdr_active=self._websdr_active,
             reverse_sync_error=self._reverse_sync_error,
             reverse_sync_pending=self._reverse_sync_pending_text(),
@@ -759,6 +816,13 @@ class SyncEngine:
         mock mode, self._rig is the real client class for the selected
         backend, pointed at the just-started embedded mock server -- never
         a separate fake client."""
+        # Bump FIRST, before either outcome below (mock-bind failure or a
+        # real attempt) -- see self._rig_generation's docstring. Every
+        # snapshot this attempt publishes, including a same-tick mock-bind
+        # failure, must carry this attempt's generation so the GUI can
+        # tell it apart from backlog belonging to whatever attempt (if
+        # any) came before this call.
+        self._rig_generation += 1
         if self._rig_active:
             await self._stop_rig()
 
@@ -1628,16 +1692,11 @@ class SyncEngine:
                     mode_to_send = obs_mode
                     if obs_mode == "CW" and state.mode is not None and state.mode.upper().startswith("CW"):
                         mode_to_send = state.mode
-                    # Preserve the rig's current filter width when only the
-                    # page's narrow/wide variant changed within the same base
-                    # mode (the page can't tell us which variant it wants --
-                    # WebSDRStatus.mode is already base-collapsed) -- 0 (rig
-                    # default) only when the base mode itself actually
-                    # changed. Recomputed fresh each attempt from this
-                    # tick's state, not captured once at ladder start -- the
-                    # rig may have partially moved between attempts.
-                    passband_hz = state.passband_hz if mode_to_send == state.mode else None
-                    ok = await self._rig.set_mode(mode_to_send, passband_hz, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
+                    # Mode-only -- filter/bandwidth is never touched by a
+                    # reverse-sync push (see RigClient.set_mode()'s own
+                    # docstring: a user reported live that any reverse-sync
+                    # filter change was unwelcome, even a "sensible" one).
+                    ok = await self._rig.set_mode(mode_to_send, verify_budget_s=REVERSE_PUSH_ATTEMPT_VERIFY_S)
                     # Stamp unconditionally, before the generation guard --
                     # the write physically happened on the wire regardless
                     # of whether a concurrent reset superseded our own
@@ -1832,6 +1891,10 @@ class SyncEngine:
         if rig_reconnected:
             self._last_rig_activity_at = time.monotonic()
         state = await self._rig.get_state()
+        # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq's docstring.
+        if state.freq_hz is not None and state.freq_hz != self._last_logged_rig_freq:
+            logger.info("rig freq_hz read: %d (was %s)", state.freq_hz, self._last_logged_rig_freq)
+            self._last_logged_rig_freq = state.freq_hz
 
         # v14 idle tracking. Runs on EVERY tick the rig is connected,
         # whether or not a WebSDR session exists, so idle time keeps
@@ -1986,6 +2049,12 @@ class SyncEngine:
 
                 if state.freq_hz is not None and not forward_superseded:
                     if self._pending_freq is None or abs(state.freq_hz - self._pending_freq) > FREQ_CHANGE_THRESHOLD_HZ:
+                        # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq.
+                        if self._pending_freq is not None and state.freq_hz != self._pending_freq:
+                            logger.info(
+                                "forward freq candidate -> %d Hz (was %d, debounce restarted)",
+                                state.freq_hz, self._pending_freq,
+                            )
                         self._pending_freq = state.freq_hz
                         self._pending_freq_since = now
                     elif (
@@ -2001,6 +2070,12 @@ class SyncEngine:
                         freq_changed = (
                             self._last_sent_freq is None
                             or abs(self._pending_freq - self._last_sent_freq) > FREQ_CHANGE_THRESHOLD_HZ
+                        )
+                        # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq.
+                        logger.info(
+                            "forward freq debounce satisfied: pending=%d last_sent=%s freq_changed=%s "
+                            "can_write_websdr=%s",
+                            self._pending_freq, self._last_sent_freq, freq_changed, can_write_websdr,
                         )
                         # verify=False ONLY for a periodic-resync re-push
                         # of an unchanged frequency WHILE a reverse-sync
@@ -2025,21 +2100,32 @@ class SyncEngine:
                         backoff = self._forward_freq_backoff
                         backoff.note_target(self._pending_freq)
                         if can_write_websdr and time.monotonic() >= backoff.next_attempt_at:
+                            # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq.
+                            logger.info("forward freq push: attempting %d Hz (verify=%s)", self._pending_freq, verify)
                             applied = await self._driver.tune_hz(self._pending_freq, verify=verify)
                             self._last_websdr_write_at = time.monotonic()  # see the mode branch
                             resync_push_attempted = True
                             if forward_generation != self._forward_latch_generation:
                                 forward_superseded = True  # concurrent reset while awaiting
+                                logger.info("forward freq push: superseded by a concurrent reset")
                             elif applied:
                                 backoff.record_success()
                                 self._last_sent_freq = self._pending_freq
                                 self._last_pushed_to_websdr_freq = self._pending_freq
                                 self._forward_push_completed_at = time.monotonic()
                                 self._reverse_reseed_due = True
+                                logger.info("forward freq push: applied %d Hz", self._pending_freq)
                             else:
                                 backoff.record_failure()
+                                logger.info("forward freq push: driver.tune_hz(%d) returned False", self._pending_freq)
                         elif not can_write_websdr:
                             resync_push_blocked = True  # write gap only -- see the mode branch
+                            # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq.
+                            logger.info(
+                                "forward freq push: blocked by write gap or backoff (pending=%d, "
+                                "next_attempt_at in %.2fs)",
+                                self._pending_freq, backoff.next_attempt_at - time.monotonic(),
+                            )
 
                 # Stamped ONLY when this cycle's push(es) actually reached
                 # the driver and nothing eligible was held back. Stamping

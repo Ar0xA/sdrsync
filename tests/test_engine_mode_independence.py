@@ -46,7 +46,7 @@ class StubRig:
     async def set_freq(self, freq_hz: int) -> bool:
         return True
 
-    async def set_mode(self, mode_name: str, passband_hz) -> bool:
+    async def set_mode(self, mode_name: str) -> bool:
         return True
 
 
@@ -273,6 +273,38 @@ def test_a_fine_9_to_10hz_retune_still_reaches_the_websdr():
     state.freq_hz = 14074810
     asyncio.run(settle())
     assert 14074810 in stub_driver.tuned
+
+
+def test_an_exact_1hz_step_still_reaches_the_websdr():
+    """Regression test for a live bug found on a real rig: the first fix
+    for the 9-10 Hz issue above lowered FREQ_CHANGE_THRESHOLD_HZ from 10
+    to 1, which still silently dropped a genuine step of EXACTLY 1 Hz --
+    many rigs offer a dedicated 1 Hz fine-tune step button, and a strict
+    '>' comparison against a threshold of 1 never lets an exactly-1
+    difference through. FREQ_CHANGE_THRESHOLD_HZ is now 0, which only
+    ever ignores a truly UNCHANGED reading (diff of exactly 0)."""
+    engine = make_engine()
+    state = RigState(freq_hz=14074500, mode="USB", passband_hz=2700, ptt=False)
+    stub_rig = StubRig(state)
+    stub_driver = StubDriver()
+    engine._rig = stub_rig
+    engine._rig_active = True
+    engine._driver = stub_driver
+    engine._websdr_active = True
+
+    async def settle():
+        await engine._tick()
+        engine._pending_freq_since -= FREQ_DEBOUNCE_S + 0.1
+        _clear_websdr_write_gap(engine)
+        await engine._tick()
+
+    asyncio.run(settle())
+    assert stub_driver.tuned == [14074500]
+
+    # The rig's own finest step button: exactly 1 Hz.
+    state.freq_hz = 14074499
+    asyncio.run(settle())
+    assert 14074499 in stub_driver.tuned
 
 
 def test_periodic_resync_of_unchanged_freq_still_verifies_with_no_reverse_push_in_flight():

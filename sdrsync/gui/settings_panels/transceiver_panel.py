@@ -54,6 +54,9 @@ class TransceiverPanel(wx.Panel):
         self.on_test: Optional[Callable[[], None]] = None
         self.on_connect: Optional[Callable[[], None]] = None
         self._rig_active = False
+        # See _populate_host_port_for_backend()'s docstring -- must exist
+        # before either host_entry or port_entry can fire an event.
+        self._populating_host_port = False
 
         outer = wx.BoxSizer(wx.VERTICAL)
         pad_top, pad_side, pad_bottom = self.FromDIP(18), self.FromDIP(16), self.FromDIP(20)
@@ -217,12 +220,27 @@ class TransceiverPanel(wx.Panel):
         self.test_status_text.SetLabel("")
 
     def _populate_host_port_for_backend(self, backend: str) -> None:
-        if backend == "flrig":
-            self.host_entry.SetValue(self.settings.flrig_host)
-            self.port_entry.SetValue(self.settings.flrig_port)
-        else:
-            self.host_entry.SetValue(self.settings.rigctld_host)
-            self.port_entry.SetValue(self.settings.rigctld_port)
+        # Guarded, not just "populate before binding" (see __init__'s own
+        # comment on that first fix) -- THIS call site runs at runtime,
+        # long after both fields' handlers are already bound, so the same
+        # hazard applies here too: SetValue() fires EVT_TEXT/EVT_SPINCTRL
+        # synchronously, and host_entry's SetValue() landing before
+        # port_entry's own runs _on_host_port_edited with the NEW
+        # backend's host but the OLD backend's still-displayed port --
+        # which then gets saved as the new backend's port, clobbering it
+        # with the wrong backend's value before port_entry.SetValue() ever
+        # gets a chance to correct it (confirmed live: switching flrig ->
+        # rigctld left rigctld_port holding flrig's port instead of 4532).
+        self._populating_host_port = True
+        try:
+            if backend == "flrig":
+                self.host_entry.SetValue(self.settings.flrig_host)
+                self.port_entry.SetValue(self.settings.flrig_port)
+            else:
+                self.host_entry.SetValue(self.settings.rigctld_host)
+                self.port_entry.SetValue(self.settings.rigctld_port)
+        finally:
+            self._populating_host_port = False
 
     def _on_backend_changed(self, _evt: wx.CommandEvent) -> None:
         backend = self.backend_choice.GetStringSelection()
@@ -232,6 +250,8 @@ class TransceiverPanel(wx.Panel):
         self._refresh_poll_status()
 
     def _on_host_port_edited(self, _evt: wx.CommandEvent) -> None:
+        if self._populating_host_port:
+            return
         backend = self.backend_choice.GetStringSelection()
         host = self.host_entry.GetValue().strip()
         port = self.port_entry.GetValue()

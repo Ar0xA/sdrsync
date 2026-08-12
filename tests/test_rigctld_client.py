@@ -77,9 +77,8 @@ def test_set_mode_success_applies_and_confirms():
         client = RigctldClient("127.0.0.1", port)
         try:
             assert await client.connect() is True
-            assert await client.set_mode("LSB", 1800) is True
+            assert await client.set_mode("LSB") is True
             assert state.mode == "LSB"
-            assert state.passband_hz == 1800
         finally:
             await client.close()
             server.close()
@@ -88,16 +87,25 @@ def test_set_mode_success_applies_and_confirms():
     asyncio.run(run())
 
 
-def test_set_mode_zero_passband_means_rig_default():
+def test_set_mode_never_touches_the_rigs_passband():
+    """Regression test for a live user report: reverse-sync mode changes
+    used to also set the rig's filter/passband (0 = "rig default" is a
+    real hamlib value, not "leave alone"), which the user found
+    unwelcome even though a "sensible" value was being sent. set_mode()
+    now always sends hamlib's real -1 ("leave bandwidth alone") sentinel
+    -- confirmed via hamlib's own rigctld documentation -- so the rig's
+    passband must be completely unaffected by a mode change, whatever it
+    was set to beforehand."""
     async def run():
         server, state = await start_server(port=0)
         port = server.sockets[0].getsockname()[1]
+        state.passband_hz = 1800  # whatever the user had manually set on the rig
         client = RigctldClient("127.0.0.1", port)
         try:
             assert await client.connect() is True
-            assert await client.set_mode("CW", None) is True
+            assert await client.set_mode("CW") is True
             assert state.mode == "CW"
-            assert state.passband_hz == 0
+            assert state.passband_hz == 1800  # untouched
         finally:
             await client.close()
             server.close()
@@ -154,9 +162,8 @@ def test_set_mode_polls_through_slow_cat_bus_turnaround():
         client = RigctldClient("127.0.0.1", port)
         try:
             assert await client.connect() is True
-            assert await client.set_mode("LSB", 1800) is True
+            assert await client.set_mode("LSB") is True
             assert state.mode == "LSB"
-            assert state.passband_hz == 1800
         finally:
             await client.close()
             server.close()
@@ -194,7 +201,7 @@ def test_set_mode_gives_up_after_verify_budget_when_never_confirmed():
         client = RigctldClient("127.0.0.1", port)
         try:
             assert await client.connect() is True
-            assert await client.set_mode("LSB", 1800) is False
+            assert await client.set_mode("LSB") is False
             assert state.mode == "USB"  # untouched -- never applied
             assert client.connected is True
         finally:

@@ -323,14 +323,25 @@ class FlrigClient:
         logger.warning("flrig did not confirm set_vfoA(%d) within %.2fs", freq_hz, budget)
         return False
 
-    async def set_mode(self, mode_name: str, passband_hz: Optional[int], verify_budget_s: Optional[float] = None) -> bool:
-        """Reverse-sync (WebSDR -> rig). passband_hz is accepted for
-        interface parity with RigctldClient.set_mode but unused -- flrig's
-        rig.set_mode takes only a mode name (bandwidth is a separate,
-        unrelated RPC on this backend). Verified via a bounded
-        poll-until-match readback of get_mode(), same reasoning as
-        set_freq() -- set_mode's own RPC response silently no-ops on an
-        unrecognized mode string rather than erroring. verify_budget_s: see
+    async def set_mode(self, mode_name: str, verify_budget_s: Optional[float] = None) -> bool:
+        """Reverse-sync (WebSDR -> rig). Sets ONLY the mode via
+        rig.set_mode -- never touches filter/bandwidth. flrig does have a
+        separate rig.set_bandwidth RPC (confirmed against flrig's source,
+        src/server/xml_server.cxx: registered signature "i:i") and an
+        earlier version of this method called it, but a user reported
+        live that having reverse sync touch the filter at all was
+        unwelcome, matching the same "mode-only" ask that changed
+        RigctldClient.set_mode() to always send hamlib's -1 ("leave
+        bandwidth alone") sentinel instead of a concrete width -- see
+        that method's docstring. flrig's rig.set_bandwidth has no
+        equivalent "leave alone" input of its own (a 0 clamps to the
+        NARROWEST supported filter, confirmed via source), so for this
+        backend "never touch it" means simply never calling it, not
+        calling it with a sentinel value.
+
+        Verified via a bounded poll-until-match readback of get_mode() --
+        set_mode's own RPC response silently no-ops on an unrecognized
+        mode string rather than erroring. verify_budget_s: see
         set_freq()."""
         if self._proxy is None:
             return False
