@@ -603,6 +603,17 @@ class SyncEngine:
         # fresh user edit. Re-seeding on the first post-push observation
         # sidesteps needing each driver's forward-collapse table at the
         # engine level.
+        #
+        # "Actually changes something" is load-bearing, not just a
+        # description -- the two set-sites below must gate on the push
+        # representing a REAL change (mode_key/pending_freq differing from
+        # what was last sent), not merely on the push having "succeeded".
+        # due_for_periodic_resync (FULL_RESYNC_INTERVAL_S) forces a push
+        # even when nothing changed, purely as a safety net -- arming this
+        # flag for THAT case too (a real bug, fixed after being found live)
+        # opened a REVERSE_HOLDOFF_S window every ~30s where a genuine page
+        # click landing in it got silently adopted as the new baseline
+        # instead of triggering a real reverse push to the rig.
         self._reverse_reseed_due: bool = False
         # Forward-push counterpart of _sync_latch_generation, checked by
         # _tick()'s forward block after each await into the driver.
@@ -2167,6 +2178,23 @@ class SyncEngine:
                             forward_superseded = True
                         elif applied:
                             backoff.record_success()
+                            # Captured BEFORE the reassignment just below --
+                            # True only when this push actually changed the
+                            # rig's mode, as opposed to firing purely because
+                            # due_for_periodic_resync forced an unconditional
+                            # re-send of an ALREADY-agreed value. Only a real
+                            # change needs the reseed below: the WebSDR page
+                            # already shows the correct canonical form of an
+                            # unchanged mode from the last time it genuinely
+                            # changed, so there is nothing new to bridge.
+                            # Arming the reseed on every resync regardless
+                            # opened a ~REVERSE_HOLDOFF_S window, every
+                            # ~FULL_RESYNC_INTERVAL_S, where a genuine page
+                            # click landing in it got silently adopted as the
+                            # new "baseline" (not pushed to the rig) instead
+                            # of triggering a real reverse push -- confirmed
+                            # live, see the regression test below.
+                            mode_actually_changed = mode_key != self._last_sent_mode_key
                             self._last_sent_mode_key = mode_key
                             # A mode change can change the effective frequency
                             # sent to the WebSDR (e.g. CW offset), so force a
@@ -2175,7 +2203,8 @@ class SyncEngine:
                             self._last_sent_freq = None
                             self._last_pushed_to_websdr_mode = state.mode
                             self._forward_push_completed_at = time.monotonic()
-                            self._reverse_reseed_due = True
+                            if mode_actually_changed:
+                                self._reverse_reseed_due = True
                         else:
                             backoff.record_failure()
                     elif not can_write_websdr:
@@ -2265,10 +2294,26 @@ class SyncEngine:
                                 logger.info("forward freq push: superseded by a concurrent reset")
                             elif applied:
                                 backoff.record_success()
+                                # Captured BEFORE the reassignment just below,
+                                # and deliberately NOT freq_changed (computed
+                                # above from _last_sent_freq): the mode branch
+                                # earlier THIS SAME tick unconditionally resets
+                                # _last_sent_freq to None on every successful
+                                # mode push, including a due_for_periodic_resync
+                                # no-op one -- so freq_changed reads True there
+                                # regardless of whether the frequency actually
+                                # moved (a false positive that defeated an
+                                # earlier version of this fix, caught by the
+                                # regression test below actually running it).
+                                # _last_pushed_to_websdr_freq is untouched by
+                                # that reset, so it reflects the real prior
+                                # value.
+                                freq_actually_changed = self._pending_freq != self._last_pushed_to_websdr_freq
                                 self._last_sent_freq = self._pending_freq
                                 self._last_pushed_to_websdr_freq = self._pending_freq
                                 self._forward_push_completed_at = time.monotonic()
-                                self._reverse_reseed_due = True
+                                if freq_actually_changed:
+                                    self._reverse_reseed_due = True
                                 logger.info("forward freq push: applied %d Hz", self._pending_freq)
                             else:
                                 backoff.record_failure()

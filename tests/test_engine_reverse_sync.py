@@ -23,6 +23,7 @@ import queue
 from sdrsync.config import AppSettings
 from sdrsync.rig.rigctld import RigState
 from sdrsync.sync.engine import (
+    FULL_RESYNC_INTERVAL_S,
     REVERSE_FREQ_CHANGE_THRESHOLD_HZ,
     REVERSE_FREQ_DEBOUNCE_S,
     REVERSE_HOLDOFF_S,
@@ -170,6 +171,45 @@ def _settle_and_capture_baseline(engine: SyncEngine) -> None:
     _clear_holdoff(engine)
     asyncio.run(engine._tick())  # nothing left to forward-push -> baseline captured
     assert engine._reverse_baseline_captured is True
+
+
+def test_periodic_resync_of_an_unchanged_value_does_not_swallow_a_concurrent_page_click():
+    """The bug: due_for_periodic_resync (FULL_RESYNC_INTERVAL_S) forces a
+    forward push even when NOTHING changed, purely as a safety net -- and
+    that push used to unconditionally arm _reverse_reseed_due regardless
+    of whether anything actually changed. That opened a REVERSE_HOLDOFF_S
+    window, every ~30s, in EVERY WebSDR session, where a genuine click on
+    the page landing in it got silently adopted as the new "baseline"
+    (never pushed to the rig) instead of triggering a real reverse push --
+    confirmed live and via direct code reading. The fix: only arm the
+    reseed when the push represented a genuine change."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    # Force the periodic full resync to fire on the next tick even though
+    # nothing has actually changed (rig and page still agree).
+    engine._last_full_resync_at -= FULL_RESYNC_INTERVAL_S + 0.1
+    _clear_holdoff(engine)
+    _clear_rig_write_gap(engine)
+    _clear_websdr_write_gap(engine)
+    asyncio.run(engine._tick())  # the periodic resync: re-sends the SAME unchanged mode+freq
+    assert engine._reverse_reseed_due is False  # the fix -- no genuine change, nothing to reseed
+
+    # The operator clicks a genuinely different frequency on the WebSDR
+    # page -- landing inside the post-resync REVERSE_HOLDOFF_S window,
+    # exactly the scenario that used to be silently discarded.
+    status.freq_hz = 14_123_456
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the reverse-freq debounce (not a reseed)
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # debounce elapsed -- must push, not have discarded the click
+
+    assert stub_rig.set_freqs == [14_123_456], "the page click was silently swallowed by the periodic-resync reseed"
 
 
 def test_first_observation_is_a_baseline_not_a_push():
