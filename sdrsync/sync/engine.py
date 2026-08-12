@@ -1770,6 +1770,14 @@ class SyncEngine:
             self._last_observed_freq is not None
             and abs(self._pending_reverse_freq - self._last_observed_freq) <= REVERSE_FREQ_CHANGE_THRESHOLD_HZ
         ):
+            # Mirrors the mode branch's identical "nothing to do" refresh
+            # (the `else` at the bottom of the mode block above) -- without
+            # this, _last_observed_freq freezes at whatever it was last set
+            # to (typically the reseed value) and never tracks reality
+            # again, so a frequency that happens to match that frozen value
+            # gets silently treated as "already accounted for" and dropped,
+            # even after the rig has since moved somewhere else entirely.
+            self._last_observed_freq = self._pending_reverse_freq
             self._freq_push = None
             return
 
@@ -1813,6 +1821,11 @@ class SyncEngine:
         push.attempts += 1
         if ok:
             self._last_pushed_to_websdr_freq = pending_freq
+            # See the mode branch's identical pair of assignments on its
+            # own success path -- _last_observed_freq must stay current or
+            # this exact frequency becomes permanently unpushable the next
+            # time the page returns to it (see the dedupe-gate comment above).
+            self._last_observed_freq = pending_freq
             self._forward_push_completed_at = time.monotonic()
             self._reverse_sync_error = None
             self._freq_push = None

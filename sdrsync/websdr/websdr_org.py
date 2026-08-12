@@ -298,6 +298,30 @@ class WebsdrOrgDriver:
             self._last_out_of_range_hz = effective_hz
             return False
 
+        # Captured before the write, only when we'll actually verify --
+        # lets _verify_freq_applied() tell "our own setfreq() didn't take"
+        # apart from "the page moved because the user clicked it" (see
+        # that method's docstring). Best-effort: a failed read here must
+        # not block the actual frequency push, so it just falls back to
+        # None (verify then falls back to its old, conservative behavior).
+        pre_push_hz = None
+        if verify:
+            try:
+                pre_push_hz = await self._read_page_freq_hz()
+            except PlaywrightError:
+                pre_push_hz = None
+            # Re-check after the await above: a concurrent close() (e.g.
+            # the user hit Disconnect, or SwitchWebsdr tore this driver
+            # down) could have run while it was suspended and set
+            # self._page to None -- there was no await between the
+            # entry check and the first self._page.evaluate() call
+            # before pre_push_hz existed, so this window is new here,
+            # not pre-existing. Every other await point in this method
+            # already re-validates the same way (see
+            # _verify_freq_applied's identical check after its sleep).
+            if not self._attached:
+                return False
+
         try:
             if band_idx != self._current_band:
                 await self._page.evaluate("(idx) => window.setband(idx)", band_idx)
@@ -310,13 +334,13 @@ class WebsdrOrgDriver:
             return False
 
         if verify:
-            self._schedule_freq_verification(effective_hz)
+            self._schedule_freq_verification(effective_hz, pre_push_hz)
         return True
 
-    def _schedule_freq_verification(self, expected_hz: int) -> None:
+    def _schedule_freq_verification(self, expected_hz: int, pre_push_hz: Optional[int] = None) -> None:
         if self._verify_task is not None and not self._verify_task.done():
             self._verify_task.cancel()
-        self._verify_task = asyncio.ensure_future(self._verify_freq_applied(expected_hz))
+        self._verify_task = asyncio.ensure_future(self._verify_freq_applied(expected_hz, pre_push_hz))
 
     async def _read_page_freq_hz(self) -> Optional[int]:
         """Reads back the frequency the page itself currently holds.
@@ -355,7 +379,22 @@ class WebsdrOrgDriver:
         except (TypeError, ValueError):
             return None
 
-    async def _verify_freq_applied(self, expected_hz: int) -> None:
+    async def _verify_freq_applied(self, expected_hz: int, pre_push_hz: Optional[int] = None) -> None:
+        """pre_push_hz is what the page's own `window.freq` held right
+        before we called setfreq(), if known. Without it, a mismatch here
+        is ambiguous: it could mean our write never landed (the rig-driven
+        case this corrective retune exists for), or it could mean the user
+        retuned the page themselves in the roughly FREQ_VERIFY_DELAY_S
+        window between our write and this check -- and forcing the page
+        back onto our value in that second case silently erases a real
+        user action while logging a misleading "WebSDR did not apply
+        requested frequency" warning that isn't true. When pre_push_hz IS
+        known, it disambiguates: if the page still shows (approximately)
+        its pre-push value, our write genuinely didn't take and the
+        corrective retune below is exactly right; if it shows some THIRD
+        value -- neither what we asked for nor where it was before -- then
+        something else changed it in the meantime and this backs off
+        instead of fighting whoever/whatever that was."""
         try:
             await asyncio.sleep(FREQ_VERIFY_DELAY_S)
             if not self._attached:
@@ -365,6 +404,15 @@ class WebsdrOrgDriver:
                 logger.warning("Could not read back window.freq to verify setfreq()")
                 return
             if abs(actual_hz - expected_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
+                return
+
+            if pre_push_hz is not None and abs(actual_hz - pre_push_hz) > FREQ_VERIFY_TOLERANCE_HZ:
+                logger.debug(
+                    "Skipping corrective re-tune: page now shows %.3f kHz, matching neither "
+                    "the requested %.3f kHz nor its %.3f kHz pre-push value -- treating as a "
+                    "user-initiated change, not a failed write.",
+                    actual_hz / 1000, expected_hz / 1000, pre_push_hz / 1000,
+                )
                 return
 
             logger.warning(

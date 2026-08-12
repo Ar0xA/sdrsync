@@ -207,6 +207,52 @@ def test_genuinely_new_freq_triggers_exactly_one_debounced_push():
     assert stub_rig.set_freqs == [14200000]
 
 
+def test_click_back_to_a_previously_pushed_value_still_reaches_the_rig():
+    """Regression test for a live bug found by an independent review: the
+    freq branch's dedupe gate checks _last_observed_freq (same as the
+    mode branch's own gate does for _last_observed_mode_key), but unlike
+    the mode branch -- which refreshes _last_observed_mode_key both on a
+    successful push AND on its own "nothing to do" branch -- nothing ever
+    refreshed _last_observed_freq at all. It stayed frozen forever at
+    whatever _settle_and_capture_baseline() set it to.
+
+    That frozen value became a silent, permanent trap the first time the
+    user pushed a genuinely DIFFERENT frequency: clicking back to the
+    original baseline value later matched the STALE _last_observed_freq
+    (which still equalled that value) and was treated as "already
+    accounted for" and silently dropped -- even though the rig had since
+    moved on to the other frequency, and even though every OTHER
+    frequency continued to push just fine."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)  # baseline value: 14074000
+
+    # User clicks to a different frequency -- pushes fine.
+    status.freq_hz = 14200000
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the reverse debounce, no push yet
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # debounce elapsed -> pushes once
+    assert stub_rig.set_freqs == [14200000]
+
+    # User clicks BACK to the exact original baseline value.
+    status.freq_hz = 14074000
+    _clear_holdoff(engine)
+    _clear_rig_write_gap(engine)
+    asyncio.run(engine._tick())  # arms the reverse debounce again, no push yet
+    assert stub_rig.set_freqs == [14200000]  # not yet -- still debouncing
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    _clear_rig_write_gap(engine)
+    asyncio.run(engine._tick())  # debounce elapsed -> must push again
+
+    assert stub_rig.set_freqs == [14200000, 14074000]
+
+
 def test_a_precise_10hz_page_step_pushes_immediately_not_after_accumulating():
     """Regression test for a live bug: a discrete, EXACT step control on
     the WebSDR page (e.g. a "+10 Hz" button) never individually exceeded

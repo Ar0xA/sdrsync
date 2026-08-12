@@ -52,6 +52,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Optional, Protocol
 
 import wx
@@ -253,7 +254,25 @@ class WxPageAdapter:
         self._lock = asyncio.Lock()
         self._loop = loop
 
-        self._pending_script_future: Optional["asyncio.Future"] = None
+        # One entry per RunScriptAsync dispatch that has actually
+        # succeeded, appended (on the GUI thread, by do_run() inside
+        # _run_script()) in dispatch order and popped from the left (also
+        # GUI thread, by _on_script_result()) in that same order --
+        # RunScriptAsync can't be cancelled once dispatched, and wx.html2
+        # delivers wxEVT_WEBVIEW_SCRIPT_RESULT strictly FIFO per adapter
+        # with no other way to correlate a result to the call that
+        # triggered it (see the module docstring's "load-bearing facts").
+        # A cancelled caller (self._lock still held until its
+        # CancelledError propagates, so at most a handful of these can
+        # ever be outstanding, one per call abandoned while its script
+        # was still in flight) simply leaves its future in this queue,
+        # already done() -- _on_script_result() pops it in its correct
+        # FIFO position and discards it there, same as any other already-
+        # resolved future, rather than needing to specifically detect or
+        # count "orphans" at all. This queue is the sole source of truth;
+        # there is deliberately no separate "the current pending call"
+        # slot to keep in sync with it.
+        self._dispatch_queue: "deque[asyncio.Future]" = deque()
         # Armed on the GUI thread, immediately before LoadURL() actually
         # runs (not when goto() is called) -- see _on_loaded for why.
         self._nav_generation = 0
@@ -441,7 +460,6 @@ class WxPageAdapter:
             if not self._alive:
                 raise BrowserError("page adapter is not attached (destroyed)")
             fut: "asyncio.Future" = self._loop.create_future()
-            self._pending_script_future = fut
 
             def do_run():
                 if not self._alive:
@@ -458,9 +476,33 @@ class WxPageAdapter:
                 try:
                     self.webview.RunScriptAsync(script)
                 except Exception as e:
+                    # fut may already be cancelled if the caller gave up
+                    # while this was still queued for the GUI thread --
+                    # setting an exception on an already-done future is a
+                    # silent no-op via _safe_set_exception, which is
+                    # exactly right: nobody is listening any more, and
+                    # (unlike the success path just below) no completion
+                    # event is ever coming for a dispatch that never
+                    # happened, so nothing needs to go on the queue.
                     self._loop.call_soon_threadsafe(
                         _safe_set_exception, fut, BrowserError(f"RunScriptAsync failed: {e}")
                     )
+                    return
+                # RunScriptAsync succeeded -- a real
+                # wxEVT_WEBVIEW_SCRIPT_RESULT is now guaranteed for this
+                # dispatch, whether or not the caller is still around to
+                # receive it (it may already be cancelled -- see
+                # self._dispatch_queue's own doc comment for why that's
+                # fine to just enqueue anyway rather than needing to
+                # special-case it here). Appended on the GUI thread, same
+                # as _on_script_result()'s pop -- wx's single-threaded
+                # event dispatch serializes the two, no lock needed, and
+                # unlike a single "pending future" slot plus a separate
+                # orphan counter (an earlier version of this fix), a
+                # single FIFO queue can't fall out of sync with itself:
+                # every dispatch that actually happened is in it exactly
+                # once, in order, whether or not it was later abandoned.
+                self._dispatch_queue.append(fut)
 
             wx.CallAfter(do_run)
             try:
@@ -475,6 +517,13 @@ class WxPageAdapter:
                 # cleanly forever with nothing ever replacing it.
                 self._mark_dead(f"script timed out after {SCRIPT_TIMEOUT_S}s")
                 raise BrowserError(f"script timed out after {SCRIPT_TIMEOUT_S}s (adapter marked dead)")
+            # A plain CancelledError (the caller itself was cancelled, not
+            # a timeout) propagates through unhandled -- nothing to clean
+            # up here. fut is already in self._dispatch_queue (or about
+            # to be, once do_run() reaches the GUI thread) regardless of
+            # cancellation, and _on_script_result() discards it in its
+            # correct FIFO position once its real result arrives, same as
+            # any other already-done future it might pop.
 
     def _mark_dead(self, reason: str, notify: bool = True) -> None:
         was_alive = self._alive
@@ -486,10 +535,10 @@ class WxPageAdapter:
             wx.CallAfter(cb, reason)
 
     def _fail_pending(self, exc: BrowserError) -> None:
-        fut = self._pending_script_future
-        self._pending_script_future = None
-        if fut is not None and not fut.done():
-            self._loop.call_soon_threadsafe(_safe_set_exception, fut, exc)
+        while self._dispatch_queue:
+            fut = self._dispatch_queue.popleft()
+            if not fut.done():
+                self._loop.call_soon_threadsafe(_safe_set_exception, fut, exc)
         goto = self._pending_goto
         self._pending_goto = None
         if goto is not None:
@@ -584,9 +633,21 @@ class WxPageAdapter:
         assert wx.IsMainThread()
         if not self._alive:
             return
-        fut = self._pending_script_future
-        self._pending_script_future = None
-        if fut is None or fut.done():
+        if not self._dispatch_queue:
+            # Nothing was dispatched that could produce this -- shouldn't
+            # happen (every RunScriptAsync call has a matching queue
+            # entry), but silently dropping an unexplained event is safer
+            # than raising out of a wx event handler.
+            return
+        fut = self._dispatch_queue.popleft()
+        if fut.done():
+            # The caller that dispatched this one was cancelled before
+            # its result came back (see _dispatch_queue's doc comment) --
+            # this event is exactly that abandoned call's real, late
+            # result. Nothing is listening any more; discard it and let
+            # the NEXT event (either another abandoned call further back
+            # in the queue, or the currently live one) take its place in
+            # line.
             return
         if evt.IsError():
             self._loop.call_soon_threadsafe(_safe_set_exception, fut, BrowserError(evt.GetString()))

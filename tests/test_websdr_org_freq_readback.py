@@ -177,3 +177,148 @@ def test_readback_returns_none_when_page_has_no_freq_global():
     rather than raising."""
     driver = make_driver()
     assert asyncio.run(driver._read_page_freq_hz()) is None
+
+
+# ------------------------------------------------------------------
+# Regression: the corrective re-tune above was DEAD CODE before the
+# window.freq fix (the old #freqinput read always returned None, so
+# _verify_freq_applied never got far enough to compare anything). Making
+# the readback real for the first time also made that corrective re-tune
+# live for the first time -- and it turned out to unconditionally force
+# the page back to whatever WE last pushed on any mismatch, with no way
+# to tell "our own setfreq() write silently didn't land" apart from "the
+# user clicked a different frequency on the page in the meantime". Found
+# live: a forward push arms a 0.6s (FREQ_VERIFY_DELAY_S) verify window,
+# and a user's manual click landing inside that window got silently
+# reverted back to the rig's frequency, logging a misleading "WebSDR did
+# not apply requested frequency" warning that wasn't true -- the page HAD
+# applied a frequency, just not ours.
+#
+# The fix: tune_hz() now captures the page's freq BEFORE calling
+# setfreq() (pre_push_hz) and passes it through to the verify task. A
+# mismatch against expected_hz is only "our write didn't land" (and
+# therefore worth correcting) if the page is still sitting on its
+# pre-push value; a mismatch against some THIRD value means something
+# else moved it in the meantime, and the verify task now backs off
+# instead of fighting whoever/whatever that was.
+
+def test_user_click_during_verify_window_is_not_reverted():
+    """The core regression, reproduced directly: the page moved to a
+    value that is neither the requested frequency NOR its pre-push value
+    -- exactly what a user's manual click looks like -- and the verify
+    task must leave it alone."""
+    driver = make_driver()
+    driver._page.freq_khz = 14200.0  # the user's own click, already landed
+
+    async def run():
+        # expected_hz=14074000 with pre_push_hz=14000000: the page was
+        # supposedly at 14000 kHz right before our push, but now shows
+        # 14200 kHz -- neither value, so this must read as a user edit.
+        await driver._verify_freq_applied(14_074_000, pre_push_hz=14_000_000)
+
+    asyncio.run(run())
+    assert driver._page.setband_calls == []
+    assert driver._page.setfreq_calls == []
+    assert driver._last_tune_error is None
+    # The page's value (the user's click) must survive untouched.
+    assert driver._page.freq_khz == 14200.0
+
+
+def test_write_that_genuinely_did_not_land_is_still_corrected():
+    """Contrast case: the page is STILL on its pre-push value (our own
+    setfreq() call silently didn't take -- the original failure mode this
+    corrective re-tune exists for) -- the retune must still fire exactly
+    as before."""
+    driver = make_driver()
+    driver._page.freq_khz = 14074.0  # unchanged since before our (failed) push
+
+    async def run():
+        # expected_hz=14075000, and the page is still sitting on exactly
+        # what it was pre-push (14074000) -- our write never landed.
+        await driver._verify_freq_applied(14_075_000, pre_push_hz=14_074_000)
+
+    asyncio.run(run())
+    assert driver._page.setband_calls == [0]
+    assert driver._page.setfreq_calls == [14075.0]
+
+
+def test_unknown_pre_push_value_falls_back_to_correcting_on_mismatch():
+    """When pre_push_hz isn't available (None -- the default, e.g. an
+    older caller or a failed pre-push read), any mismatch is ambiguous,
+    so this preserves the original, more conservative self-heal
+    behaviour rather than silently going quiet on every real failure."""
+    driver = make_driver()
+    driver._page.freq_khz = 14200.0  # could be a stuck write OR a user click -- can't tell
+
+    async def run():
+        await driver._verify_freq_applied(14_074_000)  # pre_push_hz omitted -> None
+
+    asyncio.run(run())
+    assert driver._page.setband_calls == [0]
+    assert driver._page.setfreq_calls == [14074.0]
+
+
+def test_concurrent_close_during_the_pre_push_read_does_not_crash():
+    """Regression test for a real bug found by a code review pass: the
+    pre-push readback above introduced a new `await` between tune_hz()'s
+    entry `_attached` check and its first page-writing call (there was
+    none before -- every prior await was already downstream of that first
+    write). If close() runs during that new window -- e.g. the user hits
+    Disconnect, or SwitchWebsdr tears this driver down, while a forward
+    push is in flight -- self._page becomes None, and the very next
+    self._page.evaluate() call crashed with AttributeError instead of
+    tune_hz() cleanly returning False like every other "not attached
+    any more" path in this method already does."""
+    driver = make_driver()
+    reached_pre_push_read = asyncio.Event()
+    resume_pre_push_read = asyncio.Event()
+    real_evaluate = driver._page.evaluate
+
+    async def suspending_evaluate(js, *args):
+        # Only the pre-push readback (a bare window.freq check) --
+        # setfreq/setband calls must not suspend, or this wouldn't be
+        # exercising the specific window this test targets.
+        if "window.freq" in js and "setfreq" not in js:
+            reached_pre_push_read.set()
+            await resume_pre_push_read.wait()
+        return await real_evaluate(js, *args)
+
+    driver._page.evaluate = suspending_evaluate
+
+    async def do_tune():
+        return await driver.tune_hz(14_074_000, verify=True)
+
+    async def do_close_once_read_is_in_flight():
+        await reached_pre_push_read.wait()
+        await driver.close()
+        resume_pre_push_read.set()
+
+    async def run():
+        return await asyncio.gather(do_tune(), do_close_once_read_is_in_flight())
+
+    tune_result, _ = asyncio.run(run())
+    assert tune_result is False
+    assert driver._attached is False
+
+
+def test_tune_hz_captures_and_forwards_the_pre_push_value():
+    """End-to-end: tune_hz() itself must actually read and pass
+    pre_push_hz through _schedule_freq_verification(), not just support
+    it as a parameter nothing ever supplies."""
+    driver = make_driver()
+    driver._page.freq_khz = 14100.0  # the value in place before this tune
+
+    captured = {}
+    real_schedule = driver._schedule_freq_verification
+
+    def spy(expected_hz, pre_push_hz=None):
+        captured["expected_hz"] = expected_hz
+        captured["pre_push_hz"] = pre_push_hz
+        # Don't actually schedule the real background task -- this test
+        # only cares what tune_hz() hands off, not the verify task itself.
+
+    driver._schedule_freq_verification = spy
+
+    asyncio.run(driver.tune_hz(14_074_000, verify=True))
+
+    assert captured == {"expected_hz": 14_074_000, "pre_push_hz": 14_100_000}
