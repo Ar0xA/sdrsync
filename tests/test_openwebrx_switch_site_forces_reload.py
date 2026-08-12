@@ -7,6 +7,7 @@ to a different, same-family site B while A is still loaded and ready must
 still force a goto(self.url), or attach() silently keeps controlling A."""
 import asyncio
 
+from sdrsync.websdr.browser_shim import BrowserError, _FUNC_RE
 from sdrsync.websdr.openwebrx import OpenWebRXDriver
 
 
@@ -18,6 +19,13 @@ class StubPage:
         self.mouse = self
 
     async def evaluate(self, js, *args):
+        # WxPageAdapter.evaluate() wraps every call as `(js)(args)` -- a
+        # caller passing a bare expression (not a function source) gets a
+        # real JS TypeError there ("X is not a function"), a class of bug
+        # this stub previously didn't catch. Mirror that contract instead
+        # of accepting any string.
+        if not _FUNC_RE.match(js):
+            raise BrowserError(f"not a function source (would be a real JS TypeError): {js!r}")
         if "window.location.href" in js:
             return self.current_url
         # _READY_PREDICATE: whatever page is loaded is a ready OpenWebRX.

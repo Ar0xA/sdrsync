@@ -13,6 +13,7 @@ still live and ready). What differs pre-/post-fix is whether attach()
 tries that in-place handshake at all before deciding to navigate."""
 import asyncio
 
+from sdrsync.websdr.browser_shim import BrowserError, _FUNC_RE
 from sdrsync.websdr.ubersdr import UberSDRDriver
 
 
@@ -28,6 +29,13 @@ class MiniPage:
         self.log: list = []  # ordered: "hello" | ("goto", url)
 
     async def evaluate(self, js, *args):
+        # WxPageAdapter.evaluate() wraps every call as `(js)(args)` -- a
+        # caller passing a bare expression (not a function source) gets a
+        # real JS TypeError there. Mirror that contract instead of
+        # accepting any string, matching the openwebrx test's identical
+        # fix for the identical bug shape.
+        if not _FUNC_RE.match(js):
+            raise BrowserError(f"not a function source (would be a real JS TypeError): {js!r}")
         if "window.location.href" in js:
             return self.current_url
         if "send('hello')" in js:

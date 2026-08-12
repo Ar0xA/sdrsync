@@ -949,6 +949,26 @@ class SyncEngine:
             self._publish(websdr=WebSDRStatus(connected=False, last_error=_describe_webview_create_error(e)))
             return
 
+        if self._websdr_generation != my_generation:
+            # Something else -- a user Disconnect, another Start/Switch --
+            # bumped the generation again while create_page() was
+            # suspended above (this is exactly how a page-death recovery,
+            # _on_page_dead -> _handle_page_dead -> _start_websdr(user_
+            # initiated=False), can race a Disconnect that runs to
+            # completion in between: _handle_page_dead's own generation
+            # check only guards its SCHEDULING, not the scheduled
+            # coroutine's own later await). Without this, the Disconnect
+            # would be silently undone: engine state ends up
+            # websdr_active=True, pointed at a page the user already tore
+            # down. Drop this attempt and destroy the now-orphaned page
+            # instead of committing any state.
+            logger.info("Dropping stale WebSDR start for %s (superseded while creating the WebView)", site.name)
+            try:
+                await self._webview_host.destroy_page(page, self._loop)
+            except Exception:
+                logger.exception("Error destroying superseded WebView")
+            return
+
         self._page = page
         self.site = site
         self._driver = driver_cls(site.url, cw_offset_hz=self.settings.cw_offset_hz)
@@ -2205,6 +2225,13 @@ class SyncEngine:
             reverse_ptt = state.ptt if state.ptt is not None else last_ptt_before_awaits
             if (
                 websdr_status is not None
+                # self._driver can have gone None WHILE the get_status()
+                # await above was suspended (a concurrent _stop_websdr()/
+                # _stop_rig() completing mid-await) even though that call
+                # itself still returned a real, usable websdr_status --
+                # _reverse_sync_tick() dereferences self._driver
+                # immediately, with no guard of its own.
+                and self._driver is not None
                 and not reverse_ptt
                 and websdr_status.connected
                 and not self._reverse_sync_held

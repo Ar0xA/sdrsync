@@ -209,7 +209,7 @@ class OpenWebRXDriver:
             # (e.g. engine.py's _switch_websdr() reusing the same page for
             # a switch between two OpenWebRX stations). Gate on same_site()
             # first so a genuine site switch always navigates.
-            current_url = await page.evaluate("window.location.href")
+            current_url = await page.evaluate("() => window.location.href")
             already_ready = same_site(current_url, self.url) and await page.evaluate(_READY_PREDICATE)
             if not already_ready:
                 await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)

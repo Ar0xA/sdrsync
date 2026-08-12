@@ -131,3 +131,54 @@ def test_driver_going_none_mid_tick_during_mode_push_does_not_crash():
     # _tick() before the mode-push race, not a second time afterward.
     assert driver.get_status_calls == 1
     assert engine._driver is None
+
+
+def test_driver_going_none_during_the_second_get_status_call_skips_reverse_sync():
+    """The second, later get_status() call (the one right before the
+    reverse-sync gate) can itself complete successfully -- bound to the
+    OLD driver object at call time -- even though engine._driver has
+    already gone None by the time it returns (a concurrent
+    _stop_websdr()/_stop_rig() completing while this exact await was
+    suspended). _reverse_sync_tick() dereferences self._driver
+    immediately with no guard of its own, so the reverse-sync gate at the
+    call site must re-check self._driver is not None, not just
+    websdr_status is not None."""
+    settings = AppSettings(mute_on_tx=True)
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=_UnusedWebViewHost())
+    engine._rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    engine._rig_active = True
+
+    class DisconnectingStatusDriver(DisconnectingDriver):
+        async def set_muted(self, muted: bool) -> None:
+            self.mute_calls.append(muted)  # harmless -- does NOT touch engine._driver
+
+        async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
+            # False, not True: a successful forward push this same tick
+            # would stamp _forward_push_completed_at to "now" and keep the
+            # reverse-sync holdoff gate closed, masking the exact bug this
+            # test exists to catch.
+            return False
+
+        async def set_mode(self, hamlib_mode: str, passband_hz) -> bool:
+            return False
+
+        async def get_status(self) -> WebSDRStatus:
+            self.get_status_calls += 1
+            if self.get_status_calls == 2:
+                # The SECOND call this tick -- right before the reverse-
+                # sync gate. Simulate a concurrent stop completing while
+                # this exact await was in flight: it still returns a real,
+                # connected status (bound to this driver instance), but
+                # engine._driver is gone by the time control returns.
+                self.engine._driver = None
+                self.engine._websdr_active = False
+            return WebSDRStatus(connected=True)
+
+    driver = DisconnectingStatusDriver(engine)
+    engine._driver = driver
+    engine._websdr_active = True
+
+    asyncio.run(engine._tick())  # must not raise
+
+    assert driver.get_status_calls == 2
+    assert engine._driver is None

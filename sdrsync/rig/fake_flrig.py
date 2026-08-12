@@ -100,10 +100,21 @@ class _FlrigXMLRPCServer(SimpleXMLRPCServer):
     # second instance silently bind over an already-listening socket
     # (SO_REUSEADDR permits hijacking a live port there, unlike POSIX --
     # confirmed live during the v7 plan review) instead of raising
-    # OSError like asyncio.start_server does. Explicitly False so a
-    # port-in-use mistake surfaces as the same friendly error
-    # SyncEngine._start_rig already handles for the rigctld mock.
-    allow_reuse_address = False
+    # OSError like asyncio.start_server does. False on Windows for that
+    # reason.
+    #
+    # On POSIX, though, SO_REUSEADDR does NOT allow binding over an
+    # actively listening socket at all -- two processes still can't both
+    # listen on the same port. Its only real effect there is letting a
+    # fresh bind succeed while the PREVIOUS socket's already-closed
+    # connections are still lingering in TIME_WAIT (~60s) -- exactly the
+    # ordinary "Disconnect, then Connect again a few seconds later" case.
+    # Leaving this False unconditionally made that ordinary case fail
+    # with a misleading "[Errno 98] Address already in use ... Is a real
+    # flrig already running on that port?" (confirmed live, and the
+    # reason test_ensure_connected_recovers_after_mock_server_restart is
+    # flaky when run alongside other tests on Linux).
+    allow_reuse_address = sys.platform != "win32"
 
 
 def _get_xcvr(state: FakeFlrigState) -> str:

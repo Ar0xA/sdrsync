@@ -389,6 +389,81 @@ def test_stale_page_death_notification_is_ignored(monkeypatch):
     asyncio.run(run())
 
 
+class GatedWebViewHost(StubWebViewHost):
+    """Like StubWebViewHost, but create_page() can be made to block until
+    the test releases it -- lets a test suspend a coroutine PRECISELY
+    inside the create_page() await, the exact race window
+    _start_websdr()'s post-create_page() generation re-check guards
+    against (a Disconnect racing a page-death recovery)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._gate: "asyncio.Event | None" = None
+
+    def block_next_create(self) -> None:
+        self._gate = asyncio.Event()
+
+    def release(self) -> None:
+        if self._gate is not None:
+            self._gate.set()
+
+    async def create_page(self, loop, on_dead=None):
+        if self._gate is not None:
+            await self._gate.wait()
+            self._gate = None
+        return await super().create_page(loop, on_dead=on_dead)
+
+
+def test_page_death_recovery_racing_a_disconnect_does_not_resurrect_the_session(monkeypatch):
+    """_handle_page_dead()'s own generation check only guards its
+    SCHEDULING -- the _start_websdr() coroutine it fires off has its own
+    await (create_page()) that a real Disconnect can complete underneath.
+    Without _start_websdr() re-checking the generation itself after that
+    await, this silently undoes the Disconnect: engine state ends up
+    websdr_active=True, pointed at a page the user already tore down."""
+    monkeypatch.setitem(engine_module.DRIVERS, "websdr_org", StubDriver)
+    settings = AppSettings()
+    host = GatedWebViewHost()
+    engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=host)
+    engine._attach_supervisor = _noop_attach_supervisor
+    site = WebSDRSite(name="A", url="http://a.invalid/", driver_type="websdr_org")
+
+    async def run():
+        engine._loop = asyncio.get_running_loop()
+        await engine._start_websdr(site)  # first create_page() is ungated -- goes through immediately
+        assert engine._websdr_active is True
+        generation = engine._websdr_generation
+
+        host.block_next_create()
+        engine._on_page_dead(generation, "test-induced death")
+        await asyncio.sleep(0)  # on_dead's call_soon_threadsafe -> _handle_page_dead runs
+        await asyncio.sleep(0)  # the new _start_websdr(user_initiated=False) task starts,
+        #                         reaches create_page(), suspends on the gate
+
+        # A real Disconnect races in and completes FIRST, while the
+        # recovery attempt above is still suspended.
+        await engine._stop_websdr()
+        assert engine._websdr_active is False
+        assert engine.site is None
+
+        # Now let the stale recovery attempt finish.
+        host.release()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # The Disconnect must not have been silently undone.
+        assert engine._websdr_active is False
+        assert engine.site is None
+        assert engine._page is None
+        assert engine._driver is None
+        # The orphaned page the stale recovery created must have been
+        # destroyed, not leaked -- 1 for the real Disconnect's page, 1 for
+        # the stale recovery's own (immediately-superseded) page.
+        assert len(host.created) == 2
+        assert len(host.destroyed) == 2
+
+    asyncio.run(run())
+
 
 # ----------------------------------------------------------------------
 # v14 attach-supervisor redesign (Item 5) and idle disconnect (Item 7).

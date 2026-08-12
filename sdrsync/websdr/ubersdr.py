@@ -460,7 +460,7 @@ class UberSDRDriver:
         # answer hello too. Gate on same_site() first so a genuine switch
         # always navigates instead of silently continuing to control the old
         # receiver.
-        current_url = await page.evaluate("window.location.href")
+        current_url = await page.evaluate("() => window.location.href")
         if not (same_site(current_url, self.url) and await self._handshake(RETRY_HANDSHAKE_MS)):
             try:
                 await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
