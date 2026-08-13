@@ -358,8 +358,11 @@ GPL-3.0-only — see [LICENSE](LICENSE).
   ```bash
   python -m sdrsync.main
   ```
-  (WebKitGTK is the embedded browser.) Live-verified inside WSL2/WSLg
-  only — not yet run on a bare-metal Linux desktop or a non-GNOME/non-
-  XWayland compositor.
+  (WebKitGTK is the embedded browser.) Live-verified inside WSL2/WSLg and,
+  as of v2.2.7, on a bare-metal Linux desktop (Linux Mint/Cinnamon, X11) —
+  the latter needed a fix for WebSDR audio staying silent there (WebKitGTK
+  reports a non-standard `AudioContext` state, `"interrupted"`, that the
+  WSL2-only-tested audio-unlock code didn't handle; see `project_brief.md`).
+  Still not run on a non-GNOME/non-Cinnamon/non-XWayland compositor.
 - **macOS**: best-effort code path only, **never run on an actual Mac**
   — no Mac has been available during development. Treat as unverified.

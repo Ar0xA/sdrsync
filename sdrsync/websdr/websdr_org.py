@@ -266,9 +266,21 @@ class WebsdrOrgDriver:
         await asyncio.sleep(AUDIO_GATE_CHECK_DELAY_S)
         try:
             state = await self._page.evaluate("() => (document.ct ? document.ct.state : null)")
-            if state == "suspended":
+            # "suspended" is the only state the Web Audio spec defines besides
+            # "running"/"closed", but WebKitGTK (confirmed live on a native
+            # Linux desktop, non-WSL2 -- NOT the WSL2/WSLg environment this
+            # driver was originally verified against) uses its own extra
+            # state, "interrupted", for a context that hasn't been unlocked
+            # yet. Only checking "suspended" left resume() never called at
+            # all on that platform, so the WebSDR's audio stayed silent
+            # forever with no error anywhere -- confirmed root cause via a
+            # standalone wx.html2.WebView + AudioContext repro (real click
+            # via wx.UIActionSimulator, same mechanism as mouse.click()
+            # above, does transition interrupted -> running once resume()
+            # is actually called).
+            if state in ("suspended", "interrupted"):
                 await self._page.evaluate("() => document.ct && document.ct.resume()")
-                logger.warning("Audio context was suspended; requested resume()")
+                logger.warning("Audio context was %s; requested resume()", state)
         except PlaywrightError as e:
             logger.debug("Could not inspect/resume audio context: %s", e)
 

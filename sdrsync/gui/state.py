@@ -15,6 +15,11 @@ from typing import Optional
 class AppState:
     rig_connected: bool = False
     sdr_connected: bool = False
+    # Mirrors WebSDRStatus.audio_active (sdrsync/websdr/base.py) -- a
+    # best-effort, driver-specific proxy (socket/AudioContext state, not
+    # actual sample amplitude) for "the WebSDR's own audio is flowing",
+    # None when unknown (driver didn't report / not connected yet).
+    sdr_audio_active: Optional[bool] = None
     # Not in spec §10's literal field list -- a real engineering
     # necessity found during phase 6 verification: True from the moment
     # a WebSDR connect/switch is requested, before the page confirms
@@ -44,3 +49,19 @@ class AppState:
     sync_tx_vfo: bool = True
     mock_rig: bool = False
     site: str = ""
+
+
+def ptt_tag_state(state: AppState) -> str:
+    """Shared by strip_panel/compact_frame's _PttTag.set_state() calls.
+
+    "receive" requires more than the rig being connected: the WebSDR page
+    itself must be connected too, and -- when the driver reports it --
+    its audio must actually be active. Without this, RECEIVE showed as
+    soon as the rig connected even with no WebSDR site loaded at all."""
+    if not state.rig_connected:
+        return "offline"
+    if state.ptt:
+        return "transmit"
+    if state.sdr_connected and state.sdr_audio_active is not False:
+        return "receive"
+    return "idle"

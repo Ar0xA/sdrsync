@@ -10,7 +10,7 @@ import wx
 from . import theme
 from .fonts import label_font, value_font
 from .format import fmt_delta, fmt_hz
-from .state import AppState
+from .state import AppState, ptt_tag_state
 from .widgets import CheckBox, FlatButton, ToggleButton, _OwnerDrawnMixin
 
 
@@ -120,7 +120,7 @@ class _PttTag(_OwnerDrawnMixin, wx.Control):
         wx.Control.__init__(self, parent, style=wx.BORDER_NONE)
         self._init_owner_drawn()
         self.SetFont(label_font())
-        self._ptt_state = "offline"  # "offline" | "receive" | "transmit"
+        self._ptt_state = "offline"  # "offline" | "idle" | "receive" | "transmit"
         self._blink_on = True
         self._timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_blink, self._timer)
@@ -147,7 +147,7 @@ class _PttTag(_OwnerDrawnMixin, wx.Control):
         self.Refresh()
 
     def _label(self) -> str:
-        return {"offline": "OFFLINE", "receive": "RECEIVE", "transmit": "TRANSMIT"}[self._ptt_state]
+        return {"offline": "OFFLINE", "idle": "IDLE", "receive": "RECEIVE", "transmit": "TRANSMIT"}[self._ptt_state]
 
     def _colour(self) -> wx.Colour:
         # User-requested semantic colouring (a deliberate deviation from
@@ -405,12 +405,7 @@ class StripPanel(wx.Panel):
 
         self.mode_group.set_value(state.mode if state.rig_connected else "-", theme.TEXT)
 
-        if not state.rig_connected:
-            self.ptt_tag.set_state("offline")
-        elif state.ptt:
-            self.ptt_tag.set_state("transmit")
-        else:
-            self.ptt_tag.set_state("receive")
+        self.ptt_tag.set_state(ptt_tag_state(state))
 
         self.pause_btn.SetValue(state.paused)
         if state.paused:

@@ -886,6 +886,7 @@ class MainFrame(wx.Frame):
             self._active_websdr_site = None
             self._state.rig_connected = False
             self._state.sdr_connected = False
+            self._state.sdr_audio_active = None
             self._state.sdr_active = False
             self.transceiver_panel.set_connection_state(False)
             self.transceiver_panel.mock_panel.set_enabled(False)
@@ -923,6 +924,7 @@ class MainFrame(wx.Frame):
                 self._strip_connect_busy_label = None
                 self._active_websdr_site = None
                 self._state.sdr_connected = False
+                self._state.sdr_audio_active = None
                 self._state.sdr_hz = 0
                 self._state.site = ""
             else:
@@ -936,6 +938,7 @@ class MainFrame(wx.Frame):
             self._strip_connect_busy_label = None
             ws = snap.websdr
             self._state.sdr_connected = bool(ws and ws.connected)
+            self._state.sdr_audio_active = ws.audio_active if ws else None
             # Reconcile from the engine's own reported site identity
             # whenever the GUI's locally-tracked one is missing or stale.
             # Covers the idle auto-resume path specifically: SyncEngine.

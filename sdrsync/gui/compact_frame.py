@@ -14,7 +14,7 @@ from sdrsync.config import AppSettings
 from . import theme
 from .fonts import big_freq_font, value_font_at
 from .format import fmt_hz_split
-from .state import AppState
+from .state import AppState, ptt_tag_state
 from .strip_panel import _Dot, _LabelValue, _PttTag, _VDivider
 from .widgets import CheckBox, FlatButton, ToggleButton
 
@@ -149,13 +149,11 @@ class CompactFrame(wx.Frame):
     def refresh(self, state: AppState) -> None:
         if not state.rig_connected:
             self.rig_dot.set_mode("disconnected")
-            self.ptt_tag.set_state("offline")
         elif state.paused:
             self.rig_dot.set_mode("paused")
         else:
             self.rig_dot.set_mode("syncing")
-        if state.rig_connected:
-            self.ptt_tag.set_state("transmit" if state.ptt else "receive")
+        self.ptt_tag.set_state(ptt_tag_state(state))
         self.freq.set_hz(state.rx_hz if state.rig_connected else None)
         self.mode_group.set_value(state.mode if state.rig_connected else "-", theme.TEXT)
         self.pause_btn.SetValue(state.paused)
