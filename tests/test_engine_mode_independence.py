@@ -149,6 +149,55 @@ def test_unsupported_mode_does_not_block_frequency_sync():
     assert stub_driver.tuned == [14074000]
 
 
+def test_sync_passband_from_rig_default_on_passes_the_rigs_passband_through():
+    engine = make_engine()
+    assert engine.settings.sync_passband_from_rig is True
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=1800, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    asyncio.run(engine._tick())
+
+    assert stub_driver.modes == [("USB", 1800)]
+
+
+def test_sync_passband_from_rig_off_substitutes_none():
+    """AppSettings.sync_passband_from_rig: a single, driver-agnostic gate
+    -- off means every driver falls back to its own default filter for
+    the mode, regardless of what the rig's real passband_hz is."""
+    engine = make_engine()
+    engine.settings.sync_passband_from_rig = False
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=1800, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    asyncio.run(engine._tick())
+
+    assert stub_driver.modes == [("USB", None)]
+
+
+def test_toggling_sync_passband_from_rig_mid_session_triggers_a_repush():
+    """Flipping the setting must itself count as a mode-key change and be
+    re-pushed on the next tick, the same as any other passband change --
+    not silently ignored until the mode or filter width happens to move
+    on its own."""
+    engine = make_engine()
+    stub_rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=1800, ptt=False))
+    stub_driver = StubDriver()
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+
+    asyncio.run(engine._tick())
+    assert stub_driver.modes == [("USB", 1800)]
+
+    engine.settings.sync_passband_from_rig = False
+    engine._pending_freq_since -= 1.0
+    _clear_websdr_write_gap(engine)
+    _clear_forward_backoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_driver.modes == [("USB", 1800), ("USB", None)]
+
+
 class FailingDriver(StubDriver):
     """Returns False (no-op / failed) from tune_hz and set_mode -- e.g. what
     a real driver does while not yet attached, or after a failed page call."""

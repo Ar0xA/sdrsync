@@ -69,6 +69,10 @@ class StubWebsdrPage:
             self.band = args[0]
             self.setband_calls.append(args[0])
             return None
+        if "window.setmf" in js:
+            a = args[0]
+            self.lo, self.hi = float(a["lo"]), float(a["hi"])
+            return None
         if "window.set_mode" in js:
             if str(args[0]).upper().startswith("CW"):
                 self.lo, self.hi = CW_LO_KHZ, CW_HI_KHZ

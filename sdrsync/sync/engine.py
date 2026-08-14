@@ -2300,7 +2300,22 @@ class SyncEngine:
                 # untested coupling between two distant pieces of code.
                 forward_superseded = False
 
-                mode_key = (state.mode, state.passband_hz) if state.mode is not None else None
+                # AppSettings.sync_passband_from_rig: a single, driver-
+                # agnostic gate for whether the rig's own real filter
+                # width drives the WebSDR's bandpass filter at all --
+                # substituting None here (rather than gating inside each
+                # driver separately) makes every driver's own passband
+                # handling fall back uniformly to its default filter for
+                # the mode, since every driver already treats a None/
+                # falsy passband_hz as "say nothing about the filter"
+                # (see e.g. websdr_org.py's/ubersdr.py's own
+                # passband_edges() functions). Folded into mode_key too,
+                # not just the call below, so flipping this setting
+                # mid-session is itself detected as a genuine mode-key
+                # change and re-pushed on the next tick, the same as any
+                # other passband change.
+                effective_passband_hz = state.passband_hz if self.settings.sync_passband_from_rig else None
+                mode_key = (state.mode, effective_passband_hz) if state.mode is not None else None
                 # Suppress the forward push while a reverse-sync mode
                 # ladder is actively retrying -- the rig still reports its
                 # OLD mode during that window, and pushing it back onto
@@ -2331,7 +2346,7 @@ class SyncEngine:
                         # itself be the suspension point) -- so this is a
                         # genuine no-op, not just "not attached yet".
                         if self._driver is not None:
-                            applied = await self._driver.set_mode(state.mode, state.passband_hz)
+                            applied = await self._driver.set_mode(state.mode, effective_passband_hz)
                         else:
                             applied = False
                         # Stamped unconditionally, before the generation

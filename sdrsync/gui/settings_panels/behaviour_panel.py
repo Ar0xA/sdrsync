@@ -158,6 +158,17 @@ class BehaviourPanel(wx.Panel):
         self.force_ssb_to_data_mode_check.Bind(wx.EVT_CHECKBOX, self._on_force_ssb_to_data_mode_toggled)
         checks.Add(self.force_ssb_to_data_mode_check, 0)
 
+        self.sync_passband_from_rig_check = CheckBox(self, "Sync bandpass filter from rig")
+        self.sync_passband_from_rig_check.SetValue(settings.sync_passband_from_rig)
+        self.sync_passband_from_rig_check.SetToolTip(
+            "Forward sync (rig -> WebSDR): when on, the rig's own real filter width drives "
+            "the WebSDR's bandpass filter too (not just its mode) on WebSDRs that support "
+            "it. Off leaves each WebSDR's own default filter for the mode alone, "
+            "regardless of what the rig's filter is set to."
+        )
+        self.sync_passband_from_rig_check.Bind(wx.EVT_CHECKBOX, self._on_sync_passband_from_rig_toggled)
+        checks.Add(self.sync_passband_from_rig_check, 0)
+
         outer.Add(checks, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad_side)
         outer.AddSpacer(pad_bottom)
         self.SetSizer(outer)
@@ -192,6 +203,10 @@ class BehaviourPanel(wx.Panel):
 
     def _on_force_ssb_to_data_mode_toggled(self, _evt: wx.CommandEvent) -> None:
         self.settings.force_ssb_to_data_mode = self.force_ssb_to_data_mode_check.GetValue()
+        self.settings.save()
+
+    def _on_sync_passband_from_rig_toggled(self, _evt: wx.CommandEvent) -> None:
+        self.settings.sync_passband_from_rig = self.sync_passband_from_rig_check.GetValue()
         self.settings.save()
 
     def _on_sync_direction_changed(self, _evt: wx.CommandEvent) -> None:

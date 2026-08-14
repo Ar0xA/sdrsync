@@ -10,19 +10,33 @@ control-API break is fail-loud (WebSDRIncompatibleError) rather than a
 silent protocol mismatch.
 
 Confirmed global functions on the page:
-    setfreq(khz: float)     -- set receive frequency within the current band
-    set_mode(mode: str)     -- "USB"/"USBN"/"LSB"/"LSBN"/"AM"/"AMN"/"FM"/"CW"/"AMSYNC"
-    setband(idx: int)       -- switch which (possibly non-overlapping) band is active
-    soundapplet.mute(1|0)   -- true mute/unmute of the WebSocket audio stream
-    freq (global var)       -- the current carrier/BFO frequency in kHz, as
-                               last stored by setfreq(); this is what the page
-                               sends upstream ("f=" + freq.toFixed(3)), so it
-                               carries full 1 Hz resolution. Note the VISIBLE
-                               frequency box (document.freqform.frequency) is
-                               only nomfreq.toFixed(2), i.e. rounded to 10 Hz --
-                               a sub-10 Hz retune is real but invisible there.
-                               There is no #freqinput element on any websdr.org
-                               build (verified live against five instances).
+    setfreq(khz: float)      -- set receive frequency within the current band
+    set_mode(mode: str)      -- "USB"/"USBN"/"LSB"/"LSBN"/"AM"/"AMN"/"FM"/"CW"/"AMSYNC";
+                                each is a fixed preset that internally calls setmf()
+                                below with hardcoded filter edges.
+    setmf(mode, lo, hi)      -- "set mode and filter": the real underlying primitive
+                                set_mode() itself dispatches to, but callable directly
+                                with ANY lo/hi (in kHz, relative to the dial/BFO
+                                frequency) -- confirmed live against websdr-base.js:
+                                setmf() -> updbw() (clamps lo/hi into the current
+                                band's real max linear bandwidth) -> setfreq() ->
+                                send_soundsettings_to_server() -> soundapplet.setparam
+                                ("...&lo="+lo+"&hi="+hi+"&mode="+...), i.e. the exact
+                                edges reach the audio backend, not just a UI redraw.
+                                Used here (via passband_edges() below) so the rig's
+                                own real passband_hz drives an exact filter width
+                                instead of set_mode()'s binary narrow/wide guess.
+    setband(idx: int)        -- switch which (possibly non-overlapping) band is active
+    soundapplet.mute(1|0)    -- true mute/unmute of the WebSocket audio stream
+    freq (global var)        -- the current carrier/BFO frequency in kHz, as
+                                last stored by setfreq(); this is what the page
+                                sends upstream ("f=" + freq.toFixed(3)), so it
+                                carries full 1 Hz resolution. Note the VISIBLE
+                                frequency box (document.freqform.frequency) is
+                                only nomfreq.toFixed(2), i.e. rounded to 10 Hz --
+                                a sub-10 Hz retune is real but invisible there.
+                                There is no #freqinput element on any websdr.org
+                                build (verified live against five instances).
 
 The Twente instance itself has a single band (nbands=1) spanning ~0-29 MHz,
 so band switching is a no-op there in practice, but the logic is generic so
@@ -50,41 +64,106 @@ LOAD_TIMEOUT_MS = 15000
 FREQ_VERIFY_DELAY_S = 0.6
 FREQ_VERIFY_TOLERANCE_HZ = 10
 AUDIO_GATE_CHECK_DELAY_S = 1.0
-NARROW_USB_LSB_THRESHOLD_HZ = 2000
-NARROW_AM_THRESHOLD_HZ = 6000
 
-# hamlib mode name -> (webSDR base mode, supports an "N" narrow variant)
-_MODE_MAP: dict[str, tuple[str, bool]] = {
-    "USB": ("USB", True),
-    "PKTUSB": ("USB", True),
-    "DATA-U": ("USB", True),
-    "LSB": ("LSB", True),
-    "PKTLSB": ("LSB", True),
-    "DATA-L": ("LSB", True),
-    "CW": ("CW", False),
-    "CWR": ("CW", False),
-    "CW-U": ("CW", False),
-    "CW-L": ("CW", False),
-    "AM": ("AM", True),
-    "SAM": ("AMSYNC", False),
-    "FM": ("FM", False),
-    "WFM": ("FM", False),
+# hamlib mode name -> webSDR base mode string. Many-to-one (e.g. USB/
+# PKTUSB/DATA-U all collapse to "USB") -- see _REVERSE_MODE_MAP below for
+# the deliberately-chosen reverse direction.
+_MODE_MAP: dict[str, str] = {
+    "USB": "USB",
+    "PKTUSB": "USB",
+    "DATA-U": "USB",
+    "LSB": "LSB",
+    "PKTLSB": "LSB",
+    "DATA-L": "LSB",
+    "CW": "CW",
+    "CWR": "CW",
+    "CW-U": "CW",
+    "CW-L": "CW",
+    "AM": "AM",
+    "SAM": "AMSYNC",
+    "FM": "FM",
+    "WFM": "FM",
 }
 
 
-def map_hamlib_mode(hamlib_mode: str, passband_hz: Optional[int]) -> Optional[str]:
-    """Pure mapping from a hamlib mode name (+ optional passband) to a WebSDR
-    mode string. Returns None if there's no known mapping (caller should skip
-    mode sync and log, not raise)."""
-    mapped = _MODE_MAP.get(hamlib_mode.upper())
-    if mapped is None:
+def map_hamlib_mode(hamlib_mode: str) -> Optional[str]:
+    """Pure mapping from a hamlib mode name to a WebSDR base mode string.
+    Returns None if there's no known mapping (caller should skip mode
+    sync and log, not raise). Filter width is a separate concern now --
+    see passband_edges() below -- so this no longer takes passband_hz."""
+    return _MODE_MAP.get(hamlib_mode.upper())
+
+
+# Reference edges (Hz, relative to the dial/BFO frequency) taken directly
+# from the live site's own set_mode() JS preset table (see module
+# docstring) -- confirmed against websdr-base.js's real set_mode():
+#   USB     setmf("usb",     0.3,  2.7)
+#   LSB     setmf("lsb",    -2.7, -0.3)
+#   AM      setmf("am",     -4.5,  4.5)
+#   AMSYNC  setmf("amsync", -4.5,  4.5)
+#   CW      setmf("cw",    -0.95, -0.55)
+#   FM      setmf("fm",       -5,    5)
+# Used both as the "which edge stays fixed while width varies" convention
+# below and as passband_edges()'s per-mode existence check.
+_DEFAULT_EDGES_HZ: dict[str, tuple[float, float]] = {
+    "USB": (300, 2700),
+    "LSB": (-2700, -300),
+    "AM": (-4500, 4500),
+    "AMSYNC": (-4500, 4500),
+    "CW": (-950, -550),
+    "FM": (-5000, 5000),
+}
+
+
+def passband_edges(base_mode: str, width_hz: Optional[int]) -> Optional[tuple[float, float]]:
+    """The window.setmf() filter edges to ask for, in Hz relative to the
+    dial/BFO frequency (setmf() itself wants kHz -- conversion happens
+    only at the page.evaluate() call site in _push_mode_to_page(), same
+    split as tune_hz()'s own Hz-internal/kHz-at-the-JS-boundary
+    convention).
+
+    None means "say nothing about the filter", which falls back to the
+    site's own set_mode() preset for that base mode -- the right answer
+    when the rig did not report a passband. No client-side ceiling clamp
+    (unlike a hard limit): the site's own updbw() already clamps lo/hi
+    into the current band's real max linear bandwidth server-side, so
+    sending an oversized width and letting the site do the clamping is
+    the honest reading of "as wide as I am" (mirrors ubersdr.py's
+    identically-named function's own reasoning).
+
+    Mirrors ubersdr.py's passband_edges(), adapted to this site's own
+    fixed-edge conventions (see _DEFAULT_EDGES_HZ above) instead of a
+    per-mode min/max/sideband table:
+
+        USB   the low edge stays fixed where the site's own USB preset
+              puts it (300 Hz, clear of the carrier) and the width is
+              added above it.
+        LSB   the mirror of that (high edge fixed at -300 Hz).
+        AM/AMSYNC/FM   symmetric about the dial, like the site's own
+              presets for these modes -- half the width each side.
+        CW    symmetric about -750 Hz, NOT the dial -- this is the
+              site's own hardcoded CW filter centre (the midpoint of its
+              real -950/-550 Hz preset), matching a standard ~750 Hz CW
+              sidetone pitch. (This is also the full explanation behind
+              an earlier, separate finding this session: a websdr.org
+              user's CW offset "0 line" reading 750 Hz wasn't a bug --
+              it's this site's own built-in filter centre, unrelated to
+              anything sdrsync itself adds.)
+    """
+    defaults = _DEFAULT_EDGES_HZ.get(base_mode)
+    if defaults is None or not width_hz or width_hz <= 0:
         return None
-    base_mode, supports_narrow = mapped
-    if supports_narrow and passband_hz:
-        threshold = NARROW_AM_THRESHOLD_HZ if base_mode == "AM" else NARROW_USB_LSB_THRESHOLD_HZ
-        if passband_hz < threshold:
-            return base_mode + "N"
-    return base_mode
+    if base_mode == "USB":
+        low = defaults[0]
+        return low, low + width_hz
+    if base_mode == "LSB":
+        high = defaults[1]
+        return high - width_hz, high
+    if base_mode == "CW":
+        center = (defaults[0] + defaults[1]) / 2
+        return center - width_hz / 2, center + width_hz / 2
+    # AM, AMSYNC, FM -- symmetric about the dial, like the site's own presets.
+    return -width_hz / 2, width_hz / 2
 
 
 # WebSDR base mode string (post-N-stripping, the exact set get_status()
@@ -139,12 +218,15 @@ class WebsdrOrgDriver:
         self._bands: list[tuple[float, float]] = []  # (low_hz, high_hz) per band index
         self._current_band: Optional[int] = None
         self._current_mode: Optional[str] = None
-        # Full web-mode string as last pushed to window.set_mode(), narrow
-        # ("N") suffix included -- unlike self._current_mode (which strips
-        # it for the CW-offset check), this is what setband()'s silent
-        # mode-flip fixup below needs to restore the EXACT mode (including
-        # filter width), not just the base name.
-        self._current_web_mode: Optional[str] = None
+        # (base_mode, edges) as last actually pushed via
+        # _push_mode_to_page() -- edges is the exact (lo_hz, hi_hz) pair
+        # from passband_edges() if one was sent, or None if the page's
+        # own set_mode() preset was used instead. This is what
+        # setband()'s silent mode/filter-reset fixup below needs to
+        # replay VERBATIM (not just the mode's own site default) so a
+        # band crossing can't quietly widen/narrow the filter the rig
+        # actually asked for.
+        self._current_mode_call: Optional[tuple[str, Optional[tuple[float, float]]]] = None
         # True only once attach() has fully succeeded (band table loaded,
         # audio gate handled). tune_hz/set_mode/get_status all
         # gate on this -- NOT on `self._page is None` -- because attach()
@@ -196,7 +278,7 @@ class WebsdrOrgDriver:
         # recovering from an outage, silently tuning the wrong band.
         self._current_band = None
         self._current_mode = None
-        self._current_web_mode = None
+        self._current_mode_call = None
 
         try:
             await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
@@ -304,6 +386,26 @@ class WebsdrOrgDriver:
                 return idx
         return None
 
+    async def _push_mode_to_page(self, base_mode: str, edges: Optional[tuple[float, float]]) -> None:
+        """Pushes a mode (+ exact filter edges, if known) to the page, and
+        remembers exactly what was sent in self._current_mode_call so
+        setband()'s silent mode/filter reset (see tune_hz()'s and
+        _verify_freq_applied()'s own comments on this) can replay the
+        IDENTICAL call afterwards, not just the mode's own site default.
+        window.setmf(mode, lo, hi) sets mode and filter together in one
+        call; window.set_mode(mode) (the site's own preset, no custom
+        filter) is used only when edges is None (no passband info from
+        the rig). Lets a PlaywrightError propagate -- both call sites
+        already wrap this in their own try/except."""
+        if edges is not None:
+            lo_khz, hi_khz = edges[0] / 1000.0, edges[1] / 1000.0
+            await self._page.evaluate(
+                "(a) => window.setmf(a.m, a.lo, a.hi)", {"m": base_mode, "lo": lo_khz, "hi": hi_khz},
+            )
+        else:
+            await self._page.evaluate("(m) => window.set_mode(m)", base_mode)
+        self._current_mode_call = (base_mode, edges)
+
     async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         """Returns True only if the frequency was actually pushed to the
         page. The caller (SyncEngine) must only update its "last sent"
@@ -369,8 +471,8 @@ class WebsdrOrgDriver:
                 # pushed so a band crossing can't leave the page on the
                 # wrong sideband with no error and no verification catching
                 # it (window.freq is unaffected by the flip).
-                if self._current_web_mode is not None:
-                    await self._page.evaluate("(m) => window.set_mode(m)", self._current_web_mode)
+                if self._current_mode_call is not None:
+                    await self._push_mode_to_page(*self._current_mode_call)
             await self._page.evaluate("(khz) => window.setfreq(khz)", effective_hz / 1000.0)
             self._last_tune_error = None
         except PlaywrightError as e:
@@ -475,8 +577,8 @@ class WebsdrOrgDriver:
             self._current_band = band_idx
             # Same silent USB<->LSB flip risk as tune_hz()'s setband() call --
             # see that call site's comment.
-            if self._current_web_mode is not None:
-                await self._page.evaluate("(m) => window.set_mode(m)", self._current_web_mode)
+            if self._current_mode_call is not None:
+                await self._push_mode_to_page(*self._current_mode_call)
             await self._page.evaluate("(khz) => window.setfreq(khz)", expected_hz / 1000.0)
 
             await asyncio.sleep(FREQ_VERIFY_DELAY_S)
@@ -494,11 +596,17 @@ class WebsdrOrgDriver:
     async def set_mode(self, hamlib_mode: str, passband_hz: Optional[int]) -> bool:
         """Returns True only if the mode was actually pushed to the page --
         see tune_hz()'s docstring for why the caller must gate its "last
-        sent" bookkeeping on this rather than assuming the call worked."""
+        sent" bookkeeping on this rather than assuming the call worked.
+
+        passband_hz drives an EXACT filter width via window.setmf() (see
+        passband_edges()) rather than picking between the site's two
+        fixed narrow/normal presets -- so the rig's real filter width is
+        what actually gets set, not a coarse guess at which side of a
+        threshold it falls on."""
         if not self._attached:
             return False
-        web_mode = map_hamlib_mode(hamlib_mode, passband_hz)
-        if web_mode is None:
+        base_mode = map_hamlib_mode(hamlib_mode)
+        if base_mode is None:
             self._last_mode_error = (
                 f"hamlib mode {hamlib_mode!r} has no WebSDR equivalent; frequency sync continues"
             )
@@ -509,16 +617,15 @@ class WebsdrOrgDriver:
                 logger.debug(self._last_mode_error)
             return False
 
+        edges = passband_edges(base_mode, passband_hz)
         try:
-            await self._page.evaluate("(m) => window.set_mode(m)", web_mode)
-            self._current_web_mode = web_mode
-            # base mode without the "N" (narrow) suffix, used e.g. to detect CW for cw_offset_hz
-            self._current_mode = web_mode[:-1] if web_mode.endswith("N") else web_mode
+            await self._push_mode_to_page(base_mode, edges)
+            self._current_mode = base_mode
             self._last_mode_error = None
             self._last_unmapped_mode = None
             return True
         except PlaywrightError as e:
-            self._last_mode_error = f"set_mode() failed: {e}"
+            self._last_mode_error = f"set_mode()/setmf() failed: {e}"
             logger.warning(self._last_mode_error)
             return False
 

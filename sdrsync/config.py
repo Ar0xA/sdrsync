@@ -138,6 +138,18 @@ class AppSettings:
     # _reverse_sync_data_mode_for() for the actual per-backend mode
     # strings and their sourcing.
     force_ssb_to_data_mode: bool = False
+    # Forward sync (rig -> WebSDR): whether the rig's own real filter
+    # width (state.passband_hz, from CAT) drives the WebSDR's own
+    # bandpass filter at all -- a single, driver-agnostic gate (see
+    # sync/engine.py's _tick(), which substitutes None for
+    # state.passband_hz before calling driver.set_mode() when this is
+    # off) so every driver's own passband handling -- UberSDR's exact
+    # setmf-equivalent filter, websdr.org's setmf() filter -- falls back
+    # uniformly to that driver's own default filter for the mode,
+    # without each driver needing its own separate on/off setting.
+    # Default on: matches the behavior already shipped unconditionally
+    # for UberSDR before this setting existed.
+    sync_passband_from_rig: bool = True
     mute_on_tx: bool = True
     # GUI rewrite (spec §5.3): purely a display-gate today -- the strip's
     # TX VFO readout mirrors RX VFO regardless (no real split/second-VFO
@@ -289,6 +301,7 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "last_site_driver_type": str,
     "cw_offset_hz": int,
     "force_ssb_to_data_mode": bool,
+    "sync_passband_from_rig": bool,
     "mute_on_tx": bool,
     "sync_tx_vfo": bool,
     "hide_receiver_when_undocked": bool,
