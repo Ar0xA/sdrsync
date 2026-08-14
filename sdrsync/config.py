@@ -121,6 +121,21 @@ class AppSettings:
     # upstream disappears locally too, since this isn't user-owned data.
     curated_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
+    # Transceiver settings tab: the rig's OWN CW pitch/sidetone setting
+    # (e.g. from its menu), entered manually -- nothing queries the rig
+    # for this automatically (rigctld's hamlib CWPITCH level is real and
+    # readable, but the user explicitly wants a plain editable field, not
+    # an auto-query). Added to cw_offset_hz (see sync/engine.py's
+    # _tick(), which sums the two into one value pushed to
+    # driver.cw_offset_hz) rather than kept as a second, separately-
+    # threaded offset -- reuses all of cw_offset_hz's existing live-sync/
+    # reverse-sync-reseed handling for free. Most rigs default this to a
+    # few hundred Hz (a common one, live-confirmed by the user's own
+    # rig: 750 Hz) -- entering it here lets the WebSDR CW offset field
+    # stay at 0 for "no additional correction needed" instead of the
+    # operator having to fold the rig's own pitch into that number by
+    # hand.
+    transceiver_cw_pitch_hz: int = 0
     # Reverse sync (WebSDR -> rig): when the WebSDR page is in USB/LSB,
     # send the rig's DATA-mode variant instead of plain USB/LSB (e.g.
     # PKTUSB/PKTLSB on rigctld, DATA-U/DATA-L on flrig) -- for operators
@@ -280,6 +295,7 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "last_site_url": str,
     "last_site_driver_type": str,
     "cw_offset_hz": int,
+    "transceiver_cw_pitch_hz": int,
     "force_ssb_to_data_mode": bool,
     "mute_on_tx": bool,
     "sync_tx_vfo": bool,

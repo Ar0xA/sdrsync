@@ -148,6 +148,21 @@ class TransceiverPanel(wx.Panel):
 
         outer.Add(row1, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 0)
 
+        row1b = wx.BoxSizer(wx.HORIZONTAL)
+        self.cw_pitch_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.transceiver_cw_pitch_hz)
+        self.cw_pitch_ctrl.SetFont(value_font())
+        self.cw_pitch_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
+        self.cw_pitch_ctrl.SetToolTip(
+            "The rig's OWN CW pitch/sidetone setting (from its menu), entered here "
+            "manually -- sdrsync never queries the rig for this. Added to the "
+            "Behaviour tab's WebSDR CW offset, so this field can hold the rig's "
+            "usual pitch (often a few hundred Hz) while that one stays at 0 for "
+            "\"no additional correction needed\"."
+        )
+        self.cw_pitch_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_pitch_changed)
+        row1b.Add(field("Transceiver CW pitch (Hz)", self.cw_pitch_ctrl), 0, wx.EXPAND)
+        outer.Add(row1b, 0, wx.TOP, self.FromDIP(14))
+
         row2 = wx.BoxSizer(wx.HORIZONTAL)
         self.mock_rig_check = CheckBox(self, "Use mock rig (embedded, for testing)")
         self.mock_rig_check.SetValue(settings.use_mock_rig)
@@ -283,6 +298,10 @@ class TransceiverPanel(wx.Panel):
             self.settings.flrig_host, self.settings.flrig_port = host, port
         else:
             self.settings.rigctld_host, self.settings.rigctld_port = host, port
+        self.settings.save()
+
+    def _on_cw_pitch_changed(self, _evt: wx.CommandEvent) -> None:
+        self.settings.transceiver_cw_pitch_hz = self.cw_pitch_ctrl.GetValue()
         self.settings.save()
 
     def _on_poll_interval_changed(self, _evt: wx.CommandEvent) -> None:
