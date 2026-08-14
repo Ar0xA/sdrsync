@@ -8,7 +8,7 @@ import wx
 
 from .. import theme
 from ..fonts import label_font, value_font
-from ..widgets import CheckBox
+from ..widgets import CheckBox, FlatButton
 from ...config import AppSettings
 
 SYNC_DIRECTION_ONE_WAY = "Rig -> WebSDR"
@@ -59,8 +59,22 @@ class BehaviourPanel(wx.Panel):
 
         self.cw_offset_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.cw_offset_hz)
         self.cw_offset_ctrl.SetFont(value_font())
+        # Narrower than the default best-size -- 5 digits plus a sign
+        # covers the whole -2000..2000 range, no need for the wider
+        # default width.
+        self.cw_offset_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
         self.cw_offset_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_offset_changed)
-        grid.Add(field("CW offset (Hz)", self.cw_offset_ctrl), 1, wx.EXPAND)
+        # EVT_SPINCTRL fires for the up/down arrows, but a value typed
+        # directly into the text portion only registers once focus
+        # leaves the control -- an explicit Apply button lets the
+        # operator force it to take effect immediately instead, without
+        # having to click elsewhere first.
+        self.cw_offset_apply_btn = FlatButton(self, "Apply")
+        self.cw_offset_apply_btn.Bind(wx.EVT_BUTTON, self._on_cw_offset_changed)
+        cw_offset_row = wx.BoxSizer(wx.HORIZONTAL)
+        cw_offset_row.Add(self.cw_offset_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
+        cw_offset_row.Add(self.cw_offset_apply_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(6))
+        grid.Add(field("WebSDR CW offset (Hz)", cw_offset_row), 1, wx.EXPAND)
 
         idle_val = settings.websdr_idle_disconnect_min if settings.websdr_idle_disconnect_min is not None else 0
         self.idle_disconnect_ctrl = wx.SpinCtrl(self, min=0, max=600, initial=idle_val)
