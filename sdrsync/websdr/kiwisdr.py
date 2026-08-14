@@ -11,6 +11,22 @@ Confirmed global functions/objects on the page:
         change this": ext_tune(khz) alone retunes frequency only (mode
         unaffected); ext_tune(undefined, mode) alone changes mode only
         (frequency unaffected). Confirmed live against a real instance.
+        low_cut/high_cut (Hz, relative to the dial) are the real
+        underlying filter-edge primitive -- confirmed from the live JS
+        source: ext_tune() only calls window.ext_set_passband(low_cut,
+        high_cut) when BOTH are given (isArg(low_cut) && isArg(high_cut)),
+        which clamps them into that mode's real filter.low_cut_limit/
+        high_cut_limit and applies them to demod.low_cut/high_cut
+        directly -- an exact filter width, not the coarse binary narrow/
+        wide mode-string choice this driver used before. Per-mode
+        defaults (used here only as the "which edge is fixed while width
+        varies" reference, via passband_edges() below) come from the
+        page's own passbands_fallback table -- kiwi_passbands(mode)
+        checks a live, per-instance cfg.passbands override first, so an
+        individual receiver's admin-configured defaults can differ from
+        this reference; the fixed-edge CONVENTION itself is assumed
+        universal, not independently verified against every possible
+        instance config.
     ext_get_freq_kHz()  -- returns a STRING like "14074.00", not a number.
     ext_get_mode()      -- returns the current mode as a lowercase string.
     ws_snd              -- the sound WebSocket; ws_snd.readyState === 1
@@ -52,8 +68,6 @@ logger = logging.getLogger("sdrsync.websdr.kiwisdr")
 
 LOAD_TIMEOUT_MS = 15000
 FREQ_VERIFY_TOLERANCE_HZ = 10
-NARROW_THRESHOLD_HZ = 2000
-WIDE_AM_THRESHOLD_HZ = 8000
 # Per-attempt timeout for _watch_for_audio_unlock_overlay()'s retry loop,
 # NOT a total give-up deadline -- confirmed live that the overlay's own
 # trigger (a WebSocket "camp" message handler / early UI-init call inside
@@ -84,62 +98,130 @@ AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER = 3
 # itself) to clear the overlay some other way.
 AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S = 5.0
 
-# hamlib mode name -> (kiwi base mode, kiwi narrow-variant mode or None if
-# this mode has no narrow variant). Narrow-variant strings are taken
-# verbatim from the live site's passbands_fallback table -- most do NOT
-# follow a simple "+ n" suffix rule (usb -> usn, lsb -> lsn), so they're
-# listed explicitly rather than derived.
-_MODE_MAP: dict[str, tuple[str, Optional[str]]] = {
-    "USB": ("usb", "usn"),
-    "PKTUSB": ("usb", "usn"),
-    "DATA-U": ("usb", "usn"),
-    "LSB": ("lsb", "lsn"),
-    "PKTLSB": ("lsb", "lsn"),
-    "DATA-L": ("lsb", "lsn"),
-    "CW": ("cw", "cwn"),
-    "CWR": ("cw", "cwn"),
-    "CW-U": ("cw", "cwn"),
-    "CW-L": ("cw", "cwn"),
-    "AM": ("am", "amn"),
-    "SAM": ("sam", None),
-    "FM": ("nbfm", "nnfm"),
-    "WFM": ("nbfm", "nnfm"),
+# hamlib mode name -> kiwi base mode. Filter width is a separate concern
+# now -- see passband_edges() below -- so this no longer picks a narrow-
+# variant mode string; every write goes through the base mode plus an
+# exact low_cut/high_cut via ext_tune(), never a "usn"/"lsn"/etc. string.
+_MODE_MAP: dict[str, str] = {
+    "USB": "usb",
+    "PKTUSB": "usb",
+    "DATA-U": "usb",
+    "LSB": "lsb",
+    "PKTLSB": "lsb",
+    "DATA-L": "lsb",
+    "CW": "cw",
+    "CWR": "cw",
+    "CW-U": "cw",
+    "CW-L": "cw",
+    "AM": "am",
+    "SAM": "sam",
+    "FM": "nbfm",
+    "WFM": "nbfm",
 }
 
 
-def map_hamlib_mode_kiwi(hamlib_mode: str, passband_hz: Optional[int]) -> Optional[str]:
-    """Pure mapping from a hamlib mode name (+ optional passband) to a
-    KiwiSDR mode string. Returns None if there's no known mapping (caller
-    should skip mode sync and log, not raise). Mirrors
-    websdr_org.map_hamlib_mode's shape but with KiwiSDR's own mode-string
-    table (confirmed from the live site's passbands_fallback object):
-    am/amn/amw, sam/sal/sau/sas/qam, drm, lsb/lsn, usb/usn, cw/cwn,
-    nbfm/nnfm, iq."""
-    mapped = _MODE_MAP.get(hamlib_mode.upper())
-    if mapped is None:
-        return None
-    base_mode, narrow_mode = mapped
-    if narrow_mode is None or not passband_hz:
-        return base_mode
-    if base_mode == "am":
-        if passband_hz < NARROW_THRESHOLD_HZ:
-            return narrow_mode
-        if passband_hz > WIDE_AM_THRESHOLD_HZ:
-            return "amw"
-        return "am"
-    return narrow_mode if passband_hz < NARROW_THRESHOLD_HZ else base_mode
+def map_hamlib_mode_kiwi(hamlib_mode: str) -> Optional[str]:
+    """Pure mapping from a hamlib mode name to a KiwiSDR base mode
+    string. Returns None if there's no known mapping (caller should skip
+    mode sync and log, not raise). Filter width is passband_edges()'s
+    job now, not folded into this mapping."""
+    return _MODE_MAP.get(hamlib_mode.upper())
+
+
+# KiwiSDR's own narrow/wide-variant mode strings (from its live
+# passbands_fallback table -- see module docstring) -> their base mode.
+# Used only for _base_mode_of()'s defensive normalization of whatever
+# get_status() reads back from the page: this driver no longer SENDS any
+# narrow-suffixed string itself (passband_edges() replaces the old
+# narrow/wide binary choice), but the page's own reported mode could
+# still show one from some other state. Not derivable from a simple
+# suffix rule -- most of these don't follow "+n" (nbfm -> nnfm, not
+# "nbfmn") -- so listed explicitly, same reasoning _MODE_MAP's old
+# narrow-variant column had.
+_NARROW_TO_BASE: dict[str, str] = {
+    "usn": "usb",
+    "lsn": "lsb",
+    "cwn": "cw",
+    "amn": "am",
+    "amw": "am",
+    "nnfm": "nbfm",
+}
 
 
 def _base_mode_of(kiwi_mode: str) -> str:
-    """Strip a KiwiSDR mode string down to its base ('usn'/'cwn'/'amn'/'nnfm'
-    -> 'usb'/'cw'/'am'/'nbfm'), for comparisons that must not care about the
-    narrow/wide variant (e.g. "is the rig in CW so the CW offset applies").
+    """Strip a KiwiSDR narrow/wide-variant mode string down to its base.
     Falls back to returning the string unchanged if it's not a known
-    variant (covers 'amw', 'sam', and any mode this driver doesn't map to)."""
-    for base_mode, narrow_mode in _MODE_MAP.values():
-        if kiwi_mode == narrow_mode:
-            return base_mode
-    return kiwi_mode
+    variant (covers 'sam' and any mode this driver doesn't map to)."""
+    return _NARROW_TO_BASE.get(kiwi_mode, kiwi_mode)
+
+
+# Reference edges (Hz, relative to the dial/carrier) taken directly from
+# the live site's own passbands_fallback JS table (see module docstring)
+# -- confirmed against kiwisdr.min.js:
+#   usb   {lo:300,  hi:2700}
+#   lsb   {lo:-2700, hi:-300}
+#   cw    {lo:300,  hi:700}   (centre +500 Hz -- NOT the dial, and NOT
+#                               websdr_org.py's own -750 Hz CW convention;
+#                               a genuinely different, independently
+#                               confirmed per-site value, not copy-pasted)
+#   am    {lo:-4900, hi:4900}
+#   sam   {lo:-4900, hi:4900}  (same table entry as am on this site)
+#   nbfm  {lo:-6000, hi:6000}
+# Used both as the "which edge stays fixed while width varies" convention
+# below and as passband_edges()'s per-mode existence check.
+_DEFAULT_EDGES_HZ: dict[str, tuple[float, float]] = {
+    "usb": (300, 2700),
+    "lsb": (-2700, -300),
+    "cw": (300, 700),
+    "am": (-4900, 4900),
+    "sam": (-4900, 4900),
+    "nbfm": (-6000, 6000),
+}
+
+
+def passband_edges(base_mode: str, width_hz: Optional[int]) -> Optional[tuple[float, float]]:
+    """The ext_tune()/ext_set_passband() filter edges to ask for, in Hz
+    relative to the dial -- KiwiSDR's own units, no kHz conversion needed
+    (unlike websdr_org.py's setmf()).
+
+    None means "say nothing about the filter" (low_cut/high_cut both
+    omitted from the ext_tune() call), which falls back to the site's own
+    default for that mode -- the right answer when the rig did not
+    report a passband. No client-side ceiling clamp: ext_set_passband()
+    already clamps into that mode's real filter.low_cut_limit/
+    high_cut_limit itself, so sending an oversized width and letting the
+    site do the clamping is the honest reading of "as wide as I am"
+    (mirrors ubersdr.py's and websdr_org.py's identically-named
+    functions' own reasoning).
+
+    Mirrors websdr_org.py's passband_edges(), adapted to this site's own
+    fixed-edge conventions (see _DEFAULT_EDGES_HZ above):
+
+        usb   the low edge stays fixed where the site's own USB default
+              puts it (300 Hz, clear of the carrier) and the width is
+              added above it.
+        lsb   the mirror of that (high edge fixed at -300 Hz).
+        am/sam/nbfm   symmetric about the dial, like the site's own
+              defaults for these modes -- half the width each side.
+        cw    symmetric about +500 Hz, NOT the dial -- this site's own
+              hardcoded CW filter centre (the midpoint of its real
+              300/700 Hz default), a different sidetone-pitch convention
+              from websdr_org.py's -750 Hz one.
+    """
+    defaults = _DEFAULT_EDGES_HZ.get(base_mode)
+    if defaults is None or not width_hz or width_hz <= 0:
+        return None
+    if base_mode == "usb":
+        low = defaults[0]
+        return low, low + width_hz
+    if base_mode == "lsb":
+        high = defaults[1]
+        return high - width_hz, high
+    if base_mode == "cw":
+        center = (defaults[0] + defaults[1]) / 2
+        return center - width_hz / 2, center + width_hz / 2
+    # am, sam, nbfm -- symmetric about the dial, like the site's own defaults.
+    return -width_hz / 2, width_hz / 2
 
 
 # get_status()'s already-normalized mode string (base_mode_of(...).upper(),
@@ -442,10 +524,15 @@ class KiwiSDRDriver:
 
     # ------------------------------------------------------------------
     async def set_mode(self, hamlib_mode: str, passband_hz: Optional[int]) -> bool:
-        """Returns True only if actually applied and verified via readback."""
+        """Returns True only if actually applied and verified via readback.
+
+        passband_hz drives an EXACT filter width via ext_tune()'s own
+        low_cut/high_cut params (see passband_edges()) rather than
+        picking between a coarse narrow/wide mode-string variant -- so
+        the rig's real filter width is what actually gets set."""
         if not self._attached:
             return False
-        kiwi_mode = map_hamlib_mode_kiwi(hamlib_mode, passband_hz)
+        kiwi_mode = map_hamlib_mode_kiwi(hamlib_mode)
         if kiwi_mode is None:
             self._last_mode_error = (
                 f"hamlib mode {hamlib_mode!r} has no KiwiSDR equivalent; frequency sync continues"
@@ -457,17 +544,19 @@ class KiwiSDRDriver:
                 logger.debug(self._last_mode_error)
             return False
 
+        edges = passband_edges(kiwi_mode, passband_hz)
+        lo, hi = edges if edges is not None else (None, None)
         try:
             result = await self._page.evaluate(
-                "(mode) => { "
+                "(a) => { "
                 "if (!window.ws_snd || window.ws_snd.readyState !== 1) return 'not_ready'; "
-                "window.ext_tune(undefined, mode); "
+                "window.ext_tune(undefined, a.mode, undefined, undefined, a.lo, a.hi); "
                 "return 'ok'; "
                 "}",
-                kiwi_mode,
+                {"mode": kiwi_mode, "lo": lo, "hi": hi},
             )
         except PlaywrightError as e:
-            self._last_mode_error = f"ext_tune(mode) failed: {e}"
+            self._last_mode_error = f"ext_tune(mode, lo, hi) failed: {e}"
             logger.warning(self._last_mode_error)
             return False
 
