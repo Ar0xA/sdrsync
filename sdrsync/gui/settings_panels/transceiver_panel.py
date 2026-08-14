@@ -157,6 +157,19 @@ class TransceiverPanel(wx.Panel):
         # set here, but invisible from the offset field's own tab).
         row1b = wx.BoxSizer(wx.HORIZONTAL)
 
+        self.cw_pitch_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.transceiver_cw_pitch_hz)
+        self.cw_pitch_ctrl.SetFont(value_font())
+        self.cw_pitch_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
+        self.cw_pitch_ctrl.SetToolTip(
+            "The rig's OWN CW pitch/sidetone setting (from its menu), entered here "
+            "manually -- sdrsync never queries the rig for this. Added to the "
+            "WebSDR CW offset alongside it, so this field can hold the rig's "
+            "usual pitch (often a few hundred Hz) while that one stays at 0 for "
+            "\"no additional correction needed\"."
+        )
+        self.cw_pitch_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_pitch_changed)
+        row1b.Add(field("Transceiver CW pitch (Hz)", self.cw_pitch_ctrl), 0, wx.EXPAND)
+
         self.cw_offset_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.cw_offset_hz)
         self.cw_offset_ctrl.SetFont(value_font())
         # Narrower than the default best-size -- 5 digits plus a sign
@@ -174,20 +187,7 @@ class TransceiverPanel(wx.Panel):
         cw_offset_row = wx.BoxSizer(wx.HORIZONTAL)
         cw_offset_row.Add(self.cw_offset_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
         cw_offset_row.Add(self.cw_offset_apply_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(6))
-        row1b.Add(field("WebSDR CW offset (Hz)", cw_offset_row), 0, wx.EXPAND)
-
-        self.cw_pitch_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.transceiver_cw_pitch_hz)
-        self.cw_pitch_ctrl.SetFont(value_font())
-        self.cw_pitch_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
-        self.cw_pitch_ctrl.SetToolTip(
-            "The rig's OWN CW pitch/sidetone setting (from its menu), entered here "
-            "manually -- sdrsync never queries the rig for this. Added to the "
-            "WebSDR CW offset alongside it, so this field can hold the rig's "
-            "usual pitch (often a few hundred Hz) while that one stays at 0 for "
-            "\"no additional correction needed\"."
-        )
-        self.cw_pitch_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_pitch_changed)
-        row1b.Add(field("Transceiver CW pitch (Hz)", self.cw_pitch_ctrl), 0, wx.EXPAND | wx.LEFT, self.FromDIP(14))
+        row1b.Add(field("WebSDR CW offset (Hz)", cw_offset_row), 0, wx.EXPAND | wx.LEFT, self.FromDIP(14))
 
         self.cw_offset_total_text = wx.StaticText(self, label="")
         self.cw_offset_total_text.SetFont(label_font())
