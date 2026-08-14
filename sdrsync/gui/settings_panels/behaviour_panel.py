@@ -80,6 +80,11 @@ class BehaviourPanel(wx.Panel):
         self.idle_disconnect_ctrl = wx.SpinCtrl(self, min=0, max=600, initial=idle_val)
         self.idle_disconnect_ctrl.SetFont(value_font())
         self.idle_disconnect_ctrl.Bind(wx.EVT_SPINCTRL, self._on_idle_disconnect_changed)
+        self.idle_disconnect_ctrl.SetToolTip(
+            "0-600 minutes of no rig activity (frequency/mode/PTT unchanged) before sdrsync "
+            "disconnects the WebSDR session to free up the receiver's slot for others. "
+            "Reconnects automatically the next time you touch the rig. 0 = never disconnect."
+        )
         grid.Add(field("Idle disconnect (min)", self.idle_disconnect_ctrl), 1, wx.EXPAND)
 
         self.audio_device_choice = wx.Choice(self, choices=["System default"])
