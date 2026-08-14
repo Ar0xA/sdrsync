@@ -504,7 +504,17 @@ class WebViewHost:
         session still audible, nothing visible) -- the old CallAfter and
         the new one could reach the GUI thread in either order once a
         round trip through the engine's status-queue/GUI-timer polling
-        separated them, since neither was awaited end-to-end."""
+        separated them, since neither was awaited end-to-end.
+
+        Also reported (2026-08-14, rig disconnect specifically): the
+        panel disappears immediately (GUI state) while audio keeps
+        playing for a while -- Destroy() tearing the widget down is not
+        instant, so there's a real gap where the browser engine can keep
+        producing already-buffered/queued audio. Muted natively (see
+        WxPageAdapter.set_muted(), v15 -- instant, no page round-trip)
+        BEFORE starting that teardown, so the silence is immediate
+        regardless of how long the actual destroy takes."""
+        await page.set_muted(True)
         await page.close()
 
         fut: "asyncio.Future" = loop.create_future()

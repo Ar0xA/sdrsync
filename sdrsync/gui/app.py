@@ -937,8 +937,15 @@ class MainFrame(wx.Frame):
             self._websdr_connect_pending = False
             self._strip_connect_busy_label = None
             ws = snap.websdr
+            newly_connected = bool(ws and ws.connected) and not self._state.sdr_connected
             self._state.sdr_connected = bool(ws and ws.connected)
             self._state.sdr_audio_active = ws.audio_active if ws else None
+            # Auto-fold the Transceiver settings panel once the WebSDR
+            # connection actually completes, rather than making the
+            # operator disconnect/reconnect the rig just to get it out of
+            # the way -- requested 2026-08-14.
+            if newly_connected and self._state.open_panel == "transceiver":
+                self._open_settings_panel(None)
             # Reconcile from the engine's own reported site identity
             # whenever the GUI's locally-tracked one is missing or stale.
             # Covers the idle auto-resume path specifically: SyncEngine.

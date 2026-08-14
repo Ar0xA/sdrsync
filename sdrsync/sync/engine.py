@@ -1991,6 +1991,15 @@ class SyncEngine:
         snapshot) for whichever subsystem isn't active -- rig and WebSDR
         being independently startable means neither can assume the other
         is present."""
+        # cw_offset_hz was previously only ever read at driver
+        # construction time (see driver_cls(...) call sites below), so
+        # changing it in Behaviour settings while already connected had
+        # no effect until a disconnect/reconnect or site switch -- kept
+        # the OLD value applied indefinitely. Synced live, every tick,
+        # instead.
+        if self._driver is not None:
+            self._driver.cw_offset_hz = self.settings.cw_offset_hz
+
         websdr_status = await self._driver.get_status() if self._websdr_active and self._driver else None
 
         if not self._rig_active or self._rig is None:
