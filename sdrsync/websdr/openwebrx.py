@@ -27,6 +27,24 @@ fingerprint/structure against two other instances on different versions):
         nfm/wfm/am/lsb/usb/cw are the analog ones. Unlike the other two
         drivers there is NO narrow/wide suffix convention here, so
         map_hamlib_mode_openwebrx() is a plain 1:1 dict.
+    demodulator.setBandpass({low_cut, high_cut}) / .disableBandpass()
+        -- confirmed live (receiver.js): the real underlying filter-edge
+        primitive, in Hz relative to the dial. setMode() itself already
+        calls this with the NEW mode's own default bandpass as part of
+        constructing a fresh Demodulator (`var bandpass = mode.bandpass
+        || ...; if (bandpass) this.demodulator.setBandpass(bandpass)`),
+        so set_mode() below reads that just-applied default back in the
+        SAME round trip (demod.low_cut/high_cut immediately after
+        setMode()) rather than a separate Modes.findByModulation() call,
+        then issues one more setBandpass() call to override it with an
+        exact width from the rig's passband_hz -- unlike websdr_org.py/
+        kiwisdr.py, there is NO static per-mode default table anywhere
+        in this site's own client JS at all (Modes.modes starts as an
+        empty array and is populated ENTIRELY from server-sent JSON at
+        runtime, confirmed live -- so passband_edges() below takes the
+        live default as an explicit argument instead of having one to
+        fall back on internally, the one design difference from the
+        other two drivers' identically-named functions).
     toggleMute() -- confirmed live: toggles a UI class on
         '.openwebrx-mute-button' and drives audioEngine.setVolume(). No
         longer called by sdrsync (v15 moved mute-on-TX to a native,
@@ -101,9 +119,64 @@ _MODE_MAP: dict[str, str] = {
 def map_hamlib_mode_openwebrx(hamlib_mode: str) -> Optional[str]:
     """Pure mapping from a hamlib mode name to an OpenWebRX modulation
     string. Returns None if there's no known mapping (caller should skip
-    mode sync and log, not raise). No passband parameter, unlike
-    map_hamlib_mode/map_hamlib_mode_kiwi -- see module docstring."""
+    mode sync and log, not raise). Filter width is passband_edges()'s
+    job -- see module docstring."""
     return _MODE_MAP.get(hamlib_mode.upper())
+
+
+# Which edge of a mode's passband is fixed while width scales, vs.
+# symmetric about the dial -- a universal ham-radio/DSP convention, not
+# an instance-specific value (unlike the actual default Hz numbers,
+# which only exist server-side for this site -- see passband_edges()'s
+# own docstring for why those must be passed in rather than looked up
+# here).
+_SIDEBAND: dict[str, str] = {
+    "usb": "upper",
+    "lsb": "lower",
+    "cw": "both",
+    "am": "both",
+    "nfm": "both",
+    "wfm": "both",
+}
+
+
+def passband_edges(
+    mode: str, width_hz: Optional[int], default_bandpass: Optional[tuple[float, float]],
+) -> Optional[tuple[float, float]]:
+    """The setBandpass() filter edges to ask for, in Hz relative to the
+    dial. Unlike websdr_org.py's and kiwisdr.py's identically-named
+    functions, there is no static per-mode default table to fall back
+    on internally -- OpenWebRX's own mode/bandpass config is entirely
+    server-sent at runtime (see module docstring) -- so the CALLER reads
+    the live default (demod.low_cut/high_cut immediately after
+    setMode(), which already applied it) and passes it in here as
+    default_bandpass.
+
+    None means "say nothing about the filter" (don't call setBandpass()
+    at all), which leaves the mode's own just-applied default in place
+    -- the right answer when the rig did not report a passband, or the
+    live default couldn't be read. No client-side ceiling clamp is
+    applied here -- unlike the other two drivers, this site's own
+    server-side clamping of setBandpass() wasn't independently confirmed
+    this session (flagged rather than assumed); sending an oversized
+    width and trusting the site to handle it is the same "as wide as I
+    am" philosophy regardless.
+
+    default_bandpass supplies WHICH edge is fixed (the numeric anchor);
+    _SIDEBAND above supplies which convention applies (upper/lower/
+    both) -- that classification IS a universal, hardcodable convention,
+    even though the numeric values it's anchored to are not.
+    """
+    sideband = _SIDEBAND.get(mode)
+    if sideband is None or default_bandpass is None or not width_hz or width_hz <= 0:
+        return None
+    default_low, default_high = default_bandpass
+    if sideband == "upper":
+        return default_low, default_low + width_hz
+    if sideband == "lower":
+        return default_high - width_hz, default_high
+    center = (default_low + default_high) / 2
+    return center - width_hz / 2, center + width_hz / 2
 
 
 def _fmt_khz(hz) -> str:
@@ -485,9 +558,13 @@ class OpenWebRXDriver:
     # ------------------------------------------------------------------
     async def set_mode(self, hamlib_mode: str, passband_hz: Optional[int]) -> bool:
         """Returns True only if actually applied and verified via readback.
-        passband_hz is accepted for WebSDRDriver interface compatibility
-        but unused -- OpenWebRX's modulation strings have no narrow/wide
-        variant (see map_hamlib_mode_openwebrx)."""
+
+        passband_hz drives an EXACT filter width via a follow-up
+        setBandpass() call (see passband_edges()) when usable -- the
+        mode readback below doubles as reading the just-applied DEFAULT
+        bandpass (setMode() itself always applies one), which is what
+        passband_edges() needs as its anchor since this site has no
+        static default table (see module docstring)."""
         if not self._attached:
             return False
         mode = map_hamlib_mode_openwebrx(hamlib_mode)
@@ -505,9 +582,11 @@ class OpenWebRXDriver:
         try:
             result = await self._page.evaluate(
                 "(mode) => { "
-                "if (!window.ws || window.ws.readyState !== 1) return 'not_ready'; "
+                "if (!window.ws || window.ws.readyState !== 1) return {status: 'not_ready'}; "
                 "$('#openwebrx-panel-receiver').demodulatorPanel().setMode(mode); "
-                "return 'ok'; "
+                "var d = $('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator(); "
+                "return {status: 'ok', mode: d ? d.modulation : null, "
+                "low_cut: d ? d.low_cut : null, high_cut: d ? d.high_cut : null}; "
                 "}",
                 mode,
             )
@@ -516,13 +595,13 @@ class OpenWebRXDriver:
             logger.warning(self._last_mode_error)
             return False
 
-        if result == "not_ready":
+        if result.get("status") == "not_ready":
             self._last_mode_error = "OpenWebRX control WebSocket is not open (disconnected mid-session?)"
             logger.warning(self._last_mode_error)
             self._attached = False
             return False
 
-        actual_mode = await self._read_mode()
+        actual_mode = result.get("mode")
         if actual_mode != mode:
             self._last_mode_error = (
                 f"OpenWebRX did not apply requested mode: wanted {mode!r}, reads {actual_mode!r}"
@@ -530,19 +609,32 @@ class OpenWebRXDriver:
             logger.warning(self._last_mode_error)
             return False
 
+        default_low, default_high = result.get("low_cut"), result.get("high_cut")
+        default_bandpass = (
+            (default_low, default_high)
+            if isinstance(default_low, (int, float)) and isinstance(default_high, (int, float))
+            else None
+        )
+        edges = passband_edges(mode, passband_hz, default_bandpass)
+        if edges is not None:
+            lo, hi = edges
+            try:
+                await self._page.evaluate(
+                    "(a) => { var d = $('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator(); "
+                    "if (d) d.setBandpass({low_cut: a.lo, high_cut: a.hi}); }",
+                    {"lo": lo, "hi": hi},
+                )
+            except PlaywrightError as e:
+                # The mode itself already applied successfully -- a
+                # filter-only failure must not undo that (same "a
+                # refused filter must not cost us the mode change"
+                # philosophy as ubersdr.py's set_mode()).
+                logger.warning("setBandpass() failed after a successful setMode(): %s", e)
+
         self._current_mode = mode
         self._last_mode_error = None
         self._last_unmapped_mode = None
         return True
-
-    async def _read_mode(self) -> Optional[str]:
-        try:
-            return await self._page.evaluate(
-                "() => { var d = $('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator(); "
-                "return d ? d.modulation : null; }"
-            )
-        except PlaywrightError:
-            return None
 
     # Mute-on-TX is handled natively at the page-adapter level now (v15,
     # WxPageAdapter.set_muted() in browser_shim.py) -- see its module
