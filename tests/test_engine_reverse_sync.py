@@ -1350,3 +1350,121 @@ def test_get_status_is_called_exactly_once_per_steady_state_tick():
     asyncio.run(engine._tick())
 
     assert driver.get_status_calls == 1
+
+
+def test_force_ssb_to_data_mode_sends_pktusb_on_rigctld():
+    """AppSettings.force_ssb_to_data_mode: when the WebSDR page shows
+    USB, the rig should be set to PKTUSB (rigctld's own canonical hamlib
+    mode token for data-over-USB -- confirmed via rigctl's real man page,
+    and live-confirmed by the user: a real Yaesu rig set to its own
+    "DATA-U" mode is reported back by rigctld as "PKTUSB"), not plain
+    USB."""
+    engine = make_engine()
+    engine.settings.force_ssb_to_data_mode = True
+    engine._rig_backend = "rigctld"
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW", passband_hz=500, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="CW")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "USB"  # user clicks USB on the WebSDR page
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # pushes -- must send "PKTUSB", not "USB"
+
+    assert stub_rig.set_modes == ["PKTUSB"]
+
+
+def test_force_ssb_to_data_mode_sends_data_l_on_flrig():
+    """Same feature, LSB side, flrig backend -- DATA-L (this codebase's
+    existing forward-direction _MODE_MAP convention for flrig, not
+    independently live-verified against a real flrig instance this
+    session)."""
+    engine = make_engine()
+    engine.settings.force_ssb_to_data_mode = True
+    engine._rig_backend = "flrig"
+    stub_rig = StubReverseRig(RigState(freq_hz=7074000, mode="CW", passband_hz=500, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=7074000, mode="CW")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "LSB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_modes == ["DATA-L"]
+
+
+def test_force_ssb_to_data_mode_off_by_default_sends_plain_usb():
+    """Default (off): must not change existing behavior."""
+    engine = make_engine()
+    assert engine.settings.force_ssb_to_data_mode is False
+    engine._rig_backend = "rigctld"
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW", passband_hz=500, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="CW")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "USB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_modes == ["USB"]
+
+
+def test_force_ssb_to_data_mode_bookkeeping_stays_on_canonical_mode_no_repeat_push():
+    """The dedupe/bookkeeping latches must stay keyed on the canonical
+    "USB" (what the WebSDR page actually shows), not "PKTUSB" (what got
+    written to the rig) -- otherwise the page continuing to show "USB"
+    on the next tick would look like ANOTHER new value and re-trigger a
+    push every tick forever."""
+    engine = make_engine()
+    engine.settings.force_ssb_to_data_mode = True
+    engine._rig_backend = "rigctld"
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="CW", passband_hz=500, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="CW")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    status.mode = "USB"
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    assert stub_rig.set_modes == ["PKTUSB"]
+
+    # Page still shows USB (unchanged) on later ticks -- must NOT push again.
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_modes == ["PKTUSB"]
+
+
+def test_reverse_sync_data_mode_for_pure_function():
+    from sdrsync.sync.engine import _reverse_sync_data_mode_for
+
+    assert _reverse_sync_data_mode_for("USB", "rigctld") == "PKTUSB"
+    assert _reverse_sync_data_mode_for("LSB", "rigctld") == "PKTLSB"
+    assert _reverse_sync_data_mode_for("USB", "flrig") == "DATA-U"
+    assert _reverse_sync_data_mode_for("LSB", "flrig") == "DATA-L"
+    # Non-SSB modes and unrecognized backends pass through unchanged --
+    # this is deliberately narrow (SSB only), not a general substitution.
+    assert _reverse_sync_data_mode_for("CW", "rigctld") == "CW"
+    assert _reverse_sync_data_mode_for("AM", "flrig") == "AM"
+    assert _reverse_sync_data_mode_for("USB", None) == "USB"
+    assert _reverse_sync_data_mode_for("USB", "some_future_backend") == "USB"

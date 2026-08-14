@@ -259,6 +259,41 @@ REVERSE_PUSH_BACKOFF_S = (0.35,)  # gap after attempt 1; matches REVERSE_MIN_RIG
 # often do we hit the rig", not either axis's own debounce.
 REVERSE_MIN_RIG_WRITE_GAP_S = 0.35
 
+# AppSettings.force_ssb_to_data_mode: per-backend rig-native mode token to
+# send instead of plain "USB"/"LSB" on a reverse-sync push. Two different,
+# genuinely correct conventions for the SAME concept (data-over-SSB, keyed
+# via the rig's data input rather than the mic), not a guess at one:
+#   - rigctld/hamlib: "PKTUSB"/"PKTLSB" are hamlib's own canonical
+#     protocol-level mode tokens (confirmed via `rigctl`'s real man page,
+#     the 'M'/set_mode entry's token list -- backend-independent, hamlib
+#     normalizes whatever the specific rig model calls it internally into
+#     these). Live-confirmed by the user against a real Yaesu rig: set to
+#     "DATA-U" on the rig itself, rigctld reports the mode back as
+#     "PKTUSB" -- i.e. this is genuinely what comes back over the wire,
+#     not just what the docs say to send.
+#   - flrig: "DATA-U"/"DATA-L" match this codebase's own existing forward-
+#     direction _MODE_MAP entries in kiwisdr.py/websdr_org.py/
+#     openwebrx.py (present before this feature; not a new guess), but
+#     NOT independently live-verified against a real flrig instance this
+#     session -- flrig's mode-string tables are per-rig-model, so this
+#     may not be the exact token every flrig-supported rig uses.
+_REVERSE_SYNC_DATA_MODE = {
+    "rigctld": {"USB": "PKTUSB", "LSB": "PKTLSB"},
+    "flrig": {"USB": "DATA-U", "LSB": "DATA-L"},
+}
+
+
+def _reverse_sync_data_mode_for(hamlib_mode: str, rig_backend: Optional[str]) -> str:
+    """Maps a canonical "USB"/"LSB" to that backend's own data-mode token
+    when AppSettings.force_ssb_to_data_mode is on. Any other mode (CW,
+    AM, FM, ...) or an unrecognized backend passes through unchanged --
+    this is deliberately narrow (SSB only), not a general mode
+    substitution mechanism."""
+    per_backend = _REVERSE_SYNC_DATA_MODE.get(rig_backend or "")
+    if per_backend is None:
+        return hamlib_mode
+    return per_backend.get(hamlib_mode, hamlib_mode)
+
 
 class WebViewHost(Protocol):
     """The narrow interface SyncEngine needs from whatever manages the
@@ -1839,6 +1874,16 @@ class SyncEngine:
                         and state.mode.upper().startswith("CW")
                     ):
                         mode_to_send = state.mode
+                    elif self.settings.force_ssb_to_data_mode:
+                        # "Force SSB to data mode" (Behaviour settings) --
+                        # send the rig's own data-mode token instead of
+                        # plain USB/LSB. Bookkeeping below stays keyed on
+                        # the canonical obs_mode ("USB"/"LSB"), same
+                        # pattern as the CW echo above: the WebSDR page
+                        # itself is still (and should still be compared
+                        # as) plain USB/LSB, only the string actually
+                        # written to the rig differs.
+                        mode_to_send = _reverse_sync_data_mode_for(obs_mode, self._rig_backend)
                     # Mode-only -- filter/bandwidth is never touched by a
                     # reverse-sync push (see RigClient.set_mode()'s own
                     # docstring: a user reported live that any reverse-sync

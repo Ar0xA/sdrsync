@@ -147,6 +147,17 @@ class BehaviourPanel(wx.Panel):
         self.auto_click_audio_unlock_check.Bind(wx.EVT_CHECKBOX, self._on_auto_click_audio_unlock_toggled)
         checks.Add(self.auto_click_audio_unlock_check, 0)
 
+        self.force_ssb_to_data_mode_check = CheckBox(self, "Force SSB to data mode")
+        self.force_ssb_to_data_mode_check.SetValue(settings.force_ssb_to_data_mode)
+        self.force_ssb_to_data_mode_check.SetToolTip(
+            "Reverse sync (WebSDR -> rig): when the WebSDR page is in USB or LSB, set the "
+            "rig's DATA-mode variant instead of plain USB/LSB (e.g. PKTUSB/PKTLSB on "
+            "rigctld, DATA-U/DATA-L on flrig) -- so the rig is always keyed via its data "
+            "input, never the mic, for a plain SSB-looking WebSDR page."
+        )
+        self.force_ssb_to_data_mode_check.Bind(wx.EVT_CHECKBOX, self._on_force_ssb_to_data_mode_toggled)
+        checks.Add(self.force_ssb_to_data_mode_check, 0)
+
         outer.Add(checks, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad_side)
         outer.AddSpacer(pad_bottom)
         self.SetSizer(outer)
@@ -177,6 +188,10 @@ class BehaviourPanel(wx.Panel):
 
     def _on_auto_click_audio_unlock_toggled(self, _evt: wx.CommandEvent) -> None:
         self.settings.auto_click_audio_unlock = self.auto_click_audio_unlock_check.GetValue()
+        self.settings.save()
+
+    def _on_force_ssb_to_data_mode_toggled(self, _evt: wx.CommandEvent) -> None:
+        self.settings.force_ssb_to_data_mode = self.force_ssb_to_data_mode_check.GetValue()
         self.settings.save()
 
     def _on_sync_direction_changed(self, _evt: wx.CommandEvent) -> None:

@@ -121,6 +121,16 @@ class AppSettings:
     # upstream disappears locally too, since this isn't user-owned data.
     curated_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
+    # Reverse sync (WebSDR -> rig): when the WebSDR page is in USB/LSB,
+    # send the rig's DATA-mode variant instead of plain USB/LSB (e.g.
+    # PKTUSB/PKTLSB on rigctld, DATA-U/DATA-L on flrig) -- for operators
+    # who always want the rig keyed via its data input rather than the
+    # mic, regardless of what a plain SSB WebSDR page shows. Default off:
+    # this changes what mode actually gets set on the rig, not just a
+    # display/UI preference. See sync/engine.py's
+    # _reverse_sync_data_mode_for() for the actual per-backend mode
+    # strings and their sourcing.
+    force_ssb_to_data_mode: bool = False
     mute_on_tx: bool = True
     # GUI rewrite (spec §5.3): purely a display-gate today -- the strip's
     # TX VFO readout mirrors RX VFO regardless (no real split/second-VFO
@@ -270,6 +280,7 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "last_site_url": str,
     "last_site_driver_type": str,
     "cw_offset_hz": int,
+    "force_ssb_to_data_mode": bool,
     "mute_on_tx": bool,
     "sync_tx_vfo": bool,
     "hide_receiver_when_undocked": bool,
