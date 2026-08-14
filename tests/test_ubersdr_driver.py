@@ -19,6 +19,8 @@ a real browser.
 import asyncio
 import json
 
+from sdrsync.websdr import browser_shim
+from sdrsync.websdr import ubersdr as ubersdr_module
 from sdrsync.websdr.ubersdr import UberSDRDriver
 
 
@@ -34,6 +36,7 @@ class StubPage:
         self.ready = True
         self.closed = False
         self.mouse = self
+        self.click_calls = []   # [(x, y)] in order
 
     async def evaluate(self, js, *args):
         if ".call(" in js:
@@ -55,7 +58,7 @@ class StubPage:
         return True
 
     async def click(self, x, y):
-        return None
+        self.click_calls.append((x, y))
 
     def on(self, event, handler):
         return None
@@ -350,3 +353,100 @@ def test_the_reported_json_is_what_the_page_would_receive():
     run(driver.set_mode("CW", 500))
     for _type, payload in page.sent:
         json.dumps(payload)
+
+
+# --- audio unlock opt-out ---------------------------------------------------
+
+def test_stop_listen_cycle_skipped_when_disabled_via_settings():
+    # Behaviour panel's "Mouse hijack to enable WebSDR audio" checkbox --
+    # off means the operator will click the receiver's own Stop/Listen
+    # controls themselves. Only gates the EXTRA Stop->Listen cycle, not
+    # the initial Start-button click (see _start_audio's/__init__'s own
+    # comments): session.running=True from the very start here so the
+    # driver's own click loop never even reaches for .start__go, isolating
+    # this test to just the Stop->Listen gate.
+    class PageThatMustNotBeQueried(StubPage):
+        async def evaluate(self, js, *args):
+            if "querySelector" in js:
+                raise AssertionError("Stop/Listen click must not run when disabled")
+            return await super().evaluate(js, *args)
+
+    page = PageThatMustNotBeQueried(topics={"session": {"running": True}})
+    driver = attached(page, auto_click_audio_unlock=False)
+
+    run(driver._start_audio())
+
+    assert page.click_calls == []
+
+
+# --- Stop->Listen recovery ---------------------------------------------------
+
+class _StopSucceedsListenCoveredStubPage(StubPage):
+    """Simulates: Stop is clicked successfully, but the topbar Listen
+    control is never found/hit-testable afterward (e.g. the page fell
+    back to its own full-viewport .start__go overlay, covering the
+    topbar) -- and THAT overlay is itself clickable and recovers the
+    session."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._stopped = False
+
+    async def evaluate(self, js, *args):
+        if "querySelector" in js:
+            selector = args[0]
+            if selector == '[title="Stop listening"]' and not self._stopped:
+                return {"x": 10.4, "y": 20.6}
+            if selector == '[title="Start listening"]':
+                return None  # never found -- simulates being covered
+            if selector == ".start__go" and self._stopped:
+                return {"x": 30.4, "y": 40.6}
+            return None
+        return await super().evaluate(js, *args)
+
+    async def click(self, x, y):
+        await super().click(x, y)
+        if (x, y) == (10, 21):
+            self._stopped = True
+            self.topics["session"] = {"running": False}
+        elif (x, y) == (30, 41):
+            self.topics["session"] = {"running": True}
+
+
+def test_stop_listen_cycle_recovers_via_start_overlay_when_listen_not_found(monkeypatch):
+    # Regression coverage (third-party bug-hunt review, reproduced with a
+    # standalone script): previously, if the Listen click failed to find
+    # a hit-testable target, _try_stop_listen_cycle returned False having
+    # already clicked Stop -- leaving the receiver powered OFF with no
+    # further attempt, which is worse than not touching it at all.
+    monkeypatch.setattr(ubersdr_module, "AUDIO_UNLOCK_WATCH_ATTEMPT_S", 0.05)
+    monkeypatch.setattr(browser_shim, "CLICK_ELEMENT_POLL_INTERVAL_S", 0.01)
+    page = _StopSucceedsListenCoveredStubPage(topics={"session": {"running": True}})
+    driver = attached(page)
+
+    result = run(driver._try_stop_listen_cycle())
+
+    assert result is True
+    assert page.click_calls == [(10, 21), (30, 41)]
+
+
+def test_stop_listen_cycle_reports_failure_when_recovery_also_fails(monkeypatch):
+    # If even the .start__go recovery can't be found, the cycle must
+    # still report failure honestly (not claim success) -- covered
+    # separately from the happy-recovery case above so a regression in
+    # either branch is caught independently.
+    monkeypatch.setattr(ubersdr_module, "AUDIO_UNLOCK_WATCH_ATTEMPT_S", 0.05)
+    monkeypatch.setattr(browser_shim, "CLICK_ELEMENT_POLL_INTERVAL_S", 0.01)
+
+    class _NoRecoveryStubPage(_StopSucceedsListenCoveredStubPage):
+        async def evaluate(self, js, *args):
+            if "querySelector" in js and args[0] == ".start__go":
+                return None
+            return await super().evaluate(js, *args)
+
+    page = _NoRecoveryStubPage(topics={"session": {"running": True}})
+    driver = attached(page)
+
+    result = run(driver._try_stop_listen_cycle())
+
+    assert result is False

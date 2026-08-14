@@ -295,7 +295,7 @@ class _LinkToggle(_OwnerDrawnMixin, wx.Control):
 
     def _paint(self, gc: "wx.GraphicsContext", rect: wx.Rect) -> None:
         if not self.IsEnabled():
-            colour = theme.with_alpha(theme.FAINT, 115)
+            colour = theme.with_alpha(theme.FAINT, theme.DISABLED_ALPHA)
         elif not self._checked:
             colour = theme.TRANSMIT
         elif self._hover:
@@ -427,9 +427,16 @@ class StripPanel(wx.Panel):
         if not state.sdr_active:
             self.connect_btn.SetLabel("Connect")
             self.connect_btn.SetPrimary(True)
+            self.connect_btn.SetDanger(False)
         else:
             same_site = self.site_choice.GetStringSelection() == state.site
             self.connect_btn.SetLabel("Disconnect" if same_site else "Load")
+            # Load stays gold (primary); Disconnect (same_site=True) is
+            # reddish (danger) at rest instead of plain grey/BORDER --
+            # user-reported preference, matches TransceiverPanel's own
+            # Connect/Disconnect button. Hover/press feedback stays the
+            # universal gold either way, unchanged.
             self.connect_btn.SetPrimary(not same_site)
+            self.connect_btn.SetDanger(same_site)
 
         self.Layout()

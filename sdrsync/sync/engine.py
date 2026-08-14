@@ -1032,7 +1032,10 @@ class SyncEngine:
 
         self._page = page
         self.site = site
-        self._driver = driver_cls(site.url, cw_offset_hz=self.settings.cw_offset_hz)
+        self._driver = driver_cls(
+            site.url, cw_offset_hz=self.settings.cw_offset_hz,
+            auto_click_audio_unlock=self.settings.auto_click_audio_unlock,
+        )
         self._websdr_active = True
         self._reset_sync_latches()
         # Runs for the WebSDR subsystem's whole lifetime, independently of
@@ -1165,7 +1168,10 @@ class SyncEngine:
         self._last_rig_activity_at = time.monotonic()
 
         self.site = site
-        self._driver = driver_cls(site.url, cw_offset_hz=self.settings.cw_offset_hz)
+        self._driver = driver_cls(
+            site.url, cw_offset_hz=self.settings.cw_offset_hz,
+            auto_click_audio_unlock=self.settings.auto_click_audio_unlock,
+        )
         self._reset_sync_latches()
         # Re-bound against the SAME page for the new generation -- see
         # WxPageAdapter.set_on_dead()'s docstring for why this can't be

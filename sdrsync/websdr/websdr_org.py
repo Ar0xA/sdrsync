@@ -129,9 +129,10 @@ class WebsdrOrgDriver:
     # genuinely ambiguous observation.
     CW_VARIANT_IS_AMBIGUOUS = True
 
-    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+    def __init__(self, url: str, cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True) -> None:
         self.url = url
         self.cw_offset_hz = cw_offset_hz
+        self._auto_click_audio_unlock = auto_click_audio_unlock
 
         self._page: Optional[Page] = None
         self._bands: list[tuple[float, float]] = []  # (low_hz, high_hz) per band index
@@ -204,7 +205,8 @@ class WebsdrOrgDriver:
                 timeout=LOAD_TIMEOUT_MS,
             )
             await self._load_band_table()
-            await self._satisfy_audio_gate()
+            if self._auto_click_audio_unlock:
+                await self._satisfy_audio_gate()
         except WebSDRIncompatibleError as e:
             self._last_attach_error = str(e)
             raise

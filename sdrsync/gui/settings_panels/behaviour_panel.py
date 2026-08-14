@@ -1,6 +1,7 @@
 """Behaviour settings panel (spec §5.3)."""
 from __future__ import annotations
 
+import sys
 from typing import Callable, Optional
 
 import wx
@@ -107,6 +108,31 @@ class BehaviourPanel(wx.Panel):
         self.hide_when_undocked_check.Bind(wx.EVT_CHECKBOX, self._on_hide_when_undocked_toggled)
         checks.Add(self.hide_when_undocked_check, 0)
 
+        self.auto_click_audio_unlock_check = CheckBox(
+            self, "Mouse hijack to enable WebSDR audio (Linux only)",
+        )
+        self.auto_click_audio_unlock_check.SetValue(settings.auto_click_audio_unlock)
+        if sys.platform == "win32":
+            # Inert there: WebView2's own --autoplay-policy flag (see
+            # browser/backend.py) means audio never gets gated behind a
+            # click in the first place on Windows, so this setting has
+            # nothing to turn on or off -- greyed out rather than left
+            # clickable-but-meaningless.
+            self.auto_click_audio_unlock_check.Enable(False)
+            self.auto_click_audio_unlock_check.SetToolTip(
+                "Not applicable on Windows -- WebView2 never gates WebSDR audio behind "
+                "a click in the first place, so there's nothing here to turn off."
+            )
+        else:
+            self.auto_click_audio_unlock_check.SetToolTip(
+                "Some WebSDR sites require a real click to start audio on Linux -- sdrsync "
+                "moves your actual mouse cursor and clicks automatically when this is on. "
+                "Turning it off means you'll need to click those sites' own Start/Play "
+                "controls yourself."
+            )
+        self.auto_click_audio_unlock_check.Bind(wx.EVT_CHECKBOX, self._on_auto_click_audio_unlock_toggled)
+        checks.Add(self.auto_click_audio_unlock_check, 0)
+
         outer.Add(checks, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad_side)
         outer.AddSpacer(pad_bottom)
         self.SetSizer(outer)
@@ -133,6 +159,10 @@ class BehaviourPanel(wx.Panel):
 
     def _on_hide_when_undocked_toggled(self, _evt: wx.CommandEvent) -> None:
         self.settings.hide_receiver_when_undocked = self.hide_when_undocked_check.GetValue()
+        self.settings.save()
+
+    def _on_auto_click_audio_unlock_toggled(self, _evt: wx.CommandEvent) -> None:
+        self.settings.auto_click_audio_unlock = self.auto_click_audio_unlock_check.GetValue()
         self.settings.save()
 
     def _on_sync_direction_changed(self, _evt: wx.CommandEvent) -> None:

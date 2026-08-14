@@ -16,6 +16,15 @@ Confirmed global functions/objects on the page:
     ws_snd              -- the sound WebSocket; ws_snd.readyState === 1
                             (OPEN) is the reliable "ready" signal.
     toggle_or_set_mute(1|0) -- mutes/unmutes local playback volume.
+    .id-play-button-container -- audio-unlock overlay the page shows
+        itself (onclick -> play_button_click_cb() -> AudioContext.resume())
+        whenever its own test AudioContext isn't already "running" --
+        confirmed live in KiwiSDR's actual JS source (test_audio_suspended()
+        in kiwisdr.min.js). A CSS CLASS, not a DOM id, despite the "id-"
+        prefix in its name -- confirmed live that w3_psa() (the page's own
+        markup-string parser behind w3_div()) only ever emits a class=
+        attribute from this string, never a real id=. See attach()'s own
+        comment for why this matters on WebKitGTK/Linux specifically.
 
 Unlike PA3FWM, a KiwiSDR instance is a single continuous-range receiver --
 there is no setband()-equivalent and no band table. That does NOT mean
@@ -30,10 +39,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import sys
 from typing import Optional
 
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
+from sdrsync.websdr.browser_shim import click_element_if_present, element_is_present
 
 from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
 
@@ -43,6 +54,21 @@ LOAD_TIMEOUT_MS = 15000
 FREQ_VERIFY_TOLERANCE_HZ = 10
 NARROW_THRESHOLD_HZ = 2000
 WIDE_AM_THRESHOLD_HZ = 8000
+# Per-attempt timeout for _watch_for_audio_unlock_overlay()'s retry loop,
+# NOT a total give-up deadline -- confirmed live that the overlay's own
+# trigger (a WebSocket "camp" message handler / early UI-init call inside
+# the page's JS) can fire well after ws_snd/demodulators are ready, and
+# even a generous-feeling one-shot 20s window wasn't always enough (a real
+# observed case: still not present after 20s, then appeared on screen
+# later anyway). The watcher keeps retrying for as long as this driver
+# stays attached, so this only controls how often it re-checks.
+AUDIO_UNLOCK_WATCH_ATTEMPT_S = 5.0
+# Settle time after a click before re-probing to confirm the overlay
+# actually went away (see _watch_for_audio_unlock_overlay's own comment
+# on why a dispatched click alone isn't proof of success) -- KiwiSDR's
+# own fade-out is w3_opacity(...,0) then w3_hide() 1100ms later, so this
+# needs to be a bit longer than that.
+AUDIO_UNLOCK_OVERLAY_FADE_S = 1.2
 
 # hamlib mode name -> (kiwi base mode, kiwi narrow-variant mode or None if
 # this mode has no narrow variant). Narrow-variant strings are taken
@@ -141,9 +167,10 @@ class KiwiSDRDriver:
     # above) and _REVERSE_MODE_MAP only has "CW" -> "CW" -- ambiguous.
     CW_VARIANT_IS_AMBIGUOUS = True
 
-    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+    def __init__(self, url: str, cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True) -> None:
         self.url = url
         self.cw_offset_hz = cw_offset_hz
+        self._auto_click_audio_unlock = auto_click_audio_unlock
 
         self._page: Optional[Page] = None
         self._current_mode: Optional[str] = None
@@ -159,6 +186,10 @@ class KiwiSDRDriver:
         # openwebrx.py's _last_out_of_range_key rate-limiting for the same
         # class of problem (repeated per-tick log spam).
         self._last_unmapped_mode: Optional[str] = None
+        # Background audio-unlock watcher (see attach()) -- tracked so
+        # close() can cancel a still-pending one rather than leaving it
+        # running against a page this driver no longer owns.
+        self._audio_unlock_task: Optional[asyncio.Task] = None
 
     @property
     def attached(self) -> bool:
@@ -197,6 +228,47 @@ class KiwiSDRDriver:
             )
             raise WebSDRIncompatibleError(self._last_attach_error) from e
 
+        # Best-effort audio unlock: confirmed live in KiwiSDR's own JS
+        # (test_audio_suspended()) that the page shows a "Click to start
+        # KiwiSDR" overlay -- .id-play-button-container (a CSS CLASS, not a
+        # DOM id, despite the name -- confirmed live via w3_psa(), the
+        # page's own markup-string parser, which only ever emits a class=
+        # attribute from this string; querying it as an ID selector
+        # matched nothing, which is why the very first live test of this
+        # watcher never found/clicked anything at all), onclick ->
+        # play_button_click_cb() -> audio_context.resume() -- whenever ITS
+        # OWN test AudioContext isn't already "running" at that check. On
+        # WebKitGTK (confirmed live on a native, non-WSL2 Linux desktop) a
+        # fresh AudioContext is NOT auto-"running", so this overlay
+        # genuinely appears and, unlike websdr_org.py's page, nothing else
+        # on this page ever calls resume() -- so tuning/mode control all
+        # worked while audio stayed permanently silent until this got
+        # clicked.
+        #
+        # Run as a background task, NOT awaited here: confirmed live that
+        # the overlay's own trigger can fire well after this point (a real
+        # observed case: still not present ~8s after session start), so
+        # awaiting it inline with a short timeout would either miss a
+        # late-appearing overlay or make attach() (and the GUI's
+        # "connected" status) hang around waiting for something that isn't
+        # guaranteed to happen promptly. A previous still-pending watcher
+        # (e.g. a fast reattach) is cancelled first so it can't click
+        # against a page this attach() call is about to take back over.
+        #
+        # Skipped entirely on Windows, not just left to no-op: confirmed
+        # from KiwiSDR's own source (test_audio_suspended() above) that
+        # this overlay is gated on the exact same AudioContext.state
+        # check ensure_webview_backend() (browser/backend.py) already
+        # guarantees "running" for via --autoplay-policy=
+        # no-user-gesture-required -- so the overlay provably never
+        # renders there, and watching for one that can never appear would
+        # only ever be wasted work on Windows (v2.2.6 behavior confirmed
+        # working there; this must not regress it).
+        if self._audio_unlock_task is not None:
+            self._audio_unlock_task.cancel()
+        if sys.platform != "win32" and self._auto_click_audio_unlock:
+            self._audio_unlock_task = asyncio.create_task(self._watch_for_audio_unlock_overlay(page))
+
         self._attached = True
         self._current_mode = None
         self._last_attach_error = None
@@ -204,6 +276,54 @@ class KiwiSDRDriver:
         self._last_tune_error = None
         self._last_mode_error = None
         self._last_unmapped_mode = None
+
+    async def _watch_for_audio_unlock_overlay(self, page: Page) -> None:
+        """Background task launched from attach() -- see its own comment
+        for why this isn't just awaited inline. Loops in
+        AUDIO_UNLOCK_WATCH_ATTEMPT_S-sized attempts for as long as this
+        driver stays attached (bounded only by close()/a reattach
+        cancelling this task), rather than giving up after one fixed
+        window: confirmed live that the overlay's own trigger can appear
+        well past any window that seemed generous in testing (a real
+        observed case: still not present a full 20s after session start,
+        and the overlay DID show up on screen after that). Never raises
+        out to the event loop's default task-exception logging: a page-
+        closed/navigated-away BrowserError here is routine (the operator
+        disconnected or switched sites while this was still watching),
+        not a real error."""
+        logger.debug("Audio-unlock overlay watcher started for %s", self.url)
+        try:
+            while self._attached:
+                clicked = await click_element_if_present(
+                    page, ".id-play-button-container", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S,
+                )
+                if not clicked:
+                    continue
+                # A dispatched click is not proof it did anything --
+                # confirmed live in KiwiSDR's own JS: a receiver with
+                # cfg.require_id set renders this exact overlay class
+                # with onclick='' (an identification text field takes
+                # its place instead) until the operator types something
+                # in, so clicking it is a genuine no-op. Only trust
+                # success once a re-probe confirms the overlay is
+                # actually gone -- KiwiSDR's own fade-out
+                # (w3_opacity(...,0) then w3_hide() 1100ms later) needs
+                # a moment to finish first.
+                await asyncio.sleep(AUDIO_UNLOCK_OVERLAY_FADE_S)
+                if await element_is_present(page, ".id-play-button-container"):
+                    logger.debug(
+                        "Audio-unlock overlay at %s still present after being clicked "
+                        "(likely a require_id receiver -- the operator needs to enter an "
+                        "ID/callsign on the page itself); will keep watching", self.url,
+                    )
+                    continue
+                logger.info("Audio-unlock overlay clicked at %s", self.url)
+                return
+            logger.debug("Audio-unlock overlay watcher stopped (no longer attached) at %s", self.url)
+        except asyncio.CancelledError:
+            raise
+        except PlaywrightError as e:
+            logger.debug("Audio-unlock overlay watcher stopped early (non-fatal): %s", e)
 
     # ------------------------------------------------------------------
     async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
@@ -402,6 +522,9 @@ class KiwiSDRDriver:
             return WebSDRStatus(connected=False, last_error=self._combined_error())
 
     async def close(self) -> None:
+        if self._audio_unlock_task is not None:
+            self._audio_unlock_task.cancel()
+            self._audio_unlock_task = None
         self._attached = False
         self._page = None
 

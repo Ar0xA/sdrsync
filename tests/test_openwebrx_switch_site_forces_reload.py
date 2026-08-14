@@ -28,6 +28,14 @@ class StubPage:
             raise BrowserError(f"not a function source (would be a real JS TypeError): {js!r}")
         if "window.location.href" in js:
             return self.current_url
+        # click_element_if_present()'s selector probe -- no audio-unlock
+        # overlay exists on this synthetic page, so report "not present"
+        # rather than falling through to the _READY_PREDICATE branch
+        # below (which would return a bool, not a rect-or-None, and this
+        # stub's `.mouse = self` has no `.click()` either -- neither of
+        # which this test is actually about).
+        if "querySelector" in js:
+            return None
         # _READY_PREDICATE: whatever page is loaded is a ready OpenWebRX.
         return self.ready
 
@@ -39,6 +47,9 @@ class StubPage:
         return None
 
     def on(self, event, handler):
+        return None
+
+    async def click(self, x, y):
         return None
 
 

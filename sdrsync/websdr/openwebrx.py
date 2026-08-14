@@ -42,12 +42,15 @@ fingerprint/structure against two other instances on different versions):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import sys
 from typing import Optional
 
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
+from sdrsync.websdr.browser_shim import click_element_if_present, element_is_present
 
 from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, same_site
 
@@ -55,6 +58,17 @@ logger = logging.getLogger("sdrsync.websdr.openwebrx")
 
 LOAD_TIMEOUT_MS = 15000
 FREQ_VERIFY_TOLERANCE_HZ = 10
+# Per-attempt timeout for _watch_for_audio_unlock_overlay()'s retry loop,
+# NOT a total give-up deadline -- see kiwisdr.py's identical constant for
+# the full reasoning (confirmed live there that even a generous one-shot
+# 20s window wasn't always enough; treated the same way here since this
+# is the same class of watcher).
+AUDIO_UNLOCK_WATCH_ATTEMPT_S = 5.0
+# Settle time after a click before re-probing to confirm the overlay
+# actually went away -- see kiwisdr.py's identical constant. OpenWebRX's
+# own hideOverlay() fades it out via a CSS transition rather than
+# removing it instantly.
+AUDIO_UNLOCK_OVERLAY_FADE_S = 1.2
 
 # hamlib mode name -> OpenWebRX modulation string. Confirmed live via
 # Modes.getModes() that these carry no narrow/wide suffix convention (unlike
@@ -156,9 +170,10 @@ class OpenWebRXDriver:
     # ambiguous.
     CW_VARIANT_IS_AMBIGUOUS = True
 
-    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+    def __init__(self, url: str, cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True) -> None:
         self.url = url
         self.cw_offset_hz = cw_offset_hz
+        self._auto_click_audio_unlock = auto_click_audio_unlock
 
         self._page: Optional[Page] = None
         self._current_mode: Optional[str] = None
@@ -184,6 +199,10 @@ class OpenWebRXDriver:
         # of every poll tick the engine retries set_mode() -- same
         # rate-limiting pattern as _last_out_of_range_key above.
         self._last_unmapped_mode: Optional[str] = None
+        # Background audio-unlock watcher (see attach()) -- tracked so
+        # close() can cancel a still-pending one rather than leaving it
+        # running against a page this driver no longer owns.
+        self._audio_unlock_task: Optional[asyncio.Task] = None
 
     @property
     def attached(self) -> bool:
@@ -218,6 +237,42 @@ class OpenWebRXDriver:
             if not already_ready:
                 await page.goto(self.url, timeout=LOAD_TIMEOUT_MS)
                 await page.wait_for_function(_READY_PREDICATE, timeout=LOAD_TIMEOUT_MS)
+                # Best-effort audio unlock, fresh-navigation only (not on
+                # a reattach reusing an already-ready page -- the overlay
+                # only ever appears once per real page load, so watching
+                # for it there too would just be wasted work on every
+                # profile-switch reattach). Confirmed live in OpenWebRX's
+                # own JS: AudioEngine only starts once its AudioContext
+                # reaches "running", which on WebKitGTK (a native, non-
+                # WSL2 Linux desktop -- confirmed live) doesn't happen on
+                # its own; the page shows #openwebrx-autoplay-overlay
+                # (click -> audioEngine.resume()) whenever
+                # audioEngine.isAllowed() (== audioContext.state ===
+                # 'running') is false at page-init, and nothing else on
+                # the page ever calls resume() itself.
+                #
+                # Run as a background task, NOT awaited here -- same
+                # reasoning as kiwisdr.py's identical watcher: confirmed
+                # live (for KiwiSDR; treated the same way here) that the
+                # overlay's own trigger can fire well after this point, so
+                # awaiting it inline would either miss a late-appearing
+                # overlay or make attach() hang around for it. A previous
+                # still-pending watcher is cancelled first.
+                #
+                # Skipped entirely on Windows, not just left to no-op:
+                # confirmed from OpenWebRX's own source (isAllowed() above)
+                # that this overlay is gated on the exact same
+                # AudioContext.state check ensure_webview_backend()
+                # (browser/backend.py) already guarantees "running" for
+                # via --autoplay-policy=no-user-gesture-required -- so the
+                # overlay provably never renders there, and watching for
+                # one that can never appear would only ever be wasted work
+                # on Windows (v2.2.6 behavior confirmed working there;
+                # this must not regress it).
+                if self._audio_unlock_task is not None:
+                    self._audio_unlock_task.cancel()
+                if sys.platform != "win32" and self._auto_click_audio_unlock:
+                    self._audio_unlock_task = asyncio.create_task(self._watch_for_audio_unlock_overlay(page))
         except PlaywrightError as e:
             self._last_attach_error = (
                 f"Page at {self.url} did not behave like a compatible OpenWebRX "
@@ -236,6 +291,48 @@ class OpenWebRXDriver:
         self._last_tune_error = None
         self._last_mode_error = None
         self._last_unmapped_mode = None
+
+    async def _watch_for_audio_unlock_overlay(self, page: Page) -> None:
+        """Background task launched from attach() -- see its own comment
+        for why this isn't just awaited inline. Loops in
+        AUDIO_UNLOCK_WATCH_ATTEMPT_S-sized attempts for as long as this
+        driver stays attached (bounded only by close()/a reattach
+        cancelling this task) -- see kiwisdr.py's identical watcher for why
+        a single fixed window isn't reliable enough. Never raises out to
+        the event loop's default task-exception logging: a page-closed/
+        navigated-away BrowserError here is routine (the operator
+        disconnected or switched sites while this was still watching), not
+        a real error."""
+        try:
+            while self._attached:
+                clicked = await click_element_if_present(
+                    page, "#openwebrx-autoplay-overlay", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S,
+                )
+                if not clicked:
+                    continue
+                # A dispatched click is not proof it did anything -- see
+                # kiwisdr.py's identical watcher (confirmed live there
+                # for a receiver requiring an operator-typed ID first;
+                # applied here too since it's the same click-doesn't-
+                # guarantee-effect risk, even though not specifically
+                # confirmed on an OpenWebRX instance). Only trust success
+                # once a re-probe confirms the overlay is actually gone
+                # -- OpenWebRX's own hideOverlay() fades it out via a CSS
+                # transition rather than removing it instantly.
+                await asyncio.sleep(AUDIO_UNLOCK_OVERLAY_FADE_S)
+                if await element_is_present(page, "#openwebrx-autoplay-overlay"):
+                    logger.debug(
+                        "Audio-unlock overlay at %s still present after being clicked; "
+                        "will keep watching", self.url,
+                    )
+                    continue
+                logger.info("Audio-unlock overlay clicked at %s", self.url)
+                return
+            logger.debug("Audio-unlock overlay watcher stopped (no longer attached) at %s", self.url)
+        except asyncio.CancelledError:
+            raise
+        except PlaywrightError as e:
+            logger.debug("Audio-unlock overlay watcher stopped early (non-fatal): %s", e)
 
     # ------------------------------------------------------------------
     async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
@@ -532,6 +629,9 @@ class OpenWebRXDriver:
             return WebSDRStatus(connected=False, last_error=self._combined_error())
 
     async def close(self) -> None:
+        if self._audio_unlock_task is not None:
+            self._audio_unlock_task.cancel()
+            self._audio_unlock_task = None
         self._attached = False
         self._page = None
 

@@ -24,7 +24,7 @@ from sdrsync.websdr.base import WebSDRStatus
 class StubDriver:
     CW_VARIANT_IS_AMBIGUOUS = True
 
-    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+    def __init__(self, url: str, cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True) -> None:
         self.url = url
         self.attached = True
         self.closed = False
@@ -603,8 +603,8 @@ class GatedDriver(StubDriver):
     inside its own 'await old_driver.close()' step, the exact race window
     the post-await generation re-check guards against."""
 
-    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
-        super().__init__(url, cw_offset_hz)
+    def __init__(self, url: str, cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True) -> None:
+        super().__init__(url, cw_offset_hz, auto_click_audio_unlock)
         self.on_close = None
 
     async def close(self) -> None:
@@ -676,7 +676,9 @@ class ScriptedAttachDriver:
 
     CW_VARIANT_IS_AMBIGUOUS = True
 
-    def __init__(self, url: str = "http://a.invalid/", cw_offset_hz: int = 0) -> None:
+    def __init__(
+        self, url: str = "http://a.invalid/", cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True,
+    ) -> None:
         self.url = url
         self.attached = False
         self.attach_calls = 0

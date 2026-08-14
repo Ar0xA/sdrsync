@@ -128,6 +128,127 @@ class PageLike(Protocol):
     mouse: Any  # .click(x: int, y: int) -> Awaitable[None]
 
 
+# Default polling budget for click_element_if_present() below, used for a
+# caller that awaits it synchronously (a longer default would delay
+# attach() itself). KiwiSDR/OpenWebRX's audio-unlock overlays are each
+# gated behind THEIR OWN page-internal trigger (confirmed live: KiwiSDR's
+# is a WebSocket "camp" message handler / early UI-init call, not simply
+# tied to page load or ws_snd/demodulator readiness) -- confirmed live
+# that this can fire well after both of those are ready, so a caller that
+# actually needs to catch a late-appearing overlay should pass an
+# explicit, longer timeout_s rather than relying on this default.
+CLICK_ELEMENT_POLL_TIMEOUT_S = 2.0
+CLICK_ELEMENT_POLL_INTERVAL_S = 0.2
+
+
+_VISIBLE_HITTESTABLE_CENTER_JS = (
+    "(sel) => { "
+    "const candidates = document.querySelectorAll(sel); "
+    "for (const el of candidates) { "
+    "const r = el.getBoundingClientRect(); "
+    "if (r.width === 0 || r.height === 0) continue; "
+    "const s = getComputedStyle(el); "
+    "if (s.display === 'none' || s.visibility === 'hidden') continue; "
+    "const cx = r.x + r.width / 2, cy = r.y + r.height / 2; "
+    # A matching element can exist, have a non-zero rect, and still not
+    # be what a real click at its own center would actually hit -- e.g.
+    # a hidden mobile/compact layout duplicate positioned off-screen-
+    # but-technically-laid-out, or something else (higher z-index, an
+    # overlay) actually covering it. Confirmed live as a real cause of
+    # clicks landing on the wrong control entirely. elementFromPoint()
+    # is the authoritative "what would a click here actually hit" check
+    # -- skip any candidate that fails it rather than trusting the rect
+    # alone.
+    "if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) continue; "
+    "const hit = document.elementFromPoint(cx, cy); "
+    "if (!hit || !el.contains(hit) && hit !== el) continue; "
+    "return {x: cx, y: cy, "
+    "rectX: r.x, rectY: r.y, rectW: r.width, rectH: r.height, "
+    "innerW: window.innerWidth, innerH: window.innerHeight, "
+    "dpr: window.devicePixelRatio}; "
+    "} "
+    "return null; }"
+)
+
+
+async def element_is_present(page: "PageLike", selector: str) -> bool:
+    """One-shot, no polling, no click: True if a visible, hit-testable
+    element matching `selector` exists right now. Exists to let a caller
+    verify a click actually had an effect (the element is now gone)
+    rather than trusting that dispatching a click is proof it worked --
+    confirmed live as a real gap: KiwiSDR's own audio-unlock overlay
+    renders with a no-op onclick='' when the receiver requires an
+    operator-typed ID first (cfg.require_id), so click_element_if_present
+    happily "succeeds" at clicking something that does nothing."""
+    try:
+        rect = await page.evaluate(_VISIBLE_HITTESTABLE_CENTER_JS, selector)
+    except BrowserError:
+        return False
+    return rect is not None
+
+
+async def click_element_if_present(
+    page: "PageLike", selector: str, *, timeout_s: float = CLICK_ELEMENT_POLL_TIMEOUT_S,
+) -> bool:
+    """Best-effort: if a visible element matching `selector` exists within
+    timeout_s, sends a REAL OS-level click (via page.mouse.click -- see
+    WxPageAdapter._simulate_click's own docstring for why a real click is
+    required: WebKitGTK/Chromium both reject a JS-dispatched click as an
+    untrusted gesture) at its center and returns True. Returns False if no
+    such element ever appears in time (e.g. the page's own audio was never
+    gated in the first place -- confirmed live on Windows/WebView2, where
+    sdrsync's own --autoplay-policy flag means KiwiSDR/OpenWebRX's audio-
+    unlock overlays never even render).
+
+    True here means "a click was dispatched at the element", NOT "the
+    click had the intended effect" -- see element_is_present()'s own
+    docstring for a real, confirmed case where those differ.
+
+    Exists because some WebSDR pages tie their OWN audio-unlock
+    (AudioContext.resume()) specifically to a click on ONE particular
+    on-page element, not just any trusted click anywhere (unlike
+    websdr_org.py's driver-side corner-click) -- e.g. KiwiSDR's
+    #id-play-button-container, OpenWebRX's #openwebrx-autoplay-overlay."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            rect = await page.evaluate(_VISIBLE_HITTESTABLE_CENTER_JS, selector)
+        except BrowserError as e:
+            logger.debug("click_element_if_present(%r) probe failed: %s", selector, e)
+            rect = None
+        if rect is not None:
+            # Scale CSS-pixel coordinates by devicePixelRatio before
+            # handing them to page.mouse.click() -- confirmed live (on a
+            # display where devicePixelRatio != 1.0) that wx's own
+            # ClientToScreen()/UIActionSimulator coordinate space is NOT
+            # the same as the browser's CSS-pixel space, and the
+            # resulting error grows with distance from the viewport
+            # origin: invisible on a large, centrally-placed target
+            # (KiwiSDR's/OpenWebRX's full-viewport overlays, or
+            # UberSDR's wide .start__go button) but enough to land on a
+            # completely different, neighboring control for a small
+            # target further from the origin (a topbar icon button).
+            dpr = rect.get("dpr") or 1.0
+            click_x, click_y = round(rect["x"] * dpr), round(rect["y"] * dpr)
+            logger.debug(
+                "click_element_if_present(%r) found element -- %r -- clicking at (%d, %d) (dpr=%s)",
+                selector, rect, click_x, click_y, dpr,
+            )
+            # Best-effort per this function's whole contract -- a click
+            # failure here (e.g. the page navigated away between the probe
+            # and the click) must not raise out and be mistaken by a
+            # caller's own try/except BrowserError for a real attach
+            # failure.
+            try:
+                await page.mouse.click(click_x, click_y)
+            except BrowserError as e:
+                logger.debug("click_element_if_present(%r) click itself failed: %s", selector, e)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(CLICK_ELEMENT_POLL_INTERVAL_S)
+
+
 def _parse_js_result(raw: str) -> Any:
     if raw == "undefined":
         return None

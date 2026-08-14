@@ -67,6 +67,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
+from sdrsync.websdr.browser_shim import click_element_if_present
 
 from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, same_site
 
@@ -84,6 +85,22 @@ CALL_POLL_S = 0.05
 # _start_audio for why a failure there must not fail the attach.
 AUDIO_START_ATTEMPTS = 2
 AUDIO_START_WAIT_S = 1.5
+# Brief settle time before the Stop->Listen cycle starts looking for the
+# topbar toggle, in case it hasn't mounted yet the instant session.running
+# flips true. Originally set much longer (3s) on the assumption the page's
+# own UI needed more time to settle -- turned out the real cause of the
+# clicks not working was wrong click coordinates (see
+# click_element_if_present's devicePixelRatio scaling in browser_shim.py),
+# confirmed live once that was fixed, so this only needs to be a short
+# safety margin now, not a workaround.
+AUDIO_UNLOCK_SETTLE_S = 1.0
+# User-confirmed live: even one manual Stop->Listen right after Start
+# sometimes wasn't enough -- a second toggle was needed.
+AUDIO_UNLOCK_CYCLE_ATTEMPTS = 2
+# Per-click timeout for _try_stop_listen_cycle()'s three
+# click_element_if_present() calls (Stop, Listen, and the .start__go
+# recovery fallback).
+AUDIO_UNLOCK_WATCH_ATTEMPT_S = 5.0
 # How long a reattach waits for the page already loaded to answer before deciding
 # it needs reloading. Short: a page that is still the right page answers in the
 # time it takes to dispatch an event, and the only cost of being wrong here is one
@@ -419,9 +436,15 @@ class UberSDRDriver:
     # mode.
     CW_VARIANT_IS_AMBIGUOUS = False
 
-    def __init__(self, url: str, cw_offset_hz: int = 0) -> None:
+    def __init__(self, url: str, cw_offset_hz: int = 0, auto_click_audio_unlock: bool = True) -> None:
         self.url = v2_page_url(url)
         self.cw_offset_hz = cw_offset_hz
+        # Gates only the EXTRA Stop->Listen cycle below (a Linux/WebKitGTK-
+        # specific workaround) -- NOT the initial Start-button click above
+        # it, which is UberSDR's own universal requirement on every
+        # platform (the receiver refuses power{on:true} without a real
+        # gesture regardless of OS) and predates this setting.
+        self._auto_click_audio_unlock = auto_click_audio_unlock
 
         self._page: Optional[Page] = None
         self._attached = False
@@ -639,8 +662,14 @@ class UberSDRDriver:
         """
         for attempt in range(AUDIO_START_ATTEMPTS):
             if await self._running():
-                self._audio_started = True
-                return
+                # NOT an early return: session.running here is a false
+                # positive for "audio is actually playing" (confirmed
+                # live -- it flips true on the very first Start click,
+                # before any of this method's own click loop even
+                # finishes), so falling through to the Stop->Listen cycle
+                # below is required, not skippable, once this becomes
+                # true.
+                break
             try:
                 box = await self._page.evaluate(
                     "() => { var b = document.querySelector('.start__go');"
@@ -674,6 +703,75 @@ class UberSDRDriver:
                 "(the page's Start button did not take). Frequency and mode sync are "
                 "unaffected.", self.url,
             )
+
+        # EXPERIMENTAL, being live-verified: user-confirmed that a manual
+        # Stop -> Listen cycle (the topbar's power toggle, title=
+        # "Stop listening"/"Start listening" depending on state -- same
+        # button, no distinguishing class) reliably unlocks audio even
+        # when the initial Start click above did not -- because
+        # session.running goes true on the FIRST click already (a false
+        # positive for "audio is playing", confirmed live), self._audio_started
+        # above is not trustworthy as a gate here, so this always runs.
+        # A JS .click() version of this (tried first) did not produce
+        # audio, confirming Stop/Listen need the same real OS-level
+        # trusted click the initial Start click above already uses (see
+        # browser_shim.py's click_element_if_present, shared with the
+        # other three drivers).
+        #
+        # Two cycles, not one: user-confirmed live that even a single
+        # manual Stop->Listen right after Start sometimes wasn't enough
+        # either -- a SECOND toggle was needed. No DOM-level "the
+        # waterfall has started painting" signal was found to wait on
+        # instead (the drawing is done via low-level canvas calls, not a
+        # boolean flag), so this is a best-effort generous delay before
+        # the first attempt rather than a precise readiness check.
+        #
+        # Only up to AUDIO_UNLOCK_CYCLE_ATTEMPTS passes, not an unbounded
+        # retry loop: a real receiver-side power off/on has its own side
+        # effects (e.g. band/profile selection), so this must not keep
+        # repeating itself indefinitely.
+        if not self._auto_click_audio_unlock:
+            return
+        await asyncio.sleep(AUDIO_UNLOCK_SETTLE_S)
+        for cycle in range(AUDIO_UNLOCK_CYCLE_ATTEMPTS):
+            if await self._try_stop_listen_cycle():
+                logger.info("Audio unlocked (Stop -> Listen cycle %d) at %s", cycle + 1, self.url)
+                return
+
+    async def _try_stop_listen_cycle(self) -> bool:
+        """One Stop->Listen pass. True if session.running was confirmed
+        after it (still just a proxy -- see _start_audio's own docstring
+        on why session.running alone doesn't mean audio is truly
+        playing).
+
+        Once Stop is clicked, this must not return with the receiver left
+        powered off -- confirmed live (bug hunt) that if the topbar
+        Listen control isn't found/hit-testable in time, the page has
+        likely fallen back to its own full-viewport .start__go overlay
+        (covering the topbar entirely, which is exactly why
+        click_element_if_present's elementFromPoint check correctly
+        refuses to click a covered Listen button) -- so on that path,
+        recover via THAT overlay instead of leaving the session stopped,
+        which is worse than not having touched it at all."""
+        clicked_stop = await click_element_if_present(self._page, '[title="Stop listening"]', timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S)
+        logger.info("Stop->Listen cycle at %s: Stop click found=%s", self.url, clicked_stop)
+        if not clicked_stop:
+            return False
+        await asyncio.sleep(AUDIO_START_WAIT_S)
+        clicked_listen = await click_element_if_present(self._page, '[title="Start listening"]', timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S)
+        logger.info("Stop->Listen cycle at %s: Listen click found=%s", self.url, clicked_listen)
+        if not clicked_listen:
+            recovered = await click_element_if_present(self._page, ".start__go", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S)
+            logger.info(
+                "Stop->Listen cycle at %s: Listen not found, recovery via .start__go=%s",
+                self.url, recovered,
+            )
+            if not recovered:
+                return False
+        await asyncio.sleep(AUDIO_START_WAIT_S)
+        self._audio_started = await self._running()
+        logger.info("Stop->Listen cycle at %s: audio_started=%s", self.url, self._audio_started)
+        return self._audio_started
 
     async def _running(self) -> bool:
         session = await self._topic("session")

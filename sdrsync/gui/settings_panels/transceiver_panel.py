@@ -85,7 +85,11 @@ class TransceiverPanel(wx.Panel):
 
         self.port_entry = wx.SpinCtrl(self, min=1, max=65535)
         self.port_entry.SetFont(value_font())
-        row1.Add(field("Port", self.port_entry), 1, wx.EXPAND)
+        port_box = wx.BoxSizer(wx.VERTICAL)
+        self.port_label = _labeled(self, "Port")
+        port_box.Add(self.port_label, 0, wx.BOTTOM, self.FromDIP(5))
+        port_box.Add(self.port_entry, 0, wx.EXPAND)
+        row1.Add(port_box, 1, wx.EXPAND)
         # Populate BEFORE binding change handlers -- SetValue() fires
         # EVT_TEXT/EVT_SPINCTRL immediately, and binding first meant the
         # host field's SetValue() read the port field's still-default
@@ -130,6 +134,12 @@ class TransceiverPanel(wx.Panel):
         btn_box = wx.BoxSizer(wx.HORIZONTAL)
         self.test_btn = FlatButton(self, "Test")
         self.connect_btn = FlatButton(self, "Connect", is_primary=True)
+        # Match the WebSDR strip's own Connect/Disconnect button look
+        # (user-reported: they read as different background colours,
+        # since this panel's own background is BG but the strip's is
+        # SURFACE, and a FlatButton with no fill just blends into
+        # whichever panel hosts it) rather than this panel's BG.
+        self.connect_btn.set_bg_override(theme.SURFACE)
         self.test_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_test and self.on_test())
         self.connect_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_connect and self.on_connect())
         btn_box.Add(self.test_btn, 0, wx.RIGHT, self.FromDIP(9))
@@ -200,7 +210,13 @@ class TransceiverPanel(wx.Panel):
             label = "Disconnect" if active else "Connect"
         self.connect_btn.SetLabel(label)
         self.connect_btn.Enable(busy_label is None)
+        # Gold (primary) at rest for Connect, reddish (danger) at rest
+        # for Disconnect (user-reported preference -- previously
+        # Disconnect flipped to the plain grey/BORDER style, only
+        # visually gold transiently on hover). Hover/press feedback
+        # stays the universal gold either way, unchanged.
         self.connect_btn.SetPrimary(not active)
+        self.connect_btn.SetDanger(active)
         editable = not active
         self.backend_choice.Enable(editable)
         self.port_entry.Enable(editable)
@@ -231,6 +247,14 @@ class TransceiverPanel(wx.Panel):
         # with the wrong backend's value before port_entry.SetValue() ever
         # gets a chance to correct it (confirmed live: switching flrig ->
         # rigctld left rigctld_port holding flrig's port instead of 4532).
+        # flrig's port is an XML-RPC endpoint, not rigctld's plain TCP
+        # port -- labeling it "Port" the same as rigctld's reads as if
+        # it's the same kind of thing, which it isn't (user-reported).
+        port_label_text = "XML-RPC Port" if backend == "flrig" else "Port"
+        if self.port_label.GetLabel() != theme.caps(port_label_text):
+            self.port_label.SetLabel(theme.caps(port_label_text))
+            self.Layout()
+
         self._populating_host_port = True
         try:
             if backend == "flrig":

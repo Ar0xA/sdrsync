@@ -16,6 +16,8 @@ sites in app.py.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import wx
 
 from . import theme
@@ -31,6 +33,15 @@ class _OwnerDrawnMixin:
         self._hover = False
         self._pressed = False
         self._checked = False
+        # Normally None: _on_paint() clears to the immediate parent's own
+        # background colour, so the control blends into whatever panel
+        # hosts it. Some call sites want a control to look identical
+        # regardless of which panel it happens to live in instead (e.g.
+        # TransceiverPanel's Connect/Disconnect button matching the
+        # WebSDR strip's Connect/Disconnect button -- user-reported: the
+        # two read as different background colours purely because their
+        # parent panels use different background tokens, BG vs SURFACE).
+        self._bg_override: Optional[wx.Colour] = None
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_ERASE_BACKGROUND, lambda evt: None)
@@ -109,9 +120,19 @@ class _OwnerDrawnMixin:
         else:
             evt.Skip()
 
+    def set_bg_override(self, colour: Optional[wx.Colour]) -> None:
+        """Force this control's painted background to `colour` instead of
+        the immediate parent's background colour (pass None to go back to
+        the default blend-with-parent behaviour)."""
+        self._bg_override = colour
+        self.Refresh()
+
     def _on_paint(self, evt: wx.PaintEvent) -> None:
         dc = wx.BufferedPaintDC(self)
-        parent_bg = self.GetParent().GetBackgroundColour() if self.GetParent() else theme.BG
+        if self._bg_override is not None:
+            parent_bg = self._bg_override
+        else:
+            parent_bg = self.GetParent().GetBackgroundColour() if self.GetParent() else theme.BG
         dc.SetBackground(wx.Brush(parent_bg))
         dc.Clear()
         gc = wx.GraphicsContext.Create(dc)
@@ -149,6 +170,14 @@ class FlatButton(_OwnerDrawnMixin, wx.Control):
         self._init_owner_drawn()
         self._label = label
         self.is_primary = is_primary
+        # "Danger" variant (TRANSMIT red border/label at rest) -- added
+        # for Connect/Disconnect buttons' Disconnect state (user-reported:
+        # wanted a persistent reddish look there, distinct from the gold
+        # Connect/Load state, while keeping the universal gold hover/
+        # press feedback unchanged -- "mouse over yellow is fine").
+        # Mutually exclusive with is_primary; is_primary wins if both are
+        # ever set True, since no call site needs both at once.
+        self.is_danger = False
         self.SetFont(value_font())
         self._recompute_min_size()
 
@@ -169,6 +198,20 @@ class FlatButton(_OwnerDrawnMixin, wx.Control):
         self.is_primary = is_primary
         self.Refresh()
 
+    def SetDanger(self, is_danger: bool) -> None:
+        if is_danger == self.is_danger:
+            return
+        self.is_danger = is_danger
+        self.Refresh()
+
+    def _rest_colour(self) -> wx.Colour:
+        """Border/label colour when not hovered/pressed/disabled."""
+        if self.is_primary:
+            return theme.ACCENT
+        if self.is_danger:
+            return theme.TRANSMIT
+        return theme.BORDER
+
     def _recompute_min_size(self) -> None:
         dc = wx.ClientDC(self)
         dc.SetFont(self.GetFont())
@@ -183,9 +226,9 @@ class FlatButton(_OwnerDrawnMixin, wx.Control):
         wx.PostEvent(self, evt)
 
     def _fill_and_border(self):
-        base_border = theme.ACCENT if self.is_primary else theme.BORDER
+        base_border = self._rest_colour()
         if not self.IsEnabled():
-            return theme.with_alpha(base_border, 115), None
+            return theme.with_alpha(base_border, theme.DISABLED_ALPHA), None
         if self._pressed:
             return theme.ACCENT, theme.with_alpha(theme.ACCENT, 41)  # 16%
         if self._hover:
@@ -193,9 +236,14 @@ class FlatButton(_OwnerDrawnMixin, wx.Control):
         return base_border, None
 
     def _text_colour(self):
-        colour = theme.ACCENT_TEXT if self.is_primary else theme.TEXT
+        if self.is_primary:
+            colour = theme.ACCENT_TEXT
+        elif self.is_danger:
+            colour = theme.TRANSMIT
+        else:
+            colour = theme.TEXT
         if not self.IsEnabled():
-            return theme.with_alpha(colour, 115)
+            return theme.with_alpha(colour, theme.DISABLED_ALPHA)
         return colour
 
     def _paint(self, gc: "wx.GraphicsContext", rect: wx.Rect) -> None:
@@ -256,7 +304,7 @@ class ToggleButton(FlatButton):
         else:
             colour = theme.ACCENT_TEXT if self._checked else theme.TEXT
         if not self.IsEnabled():
-            return theme.with_alpha(colour, 115)
+            return theme.with_alpha(colour, theme.DISABLED_ALPHA)
         return colour
 
     def _paint(self, gc: "wx.GraphicsContext", rect: wx.Rect) -> None:
@@ -321,7 +369,7 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
         else:
             colour = theme.TEXT
         if not self.IsEnabled():
-            return theme.with_alpha(colour, 115)
+            return theme.with_alpha(colour, theme.DISABLED_ALPHA)
         return colour
 
     def _recompute_min_size(self) -> None:
@@ -353,12 +401,12 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
             fill = theme.with_alpha(theme.ACCENT_TINT, 255)
             gc.SetBrush(gc.CreateBrush(wx.Brush(fill)))
             gc.FillPath(path)
-        border = theme.with_alpha(theme.BORDER, 115) if not self.IsEnabled() else theme.BORDER
+        border = theme.with_alpha(theme.BORDER, theme.DISABLED_ALPHA) if not self.IsEnabled() else theme.BORDER
         gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(border).Width(1)))
         gc.StrokePath(path)
 
         if self._checked:
-            check_colour = theme.with_alpha(theme.ACCENT, 115) if not self.IsEnabled() else theme.ACCENT
+            check_colour = theme.with_alpha(theme.ACCENT, theme.DISABLED_ALPHA) if not self.IsEnabled() else theme.ACCENT
             gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(check_colour).Width(2)))
             check_path = gc.CreatePath()
             x0, y0 = box * 0.22, box_y + box * 0.52

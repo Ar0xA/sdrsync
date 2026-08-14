@@ -13,8 +13,21 @@ import wx
 BG = wx.Colour(0xF3, 0xF2, 0xF2)
 SURFACE = wx.Colour(0xEA, 0xE9, 0xE9)
 TEXT = wx.Colour(0x20, 0x1F, 0x1D)
-MUTED = wx.Colour(0x7D, 0x79, 0x79)
-FAINT = wx.Colour(0x9B, 0x97, 0x97)
+# Darkened from the original spec §1 values (0x7D7979/0x9B9797) at the
+# user's explicit request, in two rounds -- the first round (MUTED to
+# 0x5C5858, ~6.3:1) fixed the field captions (RX VFO/TX VFO/MODE, every
+# settings-panel label) fine, but FAINT only moved to MUTED's old value
+# (~3.9:1) and was still reported hard to read for site URLs and status/
+# hint text (e.g. "rigctld not reachable until connected") -- both now
+# pushed further. Still grey, not TEXT's near-black, per "doesn't have to
+# be black text, but more contrast".
+MUTED = wx.Colour(0x4A, 0x46, 0x46)  # ~8.4:1 against BG
+FAINT = wx.Colour(0x5C, 0x58, 0x58)  # ~6.3:1 against BG (was MUTED's 1st-round value)
+# Disabled-control opacity (spec §7 was 45%/115 -- also reported hard to
+# read, e.g. the Sites panel's "Edit" button on a non-editable curated
+# site). 63% keeps disabled controls visibly de-emphasized relative to
+# enabled ones while landing at ~4.5:1 contrast (was ~2.7:1 at 45%).
+DISABLED_ALPHA = 160
 DIVIDER = wx.Colour(0xD2, 0xD0, 0xCE)
 BORDER = wx.Colour(0xBA, 0xB6, 0xB6)
 ACCENT = wx.Colour(0xB6, 0x82, 0x35)

@@ -197,6 +197,19 @@ class AppSettings:
     # v2.1.0 silences only v2.1.0; the popup returns the moment a newer
     # release ships.
     dismissed_update_version: Optional[str] = None
+    # Linux/WebKitGTK-only: some WebSDR families gate their own audio
+    # behind a real trusted click on a specific page control (a browser
+    # engine requirement, not something a documented control API can
+    # bypass -- see websdr_org.py's/kiwisdr.py's/openwebrx.py's/
+    # ubersdr.py's own audio-unlock code for the specifics of each).
+    # sdrsync satisfies this by moving the real OS mouse cursor and
+    # clicking (wx.UIActionSimulator) -- default on, since without it
+    # audio silently never starts on Linux, but user-visible/disruptive
+    # enough (it moves your actual mouse) that it's an opt-out, not just
+    # a fait accompli. No effect on Windows/WebView2, which never gates
+    # audio behind a click in the first place (sdrsync's own
+    # --autoplay-policy flag there -- see browser/backend.py).
+    auto_click_audio_unlock: bool = True
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -263,6 +276,7 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "keep_compact_bar_on_top": bool,
     "headless": bool,
     "use_mock_rig": bool,
+    "auto_click_audio_unlock": bool,
     "poll_interval_s": (int, float),
     "reverse_sync_min_hz": (int, type(None)),
     "reverse_sync_max_hz": (int, type(None)),
