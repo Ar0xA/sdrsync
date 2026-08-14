@@ -28,11 +28,11 @@ fingerprint/structure against two other instances on different versions):
         drivers there is NO narrow/wide suffix convention here, so
         map_hamlib_mode_openwebrx() is a plain 1:1 dict.
     toggleMute() -- confirmed live: toggles a UI class on
-        '.openwebrx-mute-button' and drives audioEngine.setVolume(); reused
-        directly (rather than reimplemented) so set_muted() doesn't need to
-        track/restore the pre-mute volume itself -- checking
-        '.openwebrx-mute-button' has class 'muted' before deciding whether
-        to call it makes set_muted() idempotent.
+        '.openwebrx-mute-button' and drives audioEngine.setVolume(). No
+        longer called by sdrsync (v15 moved mute-on-TX to a native,
+        page-independent WebView-level mute -- see browser_shim.py's
+        set_muted()), kept here as a still-true fact about this site's
+        own JS in case it's needed again.
     The demodulator does not exist/start immediately when `ws` opens (the
         page's own init sequence creates it slightly later, gated on
         Modes.initComplete() && center_freq) -- confirmed live via
@@ -498,20 +498,10 @@ class OpenWebRXDriver:
         except PlaywrightError:
             return None
 
-    # ------------------------------------------------------------------
-    async def set_muted(self, muted: bool) -> None:
-        if not self._attached:
-            return
-        try:
-            await self._page.evaluate(
-                "(wantMuted) => { "
-                "var isMuted = $('.openwebrx-mute-button').hasClass('muted'); "
-                "if (wantMuted !== isMuted && typeof toggleMute === 'function') toggleMute(); "
-                "}",
-                muted,
-            )
-        except PlaywrightError as e:
-            logger.debug("toggleMute() call failed (non-fatal): %s", e)
+    # Mute-on-TX is handled natively at the page-adapter level now (v15,
+    # WxPageAdapter.set_muted() in browser_shim.py) -- see its module
+    # comment for why: a native WebView-level mute is instant and site-
+    # independent, unlike this OpenWebRX-specific toggleMute() JS call.
 
     def _reverse_effective_hz(
         self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]

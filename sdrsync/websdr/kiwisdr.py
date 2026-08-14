@@ -438,16 +438,12 @@ class KiwiSDRDriver:
         except PlaywrightError:
             return None
 
-    # ------------------------------------------------------------------
-    async def set_muted(self, muted: bool) -> None:
-        if not self._attached:
-            return
-        try:
-            await self._page.evaluate(
-                "(m) => { if (window.toggle_or_set_mute) window.toggle_or_set_mute(m ? 1 : 0); }", muted
-            )
-        except PlaywrightError as e:
-            logger.debug("toggle_or_set_mute() call failed (non-fatal): %s", e)
+    # Mute-on-TX is handled natively at the page-adapter level now (v15,
+    # WxPageAdapter.set_muted() in browser_shim.py) -- see its module
+    # comment for why: a native WebView-level mute is instant and site-
+    # independent, unlike this KiwiSDR-specific toggle_or_set_mute() JS
+    # call, which added up to ~1s of perceptible lag depending on
+    # KiwiSDR's own mute implementation.
 
     def _reverse_effective_hz(
         self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]

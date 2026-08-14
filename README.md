@@ -97,9 +97,6 @@ control functions. This means:
     frequency outside range is reported clearly (same as an unsupported
     mode: logged, shown in the status bar, frequency/mode sync elsewhere
     unaffected) rather than silently dropped or retried forever.
-  - **OpenWebRX mute-on-TX**: uses the page's own mute toggle
-    (`toggleMute()`), confirmed working live — unlike the other two
-    drivers this one doesn't need a documented no-op fallback here.
   - **UberSDR is the exception to the "call the site's own JS" rule**, and
     the only one that is not reverse-engineered. Its v2 interface publishes
     a documented, versioned control API (`static/v2/BRIDGE_API.md` in the
@@ -122,11 +119,6 @@ control functions. This means:
       width the rig reported. The rig's passband becomes real filter edges
       (2400 Hz on USB → 50–2450 Hz), not a choice between a "narrow" and a
       "wide" mode string.
-    - **Mute-on-TX uses `duck`, not `mute`.** UberSDR separates the
-      operator's own mute setting from transient silence applied by a
-      controller. Using the transient one means sdrsync dying mid-transmission
-      cannot leave somebody's receiver muted for good, and the mute button on
-      their page never shows a state they did not choose.
     - **Only the v2 interface has this API.** Paste the receiver's root URL —
       the address operators publish — and the driver navigates to `/v2/`
       itself, preserving any query string so an UberSDR share link lands
@@ -163,6 +155,28 @@ control functions. This means:
   frequency sync is unaffected — the GUI just shows a message that that one
   mode isn't supported, and resumes silently once you switch to a
   supported one.
+- **Mute on TX** silences the WebSDR's audio the instant your rig keys up
+  (mic, CW, footswitch — anything the rig itself reports as PTT, not just
+  PTT sdrsync commanded), and unmutes on the falling edge. This mutes the
+  whole embedded browser's audio output directly, at the native browser-
+  engine level (`webkit_web_view_set_is_muted()` on Linux, WebView2's
+  `IsMuted` on Windows) — no per-site JavaScript is involved any more, so
+  it's instant and identical across every WebSDR family, rather than
+  depending on each site's own mute implementation. Verified live on
+  Linux; the Windows path uses the same native API but hasn't been
+  live-verified yet.
+- **Rig PTT detection depends on your rig software actually polling it
+  live**, not just tracking commands it issued itself — both `rigctld`
+  and flrig default to this correctly for most modern CAT-capable rigs,
+  but two common misconfigurations silently break it: `rigctld` started
+  with `-P RTS`/`-P DTR` and a separate PTT-only serial port (that only
+  reads back the pin it last set, never the rig's real state — use
+  `-P RIG`, the default for most rigs, instead), and flrig's "PTT on CAT
+  serial port" needs to be **Both** (not just Get or Set) *and* its own
+  "PTT" checkbox in the Polling section needs to be ticked — flrig won't
+  actually query live PTT at all without that second setting, regardless
+  of the CAT setting. See the `[?]` next to **Mute on TX** in the app for
+  the full detail.
 
 ## Install
 

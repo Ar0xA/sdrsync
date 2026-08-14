@@ -2075,23 +2075,27 @@ class SyncEngine:
             last_ptt_before_awaits = self._last_ptt
 
             # See WEBSDR_MIN_WRITE_GAP_S -- computed ONCE per tick, before
-            # anything that writes, and applied uniformly to the PTT-edge
-            # mute AND both forward-push axes below. Recomputing it per
-            # axis would make it three independent floors instead of one
-            # global gate, which is not what a rate limit is.
+            # anything that writes, and applied uniformly to both
+            # forward-push axes below. Mute is NOT gated by this any more
+            # (v15): it's a native WebView-level call (see
+            # browser_shim.py's set_muted()), not a page write, so there's
+            # nothing to rate-limit -- the whole point of the native path
+            # is that it doesn't share the page's own write cadence at
+            # all. Recomputing it per axis would make it two independent
+            # floors instead of one global gate, which is not what a rate
+            # limit is.
             can_write_websdr = time.monotonic() - self._last_websdr_write_at >= WEBSDR_MIN_WRITE_GAP_S
 
-            # _last_ptt is deliberately NOT latched unless the mute call
-            # actually goes out: a PTT edge swallowed by the write gap
-            # must still fire on a later tick, or an unmute could be lost
-            # for the rest of the session (the same failure mode the
-            # falling-edge comment below already guards against).
-            if state.ptt is not None and state.ptt != self._last_ptt and can_write_websdr:
+            # _last_ptt is deliberately NOT latched unless self._page
+            # actually exists: a PTT edge arriving with no page to mute
+            # must still fire once one exists again, or an unmute could
+            # be lost for the rest of the session (the same failure mode
+            # the falling-edge comment below already guards against).
+            if state.ptt is not None and state.ptt != self._last_ptt and self._page is not None:
                 self._last_ptt = state.ptt
                 if state.ptt:
                     if self.settings.mute_on_tx:
-                        await self._driver.set_muted(True)
-                        self._last_websdr_write_at = time.monotonic()
+                        await self._page.set_muted(True)
                 else:
                     # Always unmute on the falling edge, regardless of the
                     # *current* mute_on_tx value -- if the user unchecks
@@ -2101,8 +2105,7 @@ class SyncEngine:
                     # WebSDR muted indefinitely with no further edge ever
                     # able to clear it. Unmuting when not actually muted
                     # is a harmless no-op.
-                    await self._driver.set_muted(False)
-                    self._last_websdr_write_at = time.monotonic()
+                    await self._page.set_muted(False)
 
             transmitting = bool(self._last_ptt)
 
@@ -2163,9 +2166,14 @@ class SyncEngine:
                         # otherwise be wrongly recorded as delivered, silencing
                         # all further retries even after the WebSDR recovers.
                         # self._driver can turn None here -- a concurrent
-                        # _stop_websdr()/_switch_websdr() can run during the
-                        # PTT-mute await earlier this same tick -- so this is
-                        # a genuine no-op, not just "not attached yet".
+                        # _stop_websdr()/_switch_websdr() can run during one
+                        # of the several real awaits earlier this same tick
+                        # (get_state(), _idle_disconnect_if_due(),
+                        # _resume_websdr_after_idle() -- NOT the PTT-mute
+                        # call any more: WxPageAdapter.set_muted() is v15
+                        # fire-and-forget, no await inside it, so it can't
+                        # itself be the suspension point) -- so this is a
+                        # genuine no-op, not just "not attached yet".
                         if self._driver is not None:
                             applied = await self._driver.set_mode(state.mode, state.passband_hz)
                         else:

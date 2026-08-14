@@ -24,8 +24,10 @@ def same_site(current_url: str, expected_url: str) -> bool:
     _READY_PREDICATE, UberSDR's agent handshake) passes against ANY live
     instance of that software, not specifically the one just switched to
     -- so attach() would silently skip navigation and every subsequent
-    tune/mode/mute call would keep controlling the previous site while the
-    GUI shows the new one selected."""
+    tune/mode call would keep controlling the previous site while the
+    GUI shows the new one selected. (Mute-on-TX itself is unaffected by
+    this specific check since v15 -- it's a native, page-independent
+    WebView-level mute, not a per-site call.)"""
     a, b = urlsplit(current_url), urlsplit(expected_url)
     return (a.scheme, a.netloc, a.path.rstrip("/")) == (b.scheme, b.netloc, b.path.rstrip("/"))
 
@@ -78,7 +80,7 @@ class WebSDRDriver(Protocol):
     def attached(self) -> bool:
         """True once attach() has fully succeeded and stayed healthy since.
 
-        tune_hz/set_mode/set_muted/get_status must all be safe no-ops while
+        tune_hz/set_mode/get_status must all be safe no-ops while
         this is False, so a caller can keep polling other things (e.g. the
         rig) concurrently with an attach-retry loop without special-casing
         "not attached yet" itself."""
@@ -115,10 +117,6 @@ class WebSDRDriver(Protocol):
 
         Returns True only if actually applied to the page -- see
         tune_hz()'s docstring for why callers must gate on this."""
-        ...
-
-    async def set_muted(self, muted: bool) -> None:
-        """Mute/unmute the WebSDR's audio (used to silence RX audio while the rig is transmitting)."""
         ...
 
     async def get_status(self) -> WebSDRStatus:

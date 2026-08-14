@@ -96,6 +96,219 @@ else:
 _FUNC_RE = re.compile(r"^\s*(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>|^\s*(async\s+)?function\b")
 
 
+# ---------------------------------------------------------------------------
+# Native audio mute -- mutes the WHOLE WebView's audio output at the browser
+# engine level, with zero page interaction. Replaces the old approach of
+# calling each WebSDR site's own JS mute function (e.g. KiwiSDR's
+# toggle_or_set_mute()): that depended on whatever that specific site chose
+# to implement "mute" as, confirmed live to add up to ~1s of perceptible
+# lag on every one of the four site families -- inherent to relying on 4
+# independently-written, unverified third-party JS implementations rather
+# than something sdrsync controls directly.
+#
+# Both wx.html2 backends have a real native "mute this webview" API, just
+# not exposed through wx's own cross-platform WebView class -- reached here
+# via GetNativeBackend()'s raw pointer (confirmed: GTK returns a real
+# WebKitWebView*, MSW an ICoreWebView2* -- both per wxWidgets' own C++
+# source, src/gtk/webview_webkit2.cpp and src/msw/webview_edge.cpp).
+#
+#   - GTK/WebKitGTK: webkit_web_view_set_is_muted() -- a plain native C
+#     function, called via ctypes against libwebkit2gtk directly (no new
+#     dependency). VERIFIED LIVE on this machine: a standalone round-trip
+#     test (set muted -> get_is_muted() reflects it -> unset -> reflects
+#     that too) passed exactly as expected.
+#   - MSW/Edge WebView2: ICoreWebView2_8.IsMuted, a COM property. NOT
+#     live-verified -- no Windows access in this environment. Reached via
+#     raw vtable-slot indexing (manual QueryInterface + a direct call at a
+#     fixed slot offset, deliberately NOT using comtypes' higher-level
+#     interface-class machinery, which still requires knowing this same
+#     slot count and additionally risks a reference-counting mismatch
+#     against wx's own owned WebView2 reference). The slot offset was
+#     computed from Microsoft's own shipped WebView2.h (extracted from the
+#     real Microsoft.Web.WebView2 NuGet package, not a third-party binding
+#     -- an initial attempt using a third-party Go binding's vtable struct
+#     was caught to be wrong: it embedded only IUnknown ahead of
+#     ICoreWebView2_8's own methods, omitting the entire real
+#     ICoreWebView2 -> _7 inheritance chain that precedes them in memory,
+#     which would have called through a garbage function pointer).
+#     IUnknown ABI (QueryInterface/AddRef/Release at slots 0/1/2) is
+#     universal across every COM interface and not itself at risk.
+#     Slot arithmetic (own method counts, in real header declaration
+#     order, each cross-checked against Microsoft Learn's own docs page
+#     for that interface):
+#       IUnknown............................  3
+#       ICoreWebView2 (base)................ 58
+#       ICoreWebView2_2......................  7
+#       ICoreWebView2_3......................  5
+#       ICoreWebView2_4......................  4
+#       ICoreWebView2_5......................  2
+#       ICoreWebView2_6......................  1
+#       ICoreWebView2_7......................  1
+#                                     subtotal = 81
+#       ICoreWebView2_8's own, in order: add_IsMutedChanged(+0),
+#       remove_IsMutedChanged(+1), get_IsMuted(+2), put_IsMuted(+3)
+#                                  PutIsMuted slot = 84
+#     Needs real Windows testing before being trusted in place of the old
+#     per-site JS mute -- a wrong slot here is a genuine crash risk (an
+#     arbitrary function-pointer call), not a caught exception, which is
+#     exactly why every call below is wrapped and why this whole block is
+#     documented this thoroughly.
+
+# Candidate WebKitGTK sonames, in no particular preference order -- see
+# _load_webkit2gtk()'s use of RTLD_NOLOAD below for why order doesn't
+# matter here. A fixed try-order was a real bug caught by a bug-hunter
+# review pass: wx.html2's actual WebKitGTK backend version is a
+# distro/package matter, not something this module controls, and a
+# distro that links wx against 4.0 (confirmed real: Ubuntu 22.04's
+# libwxgtk-webview3.0-gtk3-0v5 depends on libwebkit2gtk-4.0-37, per its
+# own package metadata -- the exact distro CLAUDE.md's own install
+# instructions target) while 4.1 also happens to be installed would have
+# silently loaded the WRONG library and handed it a pointer created by
+# the other one -- WebKitGTK's own GObject type-check guard on
+# set_is_muted() then just logs a GLib CRITICAL and does nothing (no
+# Python exception, so nothing here would have noticed), and cross-
+# library GObject/libsoup version conflicts were reproduced to also hang
+# or abort the whole process in the worst case.
+_WEBKIT2GTK_SONAMES = ("libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.0.so.37")
+_webkit2gtk_lib = None
+_webkit2gtk_load_attempted = False
+
+
+def _load_webkit2gtk():
+    """Only ever returns a library already loaded into THIS process (via
+    RTLD_NOLOAD -- fails instead of loading a fresh, possibly different
+    instance) -- i.e. whichever WebKitGTK wx.html2's own backend already
+    pulled in, never a second, independently-loaded one. Returns None
+    (native mute unavailable, not guessed at) if none of the known
+    sonames are already loaded, rather than risk loading a mismatched
+    library instance."""
+    import ctypes
+    import os
+
+    for soname in _WEBKIT2GTK_SONAMES:
+        try:
+            lib = ctypes.CDLL(soname, mode=os.RTLD_NOLOAD)
+        except OSError:
+            continue
+        lib.webkit_web_view_set_is_muted.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.webkit_web_view_set_is_muted.restype = None
+        lib.webkit_web_view_get_is_muted.argtypes = [ctypes.c_void_p]
+        lib.webkit_web_view_get_is_muted.restype = ctypes.c_int
+        return lib
+    return None
+
+
+def _gtk_native_set_muted(native_ptr: Any, muted: bool) -> bool:
+    """native_ptr is whatever GetNativeBackend() returned (a sip.voidptr
+    wrapping the real WebKitWebView*, confirmed live) -- int() extracts
+    the raw address from it the same way on a plain int, if some other
+    wx build ever returns one directly.
+
+    Verifies via a get_is_muted() readback rather than trusting
+    set_is_muted() blind -- a bug-hunter review pass found that a
+    cross-library pointer mismatch (see _load_webkit2gtk()'s own
+    docstring) makes WebKitGTK's own type-check guard silently no-op the
+    call with no Python-visible signal at all; the readback is what
+    actually distinguishes "muted" from "asked to mute, nothing
+    happened"."""
+    global _webkit2gtk_lib, _webkit2gtk_load_attempted
+    import ctypes
+
+    if not _webkit2gtk_load_attempted:
+        _webkit2gtk_load_attempted = True
+        _webkit2gtk_lib = _load_webkit2gtk()
+        if _webkit2gtk_lib is None:
+            logger.warning(
+                "native audio mute unavailable: none of %s are already loaded in this process",
+                _WEBKIT2GTK_SONAMES,
+            )
+    if _webkit2gtk_lib is None:
+        return False
+    ptr = ctypes.cast(int(native_ptr), ctypes.c_void_p)
+    _webkit2gtk_lib.webkit_web_view_set_is_muted(ptr, 1 if muted else 0)
+    now_muted = bool(_webkit2gtk_lib.webkit_web_view_get_is_muted(ptr))
+    if now_muted != muted:
+        return False
+    return True
+
+
+# See the big comment block above for how this offset was derived and its
+# residual, un-live-tested risk.
+_ICOREWEBVIEW2_8_IID = "E9632730-6E1E-43AB-B7B8-7B2C9E62E094"
+_PUT_IS_MUTED_SLOT = 84
+
+
+def _win32_guid_struct(guid_str: str):
+    import ctypes
+    import uuid
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_uint8 * 8),
+        ]
+
+    return _GUID.from_buffer_copy(uuid.UUID(guid_str).bytes_le)
+
+
+def _win32_vtable_call(obj_ptr: int, slot: int, functype, *args):
+    import ctypes
+
+    vtable_ptr = ctypes.cast(obj_ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+    func_ptr = ctypes.cast(vtable_ptr, ctypes.POINTER(ctypes.c_void_p))[slot]
+    func = ctypes.cast(func_ptr, functype)
+    return func(obj_ptr, *args)
+
+
+def _win32_native_set_muted(native_ptr: Any, muted: bool) -> bool:
+    """See the module-level comment above -- NOT live-verified, no Windows
+    access in this environment. Manually calls QueryInterface for
+    ICoreWebView2_8 (universal IUnknown slot 0) then PutIsMuted at its
+    computed slot, releasing the queried interface afterward (universal
+    IUnknown slot 2) -- entirely manual reference counting, matching real
+    C++ COM usage, rather than trusting an automatic wrapper's lifecycle
+    against a pointer this adapter does not itself own."""
+    import ctypes
+
+    try:
+        obj = int(native_ptr)
+        qi_func = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+        )
+        release_func = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+        put_is_muted_func = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_int)
+
+        iid = _win32_guid_struct(_ICOREWEBVIEW2_8_IID)
+        out = ctypes.c_void_p()
+        hr = _win32_vtable_call(obj, 0, qi_func, ctypes.byref(iid), ctypes.byref(out))
+        if hr < 0 or not out.value:
+            logger.warning(
+                "native WebView2 mute unavailable: QueryInterface(ICoreWebView2_8) failed "
+                "(hr=0x%08x) -- WebView2 Runtime may be older than 1.0.1072.54",
+                hr & 0xFFFFFFFF,
+            )
+            return False
+        try:
+            hr = _win32_vtable_call(out.value, _PUT_IS_MUTED_SLOT, put_is_muted_func, 1 if muted else 0)
+            if hr < 0:
+                logger.warning("native WebView2 mute failed: put_IsMuted returned hr=0x%08x", hr & 0xFFFFFFFF)
+                return False
+            return True
+        finally:
+            _win32_vtable_call(out.value, 2, release_func)
+    except Exception as e:
+        logger.warning("native WebView2 mute failed: %s", e, exc_info=True)
+        return False
+
+
+def _native_set_muted(native_ptr: Any, muted: bool) -> bool:
+    if sys.platform == "win32":
+        return _win32_native_set_muted(native_ptr, muted)
+    return _gtk_native_set_muted(native_ptr, muted)
+
+
 class BrowserError(Exception):
     """Raised for any browser/page-level failure -- the shim's equivalent
     of Playwright's Error, caught the same way (`except BrowserError`)
@@ -124,6 +337,7 @@ class PageLike(Protocol):
     async def goto(self, url: str, timeout: Optional[float] = None) -> None: ...
     async def evaluate(self, js: str, *args: Any) -> Any: ...
     async def wait_for_function(self, js: str, timeout: Optional[float] = None) -> None: ...
+    async def set_muted(self, muted: bool) -> None: ...
     def on(self, event: str, handler: Callable) -> None: ...
     mouse: Any  # .click(x: int, y: int) -> Awaitable[None]
 
@@ -419,6 +633,7 @@ class WxPageAdapter:
         self._console_handlers: list[Callable[[ConsoleMessage], None]] = []
         self._pageerror_handlers: list[Callable[[Exception], None]] = []
         self._warned_no_presenter = False
+        self._native_mute_warned = False
 
         self.mouse = _Mouse(self)
 
@@ -507,6 +722,44 @@ class WxPageAdapter:
         script = f"JSON.stringify(({js})({args_js}))"
         raw = await self._run_script(script)
         return _parse_js_result(raw)
+
+    async def set_muted(self, muted: bool) -> None:
+        """Mutes/unmutes the WHOLE WebView's audio output natively --
+        see the module-level comment above _gtk_native_set_muted() for
+        why this replaced per-site JS mute() calls, and the residual,
+        un-live-tested risk on MSW. Deliberately does NOT await
+        _await_ready()/go through the script-result FIFO queue like
+        evaluate() -- this is the whole point of the native path being
+        fast: no page round-trip to wait on at all, just a same-thread
+        native call once dispatched to the GUI thread. Fire-and-forget
+        from the caller's perspective; does not block on the GUI thread
+        actually running it.
+
+        GetNativeBackend() itself must run inside do_mute(), on the GUI
+        thread, same as every other widget touch in this class -- a real
+        bug caught by a bug-hunter review pass: calling it here instead
+        (on the calling asyncio thread) is exactly the segfault-on-a-
+        destroyed-widget hazard this module's own docstring warns about
+        for RunScriptAsync, and was reproduced live (destroy the WebView,
+        then call GetNativeBackend() from off the GUI thread -> SIGSEGV,
+        no Python exception)."""
+        if not self._alive:
+            return
+
+        def do_mute():
+            if not self._alive:
+                return
+            native = self.webview.GetNativeBackend()
+            if native is None:
+                return
+            if not _native_set_muted(native, muted) and not self._native_mute_warned:
+                self._native_mute_warned = True
+                logger.warning(
+                    "native audio mute unavailable on this platform/WebView build -- "
+                    "TX audio will not be muted"
+                )
+
+        wx.CallAfter(do_mute)
 
     async def wait_for_function(self, js: str, timeout: Optional[float] = None) -> None:
         """timeout is in milliseconds (Playwright convention)."""

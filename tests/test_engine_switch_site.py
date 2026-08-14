@@ -38,9 +38,6 @@ class StubDriver:
     async def set_mode(self, hamlib_mode: str, passband_hz) -> bool:
         return True
 
-    async def set_muted(self, muted: bool) -> None:
-        pass
-
     async def get_status(self) -> WebSDRStatus:
         return WebSDRStatus(connected=True)
 
@@ -68,9 +65,13 @@ class StubPage:
 
     def __init__(self) -> None:
         self.on_dead = None
+        self.mute_calls: list[bool] = []
 
     def set_on_dead(self, on_dead) -> None:
         self.on_dead = on_dead
+
+    async def set_muted(self, muted: bool) -> None:
+        self.mute_calls.append(muted)
 
 
 class StubWebViewHost:
@@ -698,9 +699,6 @@ class ScriptedAttachDriver:
 
     async def set_mode(self, hamlib_mode: str, passband_hz) -> bool:
         return True
-
-    async def set_muted(self, muted: bool) -> None:
-        pass
 
     async def get_status(self) -> WebSDRStatus:
         return WebSDRStatus(connected=self.attached)

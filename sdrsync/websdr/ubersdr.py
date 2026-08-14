@@ -35,7 +35,6 @@ The commands used here, and why each:
 
     tune {frequency, ensureVisible}          the dial
     tune {mode, bandwidthLow, bandwidthHigh} mode and filter in ONE call
-    duck {ducked}                            transient silence -- see set_muted
     bye                                      release our client slot
 
 `tune` carries mode and passband together deliberately: sent separately, the
@@ -453,9 +452,6 @@ class UberSDRDriver:
         self._modes: Optional[dict[str, dict[str, Any]]] = None
         self._receiver: dict[str, Any] = {}
         self._capabilities: tuple[str, ...] = ()
-        # Whether this receiver has the transient-silence command. Read from the
-        # announce, not assumed -- see set_muted.
-        self._can_duck = True
         self._last_attach_error: Optional[str] = None
         self._last_page_error: Optional[str] = None
         self._last_tune_error: Optional[str] = None
@@ -589,15 +585,6 @@ class UberSDRDriver:
         self._receiver = d.get("receiver") or {}
         caps = d.get("capabilities") or []
         self._capabilities = tuple(str(c) for c in caps)
-        # An empty list means an announce we could not read, not a receiver with
-        # no commands -- so the good case is assumed and a refusal is reported
-        # rather than a silence being introduced by our own guess.
-        self._can_duck = ("duck" in self._capabilities) if self._capabilities else True
-        if self._capabilities and not self._can_duck:
-            logger.warning(
-                "UberSDR at %s has no `duck` command; transmit silence will use the "
-                "operator's own mute instead", self.url,
-            )
 
     async def _subscribe(self) -> None:
         """Subscribe to what get_status() reports, and seed it with a snapshot.
@@ -862,34 +849,14 @@ class UberSDRDriver:
         self._last_unmapped_mode = None
         return True
 
-    async def set_muted(self, muted: bool) -> None:
-        """Silence for transmit -- with `duck` where there is one, and that is the point.
-
-        UberSDR draws a distinction the other families do not: `mute` is the
-        operator's own setting, which the page's mute button shows and that
-        browser remembers between visits, while `duck` is transient silence
-        applied by something else. Transmit is the second kind. Using `duck`
-        means sdrsync dying mid-transmission leaves nothing behind to undo, and
-        the mute button in the view never shows a state nobody chose.
-
-        Feature-detected on the announce's capability list rather than assumed,
-        which is the API's own rule -- and the fallback matters: a receiver
-        without `duck` still has to go quiet while the rig is transmitting, so
-        `mute` is used instead and said out loud once. RX audio over your own
-        transmission is the worse failure.
-
-        Absolute, never a toggle: PTT arrives as "transmitting: true/false", and
-        a toggle desynchronises permanently the first time a message is missed.
-        """
-        if not self._attached:
-            return
-        if self._can_duck:
-            name, args = "duck", {"ducked": bool(muted)}
-        else:
-            name, args = "mute", {"muted": bool(muted)}
-        res = await self._call("command", name, name=name, args=args)
-        if res is not None and not res.get("ok"):
-            logger.debug("%s command refused: %s", name, self._error_text(name, res))
+    # Mute-on-TX is handled natively at the page-adapter level now (v15,
+    # WxPageAdapter.set_muted() in browser_shim.py) -- see its module
+    # comment for why: a native WebView-level mute is instant and does
+    # not touch the page's own `duck`/`mute` API at all, which is a
+    # strict improvement over the old approach here (`duck` existed
+    # specifically so the page's own visible mute-button state never
+    # showed a state the operator didn't choose -- with the page never
+    # touched in the first place, that's no longer even a concern).
 
     # ------------------------------------------------------------------- status
     async def get_status(self) -> WebSDRStatus:

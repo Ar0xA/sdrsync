@@ -2,10 +2,12 @@
 
 The page's control API answers every command with either the state it set or an
 error carrying a *reason*, which is the whole advantage of it over calling a
-site's internals and reading the result back. These tests pin the three places
-that advantage is spent: PTT silence going to `duck` rather than `mute`, a
-refusal being reported instead of assumed-successful, and a refused filter not
-costing us the mode change.
+site's internals and reading the result back. These tests pin two of the places
+that advantage is spent: a refusal being reported instead of assumed-successful,
+and a refused filter not costing us the mode change. (PTT silence used to be a
+third -- the driver's own `duck`/`mute` command choice -- until v15 moved
+mute-on-TX to a native, page-independent WebView-level mute; see
+browser_shim.py's module comment.)
 
 They cover what the driver *asks for*, which is everything checkable without the
 receiver's own code to hand. That the page *understands* it was established once,
@@ -76,54 +78,6 @@ def run(coro):
     return asyncio.run(coro)
 
 
-# --- PTT silence ----------------------------------------------------------
-
-def test_ptt_silence_uses_duck_and_never_touches_the_operators_mute():
-    # The distinction the API draws, and the reason it exists: `mute` is the
-    # operator's own setting, remembered by the browser view and shown on its mute
-    # button. Using it for transmit would leave that mute behind to undo if sdrsync
-    # died mid-transmission -- `duck` leaves nothing.
-    page = StubPage()
-    driver = attached(page)
-    run(driver.set_muted(True))
-    assert page.sent == [("command", {"name": "duck", "args": {"ducked": True}})]
-    run(driver.set_muted(False))
-    assert page.sent[-1] == ("command", {"name": "duck", "args": {"ducked": False}})
-
-
-def test_a_receiver_without_duck_still_goes_quiet_for_transmit():
-    # Feature-detected on the announce's capability list, as the API instructs. A
-    # receiver that has no transient-silence command still has to be silent while
-    # the rig is transmitting -- RX audio over your own transmission is the worse
-    # failure, so the operator's own mute is used and said out loud once.
-    page = StubPage()
-    driver = attached(page)
-    driver._capabilities = ("tune", "mode", "passband", "mute")
-    driver._can_duck = False
-    run(driver.set_muted(True))
-    assert page.sent == [("command", {"name": "mute", "args": {"muted": True}})]
-
-
-def test_duck_is_used_when_the_receiver_reports_it():
-    page = StubPage()
-    driver = attached(page)
-    driver._capabilities = ("tune", "mute", "duck")
-    driver._can_duck = True
-    run(driver.set_muted(True))
-    assert page.sent[-1][1]["name"] == "duck"
-
-
-def test_silence_is_absolute_rather_than_a_toggle():
-    # PTT arrives as "transmitting: true/false". A toggle desynchronises
-    # permanently the first time a message is missed, and then unmutes on every
-    # transmission.
-    page = StubPage()
-    driver = attached(page)
-    run(driver.set_muted(True))
-    run(driver.set_muted(True))
-    assert all(payload["args"]["ducked"] is True for _t, payload in page.sent)
-
-
 # --- tuning ---------------------------------------------------------------
 
 def test_tune_sends_an_absolute_frequency_and_asks_for_the_view_to_follow():
@@ -164,7 +118,6 @@ def test_nothing_is_sent_while_unattached():
     driver._page = page
     assert run(driver.tune_hz(14074000)) is False
     assert run(driver.set_mode("USB", 2400)) is False
-    run(driver.set_muted(True))
     assert page.sent == []
 
 

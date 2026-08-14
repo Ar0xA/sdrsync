@@ -145,7 +145,7 @@ class WebsdrOrgDriver:
         # filter width), not just the base name.
         self._current_web_mode: Optional[str] = None
         # True only once attach() has fully succeeded (band table loaded,
-        # audio gate handled). tune_hz/set_mode/set_muted/get_status all
+        # audio gate handled). tune_hz/set_mode/get_status all
         # gate on this -- NOT on `self._page is None` -- because attach()
         # sets self._page as its very first statement, before navigation
         # even starts, so a `_page is None` check is disengaged for the
@@ -511,15 +511,11 @@ class WebsdrOrgDriver:
             logger.warning(self._last_mode_error)
             return False
 
-    async def set_muted(self, muted: bool) -> None:
-        if not self._attached:
-            return
-        try:
-            await self._page.evaluate(
-                "(m) => { if (window.soundapplet) window.soundapplet.mute(m ? 1 : 0); }", muted
-            )
-        except PlaywrightError as e:
-            logger.debug("mute() call failed (non-fatal): %s", e)
+    # Mute-on-TX is handled natively at the page-adapter level now (v15,
+    # WxPageAdapter.set_muted() in browser_shim.py) -- see its module
+    # comment for why: a native WebView-level mute is instant and site-
+    # independent, unlike this websdr.org-specific soundapplet.mute()
+    # JS call.
 
     def _reverse_effective_hz(
         self, observed_hz: Optional[int], observed_hamlib_mode: Optional[str]
@@ -578,7 +574,7 @@ class WebsdrOrgDriver:
             )
         except PlaywrightError as e:
             # The page died out from under us -- drop back to "not attached"
-            # so tune_hz/set_mode/set_muted become no-ops again until a
+            # so tune_hz/set_mode become no-ops again until a
             # fresh attach() (retried by the engine) succeeds.
             self._attached = False
             self._last_page_error = str(e)

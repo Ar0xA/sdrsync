@@ -1,10 +1,21 @@
 """A concurrent Disconnect (_stop_websdr(), reachable via a user click, the
 rig-stop cascade, or _handle_page_dead()) can run on the same event loop
-while _tick() is suspended inside an earlier await in the SAME tick (e.g.
-the PTT-edge mute call), nulling engine._driver out from under it. Every
-subsequent bare self._driver.<method>() access in that tick must not
-raise AttributeError -- it must be treated as "nothing left to do this
-tick", the same way the code already treats "not attached"."""
+while _tick() is suspended inside an earlier await in the SAME tick,
+nulling engine._driver (and, for the ptt_mute test below, engine._page)
+out from under it. Every subsequent bare self._driver.<method>() access
+in that tick must not raise AttributeError -- it must be treated as
+"nothing left to do this tick", the same way the code already treats
+"not attached".
+
+The ptt_mute test's stub simulates this by mutating engine state
+synchronously from inside its own awaited set_muted() -- it does not rely
+on _tick() genuinely suspending at that specific call: since v15,
+WxPageAdapter.set_muted() is fire-and-forget (no await inside it at all),
+so the real code can no longer actually yield there. The test is still a
+real regression guard for the later guards it exercises (a stub whose
+set_muted() does NOT touch engine state would make it pass whether or not
+those guards existed at all -- confirmed by a bug-hunter review pass, not
+just asserted here)."""
 import asyncio
 import queue
 
@@ -34,26 +45,34 @@ class StubRig:
         return True
 
 
-class DisconnectingDriver:
+class StubPage:
     """Its set_muted() call simulates a concurrent _stop_websdr() completing
-    while THIS driver call was in flight -- by the time it returns,
-    engine._driver is already None, exactly as a real teardown running
-    during a suspended await on the same loop would leave it. get_status()
-    would raise AttributeError if called on self.engine._driver afterward
-    without a None-check."""
+    while THIS page call was in flight -- by the time it returns,
+    engine._driver/_page are already None and _websdr_active False,
+    exactly as the real _stop_websdr() (which nulls all three together)
+    running during a suspended await on the same loop would leave it."""
+
+    def __init__(self, engine: SyncEngine) -> None:
+        self.engine = engine
+        self.mute_calls: list[bool] = []
+
+    async def set_muted(self, muted: bool) -> None:
+        self.mute_calls.append(muted)
+        self.engine._driver = None
+        self.engine._page = None
+        self.engine._websdr_active = False
+
+
+class DisconnectingDriver:
+    """get_status() would raise AttributeError if called on
+    self.engine._driver afterward without a None-check."""
 
     CW_VARIANT_IS_AMBIGUOUS = True
 
     def __init__(self, engine: SyncEngine) -> None:
         self.attached = True
         self.engine = engine
-        self.mute_calls: list[bool] = []
         self.get_status_calls = 0
-
-    async def set_muted(self, muted: bool) -> None:
-        self.mute_calls.append(muted)
-        self.engine._driver = None
-        self.engine._websdr_active = False
 
     async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
         raise AssertionError("must not be called: transmitting suppresses the forward push branch")
@@ -90,21 +109,24 @@ def test_driver_going_none_mid_tick_during_ptt_mute_does_not_crash():
     engine._rig_active = True
     driver = DisconnectingDriver(engine)
     engine._driver = driver
+    page = StubPage(engine)
+    engine._page = page
     engine._websdr_active = True
 
     # PTT rising edge -> set_muted(True) fires, which (simulating a
-    # concurrent Disconnect) nulls engine._driver mid-tick. The rest of
-    # this tick (transmitting -> skip forward push -> get_status()) must
+    # concurrent Disconnect) nulls engine._driver/_page mid-tick. The rest
+    # of this tick (transmitting -> skip forward push -> get_status()) must
     # complete cleanly rather than raising.
     asyncio.run(engine._tick())
 
-    assert driver.mute_calls == [True]
+    assert page.mute_calls == [True]
     # get_status() is legitimately called once at the very top of _tick()
     # (before the mute call/race), while the driver was still real -- the
     # SECOND, later call this tick (the one this fix guards) must have been
     # skipped rather than crashing or firing again against the gone driver.
     assert driver.get_status_calls == 1
     assert engine._driver is None
+    assert engine._page is None
     assert engine._websdr_active is False
 
 
@@ -151,9 +173,6 @@ def test_driver_going_none_during_the_second_get_status_call_skips_reverse_sync(
     engine._rig_active = True
 
     class DisconnectingStatusDriver(DisconnectingDriver):
-        async def set_muted(self, muted: bool) -> None:
-            self.mute_calls.append(muted)  # harmless -- does NOT touch engine._driver
-
         async def tune_hz(self, freq_hz: int, verify: bool = True) -> bool:
             # False, not True: a successful forward push this same tick
             # would stamp _forward_push_completed_at to "now" and keep the
