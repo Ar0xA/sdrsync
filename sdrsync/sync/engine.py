@@ -588,12 +588,13 @@ class SyncEngine:
 
         # cw_offset_hz as last applied to self._driver -- None until the
         # first driver exists. Compared against self._effective_cw_offset_hz()
-        # each tick so a LIVE change (the user editing the Behaviour-tab
-        # spinner, or the Transceiver-tab CW pitch field, mid-session) can
-        # be told apart from "just attached, this is what the driver was
-        # already constructed with" -- see _tick()'s own use of this for
-        # why that distinction matters (a live change must reseed the
-        # reverse-sync baseline, not be read as a page edit).
+        # each tick so a LIVE change (the user editing either the
+        # Transceiver tab's WebSDR CW offset spinner or its CW pitch
+        # field, mid-session) can be told apart from "just attached, this
+        # is what the driver was already constructed with" -- see
+        # _tick()'s own use of this for why that distinction matters (a
+        # live change must reseed the reverse-sync baseline, not be read
+        # as a page edit).
         self._applied_cw_offset_hz: Optional[int] = None
 
         # Sync dedupe latches -- reset whenever either subsystem
@@ -2045,12 +2046,12 @@ class SyncEngine:
 
     def _effective_cw_offset_hz(self) -> int:
         """The single value actually applied to a driver's cw_offset_hz:
-        the Behaviour-tab "WebSDR CW offset" plus the Transceiver-tab
-        "CW pitch" (the rig's own, manually-entered pitch/sidetone
-        setting) -- summed here so both feed the exact same driver
-        attribute, reusing all of it its existing live-sync/reverse-sync-
-        reseed handling for free instead of threading a second offset
-        through every driver separately."""
+        the Transceiver tab's "WebSDR CW offset" plus its "CW pitch"
+        (the rig's own, manually-entered pitch/sidetone setting) --
+        summed here so both feed the exact same driver attribute,
+        reusing all of its existing live-sync/reverse-sync-reseed
+        handling for free instead of threading a second offset through
+        every driver separately."""
         return self.settings.cw_offset_hz + self.settings.transceiver_cw_pitch_hz
 
     async def _tick(self) -> None:

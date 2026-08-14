@@ -148,19 +148,53 @@ class TransceiverPanel(wx.Panel):
 
         outer.Add(row1, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 0)
 
+        # WebSDR CW offset and Transceiver CW pitch are summed into one
+        # effective offset (SyncEngine._effective_cw_offset_hz()) -- kept
+        # side by side, not split across tabs, so that relationship is
+        # visible instead of surprising (previously on the Behaviour tab
+        # alone, which is how a user ended up asking why their offset's
+        # "0" line actually sat at 750Hz -- their rig's own CW pitch,
+        # set here, but invisible from the offset field's own tab).
         row1b = wx.BoxSizer(wx.HORIZONTAL)
+
+        self.cw_offset_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.cw_offset_hz)
+        self.cw_offset_ctrl.SetFont(value_font())
+        # Narrower than the default best-size -- 5 digits plus a sign
+        # covers the whole -2000..2000 range, no need for the wider
+        # default width.
+        self.cw_offset_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
+        self.cw_offset_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_offset_changed)
+        # EVT_SPINCTRL fires for the up/down arrows, but a value typed
+        # directly into the text portion only registers once focus
+        # leaves the control -- an explicit Apply button lets the
+        # operator force it to take effect immediately instead, without
+        # having to click elsewhere first.
+        self.cw_offset_apply_btn = FlatButton(self, "Apply")
+        self.cw_offset_apply_btn.Bind(wx.EVT_BUTTON, self._on_cw_offset_changed)
+        cw_offset_row = wx.BoxSizer(wx.HORIZONTAL)
+        cw_offset_row.Add(self.cw_offset_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
+        cw_offset_row.Add(self.cw_offset_apply_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(6))
+        row1b.Add(field("WebSDR CW offset (Hz)", cw_offset_row), 0, wx.EXPAND)
+
         self.cw_pitch_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.transceiver_cw_pitch_hz)
         self.cw_pitch_ctrl.SetFont(value_font())
         self.cw_pitch_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
         self.cw_pitch_ctrl.SetToolTip(
             "The rig's OWN CW pitch/sidetone setting (from its menu), entered here "
             "manually -- sdrsync never queries the rig for this. Added to the "
-            "Behaviour tab's WebSDR CW offset, so this field can hold the rig's "
+            "WebSDR CW offset alongside it, so this field can hold the rig's "
             "usual pitch (often a few hundred Hz) while that one stays at 0 for "
             "\"no additional correction needed\"."
         )
         self.cw_pitch_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_pitch_changed)
-        row1b.Add(field("Transceiver CW pitch (Hz)", self.cw_pitch_ctrl), 0, wx.EXPAND)
+        row1b.Add(field("Transceiver CW pitch (Hz)", self.cw_pitch_ctrl), 0, wx.EXPAND | wx.LEFT, self.FromDIP(14))
+
+        self.cw_offset_total_text = wx.StaticText(self, label="")
+        self.cw_offset_total_text.SetFont(label_font())
+        self.cw_offset_total_text.SetForegroundColour(theme.FAINT)
+        row1b.Add(field("= effective CW offset", self.cw_offset_total_text), 0, wx.EXPAND | wx.LEFT, self.FromDIP(14))
+        self._refresh_cw_offset_total()
+
         outer.Add(row1b, 0, wx.TOP, self.FromDIP(14))
 
         row2 = wx.BoxSizer(wx.HORIZONTAL)
@@ -300,9 +334,19 @@ class TransceiverPanel(wx.Panel):
             self.settings.rigctld_host, self.settings.rigctld_port = host, port
         self.settings.save()
 
+    def _on_cw_offset_changed(self, _evt: wx.CommandEvent) -> None:
+        self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
+        self.settings.save()
+        self._refresh_cw_offset_total()
+
     def _on_cw_pitch_changed(self, _evt: wx.CommandEvent) -> None:
         self.settings.transceiver_cw_pitch_hz = self.cw_pitch_ctrl.GetValue()
         self.settings.save()
+        self._refresh_cw_offset_total()
+
+    def _refresh_cw_offset_total(self) -> None:
+        total = self.cw_offset_ctrl.GetValue() + self.cw_pitch_ctrl.GetValue()
+        self.cw_offset_total_text.SetLabel(f"{total:+d} Hz")
 
     def _on_poll_interval_changed(self, _evt: wx.CommandEvent) -> None:
         self.settings.poll_interval_s = self.poll_interval_ctrl.GetValue()
