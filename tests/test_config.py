@@ -426,3 +426,59 @@ def test_save_then_load_round_trips_dismissed_update_version(monkeypatch, tmp_pa
     _use_tmp_config(monkeypatch, tmp_path)
     AppSettings(dismissed_update_version="v2.2.0").save()
     assert AppSettings.load().dismissed_update_version == "v2.2.0"
+
+
+# --- cw_offset_hz / transceiver_cw_pitch_hz range clamping --------------
+
+
+def test_load_accepts_in_range_cw_offset_and_pitch(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"cw_offset_hz": -600, "transceiver_cw_pitch_hz": 750}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.cw_offset_hz == -600
+    assert settings.transceiver_cw_pitch_hz == 750
+
+
+def test_load_clamps_out_of_range_cw_offset_and_pitch(monkeypatch, tmp_path):
+    """Bug-hunter finding: unlike poll_interval_s/reverse_sync_*/
+    websdr_idle_disconnect_min, these two fields were type-validated but
+    never range-clamped on load -- a hand-edited out-of-range value
+    reached SyncEngine._effective_cw_offset_hz() as-is, while
+    transceiver_panel.py's SpinCtrl (min=CW_HZ_MIN, max=CW_HZ_MAX)
+    silently clamped the SAME value for display, so the "= effective CW
+    offset" readout could show a different number than what the engine
+    actually applied."""
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"cw_offset_hz": -9000, "transceiver_cw_pitch_hz": 5000}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.cw_offset_hz == config_module.CW_HZ_MIN
+    assert settings.transceiver_cw_pitch_hz == config_module.CW_HZ_MAX
+
+
+def test_load_rejects_wrong_type_cw_offset_and_pitch(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+    config_file.write_text(
+        json.dumps({"cw_offset_hz": "750", "transceiver_cw_pitch_hz": "750"}), encoding="utf-8",
+    )
+    settings = AppSettings.load()
+    assert settings.cw_offset_hz == 0  # falls back to the default
+    assert settings.transceiver_cw_pitch_hz == 0
+
+
+def test_clamp_cw_hz_passes_through_valid_values():
+    assert config_module.clamp_cw_hz(0) == 0
+    assert config_module.clamp_cw_hz(750) == 750
+    assert config_module.clamp_cw_hz(config_module.CW_HZ_MIN) == config_module.CW_HZ_MIN
+    assert config_module.clamp_cw_hz(config_module.CW_HZ_MAX) == config_module.CW_HZ_MAX
+
+
+def test_save_then_load_round_trips_cw_offset_and_pitch(monkeypatch, tmp_path):
+    _use_tmp_config(monkeypatch, tmp_path)
+    AppSettings(cw_offset_hz=-300, transceiver_cw_pitch_hz=600).save()
+    settings = AppSettings.load()
+    assert settings.cw_offset_hz == -300
+    assert settings.transceiver_cw_pitch_hz == 600

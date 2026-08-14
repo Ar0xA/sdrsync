@@ -30,6 +30,18 @@ MAX_POLL_INTERVAL_S = 5.0
 MIN_WEBVIEW_WIDTH = 400
 MIN_WEBVIEW_HEIGHT = 300
 
+# Bounds for AppSettings.cw_offset_hz and .transceiver_cw_pitch_hz --
+# defined here (not in gui/settings_panels/transceiver_panel.py) so
+# load() can enforce them on a hand-edited config.json too, not just the
+# GUI's SpinCtrl widgets (same split as MIN/MAX_POLL_INTERVAL_S above).
+# Without this, a hand-edited out-of-range value would be applied as-is
+# by SyncEngine (which reads AppSettings directly), while the SpinCtrl
+# displaying it silently clamps to its own min/max on construction --
+# leaving the GUI's own "effective CW offset" readout showing a
+# different number than what's actually pushed to the driver.
+CW_HZ_MIN = -2000
+CW_HZ_MAX = 2000
+
 
 @dataclass(frozen=True)
 class WebSDRSite:
@@ -261,6 +273,7 @@ class AppSettings:
             _clamp_poll_interval(filtered)
             _clamp_reverse_sync_range(filtered)
             _clamp_idle_disconnect(filtered)
+            _clamp_cw_offsets(filtered)
             _validate_main_window_position(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
@@ -421,6 +434,34 @@ def clamp_idle_disconnect_min(value: Optional[int]) -> Optional[int]:
         )
         return None
     return value
+
+
+def clamp_cw_hz(value: int) -> int:
+    """Pure sanity-check of a CW offset/pitch value: takes the value,
+    returns the corrected one. Shared by _clamp_cw_offsets() below (a
+    hand-edited config.json) and transceiver_panel.py's two SpinCtrls
+    (via CW_HZ_MIN/CW_HZ_MAX), so the two layers enforcing this bound
+    can't drift apart -- same split as clamp_reverse_sync_bounds()."""
+    return min(max(value, CW_HZ_MIN), CW_HZ_MAX)
+
+
+def _clamp_cw_offsets(filtered: dict[str, Any]) -> None:
+    """Apply clamp_cw_hz() to cw_offset_hz and transceiver_cw_pitch_hz in
+    a loaded config dict, in place. Runs after _validate_scalars, so
+    each value (if present) is already known to be an int. Only writes a
+    key back when its value actually changed, so an absent key stays
+    absent and falls through to the dataclass default."""
+    for key in ("cw_offset_hz", "transceiver_cw_pitch_hz"):
+        if key not in filtered:
+            continue
+        value = filtered[key]
+        clamped = clamp_cw_hz(value)
+        if clamped != value:
+            logger.warning(
+                "Clamping %s in %s from %r to %r (allowed range [%s, %s])",
+                key, CONFIG_FILE, value, clamped, CW_HZ_MIN, CW_HZ_MAX,
+            )
+            filtered[key] = clamped
 
 
 def _clamp_idle_disconnect(filtered: dict[str, Any]) -> None:

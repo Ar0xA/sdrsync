@@ -1491,6 +1491,84 @@ def test_force_ssb_to_data_mode_bookkeeping_stays_on_canonical_mode_no_repeat_pu
     assert stub_rig.set_modes == ["PKTUSB"]
 
 
+def test_force_ssb_to_data_mode_asserts_on_an_already_settled_usb_session():
+    """The setting is a STANDING preference ("always keyed via data
+    input, never the mic"), not just a translation applied to a detected
+    page transition -- turning it on while the WebSDR page is ALREADY
+    settled on USB (no further page click ever happens) must still push
+    PKTUSB to the rig. Bug-hunter finding: pre-fix, the reverse-sync
+    trigger only fired on a genuine obs_mode change, so enabling the
+    checkbox mid-session on an already-settled page did nothing at all,
+    confirmed live against 40 further ticks with every debounce/holdoff
+    gate cleared."""
+    engine = make_engine()
+    engine._rig_backend = "rigctld"
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2400, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+    assert stub_rig.set_modes == []  # setting was off during settling -- nothing pushed yet
+
+    # Operator turns the checkbox on AFTER the session already settled on
+    # USB -- the WebSDR page itself never moves again.
+    engine.settings.force_ssb_to_data_mode = True
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_mode_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_modes == ["PKTUSB"]
+
+    # And it must not keep re-pushing every tick once satisfied.
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    assert stub_rig.set_modes == ["PKTUSB"]
+
+
+def test_force_ssb_to_data_mode_gives_up_after_rejection_instead_of_hammering_forever():
+    """If the rig genuinely rejects the mapped data-mode token (e.g. an
+    older/incompatible rigctld backend), the standing assertion added
+    above must back off and give up after REVERSE_PUSH_MAX_ATTEMPTS, the
+    same as a genuine page-transition push does -- not retry forever on
+    every subsequent tick, since nothing about a rejected token changes
+    by itself."""
+    engine = make_engine()
+    engine._rig_backend = "rigctld"
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2400, ptt=False))
+    stub_rig.set_mode_result = False
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    stub_driver = StubReverseDriver(status)
+    engine._rig, engine._rig_active, engine._driver, engine._websdr_active = stub_rig, True, stub_driver, True
+    _settle_and_capture_baseline(engine)
+
+    engine.settings.force_ssb_to_data_mode = True
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())  # arms the mode debounce, no push yet
+    assert stub_rig.set_modes == []
+
+    for _ in range(REVERSE_PUSH_MAX_ATTEMPTS):
+        _clear_reverse_mode_debounce(engine)
+        _clear_push_backoff(engine)
+        _clear_rig_write_gap(engine)
+        _clear_holdoff(engine)
+        asyncio.run(engine._tick())
+
+    assert stub_rig.set_modes.count("PKTUSB") == REVERSE_PUSH_MAX_ATTEMPTS
+    assert engine._mode_push is None  # ladder gave up, not left dangling
+    assert engine._force_data_mode_gave_up_for == ("USB", "USB")
+
+    # Further ticks (rig still stuck on plain USB, page still USB) must
+    # not keep retrying the same rejected assertion.
+    for _ in range(3):
+        _clear_holdoff(engine)
+        asyncio.run(engine._tick())
+    assert stub_rig.set_modes.count("PKTUSB") == REVERSE_PUSH_MAX_ATTEMPTS
+
+
 def test_reverse_sync_data_mode_for_pure_function():
     from sdrsync.sync.engine import _reverse_sync_data_mode_for
 

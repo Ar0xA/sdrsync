@@ -679,6 +679,16 @@ class SyncEngine:
         self._pending_reverse_freq: Optional[int] = None
         self._pending_reverse_freq_since: float = 0.0
         self._last_observed_mode_key: Optional[str] = None
+        # (obs_mode, rig_mode) pair that AppSettings.force_ssb_to_data_mode
+        # has already tried REVERSE_PUSH_MAX_ATTEMPTS times to push the
+        # rig's own data-mode token for, and given up on -- suppresses
+        # _reverse_sync_tick()'s standing force-data-mode assertion from
+        # re-firing every tick forever against a rig that genuinely
+        # rejects the mapped token, while still re-arming the moment
+        # either the page's mode or the rig's own actual mode changes
+        # (so a fresh page click, or the operator fixing the rig, gets a
+        # fresh attempt rather than staying suppressed forever).
+        self._force_data_mode_gave_up_for: Optional[tuple[str, str]] = None
         # True once the first post-(re)attach/toggle-on observation has
         # been captured as a baseline (not pushed) -- see
         # _reverse_sync_tick()'s docstring for why the first observation
@@ -1728,6 +1738,7 @@ class SyncEngine:
         self._pending_reverse_freq = None
         self._pending_reverse_freq_since = 0.0
         self._last_observed_mode_key = None
+        self._force_data_mode_gave_up_for = None
         self._reverse_baseline_captured = False
         self._last_unmapped_reverse_mode = None
         self._mode_push = None
@@ -1837,7 +1848,34 @@ class SyncEngine:
                 self._pending_reverse_mode = obs_mode
                 self._pending_reverse_mode_since = time.monotonic()
 
-            if obs_mode != self._last_pushed_to_websdr_mode and obs_mode != self._last_observed_mode_key:
+            # force_ssb_to_data_mode is a STANDING preference ("always
+            # keyed via data input, never the mic"), not just a
+            # translation applied to a detected page transition -- so
+            # also re-enter this branch when the page is (still) plain
+            # USB/LSB but the rig's OWN current mode doesn't match the
+            # mapped data-mode token yet (the setting was just turned on
+            # mid-session on an already-settled page, or the operator
+            # flipped the rig back to plain USB/LSB from its own front
+            # panel). Without this, the branch below only ever fired on a
+            # genuine WebSDR-side mode transition, so enabling the
+            # checkbox on a steady-state session did nothing at all
+            # (bug-hunter finding, confirmed live: 40 further ticks with
+            # every debounce/holdoff gate cleared, rig stayed on plain
+            # USB). Suppressed once REVERSE_PUSH_MAX_ATTEMPTS has already
+            # given up on this exact (obs_mode, rig_mode) pair -- see
+            # _force_data_mode_gave_up_for's own docstring -- so a rig
+            # that genuinely rejects the mapped token isn't hammered with
+            # a rejected SET-mode command forever.
+            force_data_mode_needed = False
+            if self.settings.force_ssb_to_data_mode and obs_mode in ("USB", "LSB") and state.mode is not None:
+                rig_mode = state.mode.upper()
+                mapped_mode = _reverse_sync_data_mode_for(obs_mode, self._rig_backend)
+                if rig_mode != mapped_mode and (obs_mode, rig_mode) != self._force_data_mode_gave_up_for:
+                    force_data_mode_needed = True
+
+            if (
+                obs_mode != self._last_pushed_to_websdr_mode and obs_mode != self._last_observed_mode_key
+            ) or force_data_mode_needed:
                 if self._mode_push is None:
                     if time.monotonic() - self._pending_reverse_mode_since >= REVERSE_MODE_DEBOUNCE_S:
                         self._mode_push = _ReversePush(target=obs_mode)
@@ -1905,6 +1943,7 @@ class SyncEngine:
                         self._forward_push_completed_at = time.monotonic()
                         self._reverse_sync_error = None
                         self._mode_push = None
+                        self._force_data_mode_gave_up_for = None
                     elif push.attempts >= REVERSE_PUSH_MAX_ATTEMPTS:
                         # Gave it several tries, spaced out, not just one
                         # shot -- genuinely not landing. Rig status is
@@ -1932,6 +1971,9 @@ class SyncEngine:
                         self._last_observed_mode_key = obs_mode
                         self._last_sent_mode_key = None
                         self._mode_push = None
+                        self._force_data_mode_gave_up_for = (
+                            (obs_mode, state.mode.upper()) if state.mode is not None else None
+                        )
                     else:
                         push.next_attempt_at = time.monotonic() + REVERSE_PUSH_BACKOFF_S[
                             min(push.attempts - 1, len(REVERSE_PUSH_BACKOFF_S) - 1)

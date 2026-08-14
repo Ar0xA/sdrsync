@@ -12,7 +12,14 @@ import wx
 from .. import theme
 from ..fonts import label_font, value_font
 from ..widgets import CheckBox, FlatButton
-from ...config import MAX_POLL_INTERVAL_S, MIN_POLL_INTERVAL_S, AppSettings, clamp_reverse_sync_bounds
+from ...config import (
+    CW_HZ_MAX,
+    CW_HZ_MIN,
+    MAX_POLL_INTERVAL_S,
+    MIN_POLL_INTERVAL_S,
+    AppSettings,
+    clamp_reverse_sync_bounds,
+)
 
 # Fixed display order -- config.RIG_BACKENDS is a set (validation-only),
 # and only these two backends actually exist in sync/engine.py today;
@@ -157,7 +164,7 @@ class TransceiverPanel(wx.Panel):
         # set here, but invisible from the offset field's own tab).
         row1b = wx.BoxSizer(wx.HORIZONTAL)
 
-        self.cw_pitch_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.transceiver_cw_pitch_hz)
+        self.cw_pitch_ctrl = wx.SpinCtrl(self, min=CW_HZ_MIN, max=CW_HZ_MAX, initial=settings.transceiver_cw_pitch_hz)
         self.cw_pitch_ctrl.SetFont(value_font())
         self.cw_pitch_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
         self.cw_pitch_ctrl.SetToolTip(
@@ -170,7 +177,7 @@ class TransceiverPanel(wx.Panel):
         self.cw_pitch_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_pitch_changed)
         row1b.Add(field("Transceiver CW pitch (Hz)", self.cw_pitch_ctrl), 0, wx.EXPAND)
 
-        self.cw_offset_ctrl = wx.SpinCtrl(self, min=-2000, max=2000, initial=settings.cw_offset_hz)
+        self.cw_offset_ctrl = wx.SpinCtrl(self, min=CW_HZ_MIN, max=CW_HZ_MAX, initial=settings.cw_offset_hz)
         self.cw_offset_ctrl.SetFont(value_font())
         # Narrower than the default best-size -- 5 digits plus a sign
         # covers the whole -2000..2000 range, no need for the wider
