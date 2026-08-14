@@ -305,6 +305,14 @@ class OpenWebRXDriver:
         a real error."""
         try:
             while self._attached:
+                # Re-checked every loop iteration -- see kiwisdr.py's
+                # identical watcher for why (a bug-hunter review pass
+                # found unchecking the Behaviour-tab mouse-hijack setting
+                # mid-session had no effect on an already-running
+                # watcher).
+                if not self._auto_click_audio_unlock:
+                    await asyncio.sleep(1.0)
+                    continue
                 clicked = await click_element_if_present(
                     page, "#openwebrx-autoplay-overlay", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S,
                 )

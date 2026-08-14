@@ -294,6 +294,16 @@ class KiwiSDRDriver:
         logger.debug("Audio-unlock overlay watcher started for %s", self.url)
         try:
             while self._attached:
+                # Re-checked every loop iteration, not just at spawn time
+                # (engine.py syncs this live from settings each tick) --
+                # a bug-hunter review pass found unchecking "Mouse hijack
+                # to enable WebSDR audio" mid-session had no effect on an
+                # already-running watcher, the same staleness bug
+                # cw_offset_hz had. A short sleep, not a busy spin, since
+                # the box being off is the steady state once toggled.
+                if not self._auto_click_audio_unlock:
+                    await asyncio.sleep(1.0)
+                    continue
                 clicked = await click_element_if_present(
                     page, ".id-play-button-container", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S,
                 )

@@ -510,11 +510,20 @@ class WebViewHost:
         panel disappears immediately (GUI state) while audio keeps
         playing for a while -- Destroy() tearing the widget down is not
         instant, so there's a real gap where the browser engine can keep
-        producing already-buffered/queued audio. Muted natively (see
-        WxPageAdapter.set_muted(), v15 -- instant, no page round-trip)
-        BEFORE starting that teardown, so the silence is immediate
-        regardless of how long the actual destroy takes."""
-        await page.set_muted(True)
+        producing already-buffered/queued audio. Muted natively BEFORE
+        starting that teardown, so the silence is immediate regardless
+        of how long the actual destroy takes.
+
+        Uses mute_before_teardown(), NOT the ordinary set_muted() -- a
+        bug-hunter review pass caught that set_muted() immediately
+        followed by close() was a guaranteed no-op: set_muted() is
+        fire-and-forget (wx.CallAfter with no await), and close() clears
+        self._alive synchronously with no suspension point in between,
+        so the dispatched mute callback never got a chance to run before
+        seeing itself already marked dead. mute_before_teardown() is
+        awaited end-to-end instead, so it's guaranteed to actually
+        happen before close()/Destroy() proceed."""
+        await page.mute_before_teardown(True)
         await page.close()
 
         fut: "asyncio.Future" = loop.create_future()

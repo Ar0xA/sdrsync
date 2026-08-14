@@ -200,3 +200,59 @@ def test_win32_guid_struct_matches_the_real_icorewebview2_8_iid_byte_layout():
     assert guid.Data2 == 0x6E1E
     assert guid.Data3 == 0x43AB
     assert bytes(guid.Data4) == bytes.fromhex("B7B87B2C9E62E094")
+
+
+def test_mute_before_teardown_actually_mutes_before_close_marks_the_adapter_dead(monkeypatch):
+    """Regression guard for a real bug caught by a bug-hunter review pass:
+    WebViewHost.destroy_page() used to call the ordinary set_muted()
+    immediately followed by close(). set_muted() is fire-and-forget
+    (wx.CallAfter with no await inside it), and close() clears
+    self._alive SYNCHRONOUSLY with no suspension point in between -- so
+    the dispatched do_mute callback never got a chance to run before
+    seeing itself already marked dead. Reproduced live: the mute call was
+    a guaranteed no-op, every time. mute_before_teardown() is awaited
+    end-to-end and does not gate on self._alive, so it must actually run
+    before the caller's own next line (close()) executes."""
+    calls = []
+    monkeypatch.setattr(browser_shim, "_native_set_muted", lambda native, muted: calls.append((native, muted)) or True)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        adapter, webview, gui_queue = _make_adapter(monkeypatch, loop, native_backend="the-native-ptr")
+        # mute_before_teardown() awaits a future only the (fake) GUI
+        # thread resolves -- run it as a task and pump once it's had a
+        # chance to reach that await, mirroring how a real background
+        # GUI thread would service it concurrently.
+        task = asyncio.create_task(adapter.mute_before_teardown(True))
+        await asyncio.sleep(0)
+        gui_queue.pump()
+        await task
+        # Mirrors WebViewHost.destroy_page()'s real call order exactly.
+        await adapter.close()
+
+    asyncio.run(run())
+
+    assert calls == [("the-native-ptr", True)], "mute_before_teardown() must actually mute before close() runs"
+
+
+def test_set_muted_then_close_back_to_back_is_a_no_op_do_not_reintroduce(monkeypatch):
+    """Documents the bug mute_before_teardown() exists to avoid: the
+    ordinary fire-and-forget set_muted(), immediately followed by
+    close(), never actually mutes -- there is no suspension point
+    between the wx.CallAfter dispatch and close()'s synchronous
+    self._alive = False for the GUI thread to run the callback in. A
+    future change must not "simplify" destroy_page() back to this
+    sequence."""
+    calls = []
+    monkeypatch.setattr(browser_shim, "_native_set_muted", lambda native, muted: calls.append((native, muted)) or True)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        adapter, webview, gui_queue = _make_adapter(monkeypatch, loop, native_backend="the-native-ptr")
+        await adapter.set_muted(True)
+        await adapter.close()
+        gui_queue.pump()  # too late -- do_mute's own _alive check already sees it dead
+
+    asyncio.run(run())
+
+    assert calls == [], "set_muted() immediately followed by close() is a documented no-op, not a fix"

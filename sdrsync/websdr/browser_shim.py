@@ -761,6 +761,33 @@ class WxPageAdapter:
 
         wx.CallAfter(do_mute)
 
+    async def mute_before_teardown(self, muted: bool = True) -> None:
+        """Like set_muted(), but AWAITED end-to-end and does not gate on
+        self._alive -- for WebViewHost.destroy_page() to call right
+        before close()/Destroy(), so the mute is guaranteed to actually
+        run before the widget goes away.
+
+        A real bug caught by a bug-hunter review pass: destroy_page()
+        used to call the ordinary set_muted() followed immediately by
+        close() (which synchronously clears self._alive with no await in
+        between) -- set_muted()'s fire-and-forget wx.CallAfter(do_mute)
+        never got a chance to actually run before do_mute's own
+        `if not self._alive: return` saw it already cleared. Reproduced
+        live: the mute call was a guaranteed no-op every time, not just
+        a race. This version is awaited by the caller instead, so the
+        GUI thread has genuinely run it before destroy_page() proceeds
+        to close()/Destroy()."""
+        fut: "asyncio.Future" = self._loop.create_future()
+
+        def do_mute():
+            native = self.webview.GetNativeBackend()
+            if native is not None:
+                _native_set_muted(native, muted)
+            self._loop.call_soon_threadsafe(_safe_set_result, fut, None)
+
+        wx.CallAfter(do_mute)
+        await fut
+
     async def wait_for_function(self, js: str, timeout: Optional[float] = None) -> None:
         """timeout is in milliseconds (Playwright convention)."""
         _require_background_thread("wait_for_function")

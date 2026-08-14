@@ -1270,3 +1270,49 @@ def test_range_guard_allows_a_frequency_exactly_on_both_bounds():
 
     assert stub_rig.set_freqs == [14_200_000]
     assert engine._reverse_sync_error is None
+
+
+class LiveCWOffsetDriver(StubReverseDriver):
+    """Like CWOffsetReverseDriver, but reads the offset from a real
+    instance attribute (self.cw_offset_hz) instead of a module constant --
+    mirroring every real driver's own self.cw_offset_hz, and letting a
+    test mutate it the same way SyncEngine._tick()'s live-sync does."""
+
+    def __init__(self, status: WebSDRStatus, cw_offset_hz: int = 0) -> None:
+        super().__init__(status)
+        self.cw_offset_hz = cw_offset_hz
+
+    def rig_freq_from_status(self, status: WebSDRStatus):
+        if status.freq_hz is None:
+            return None
+        return status.freq_hz - self.cw_offset_hz
+
+
+def test_changing_cw_offset_mid_session_does_not_retune_the_rig():
+    """The bug: a naive per-tick sync of cw_offset_hz onto the driver (the
+    first attempt at fixing the CW-offset-goes-stale bug) fed straight
+    into rig_freq_from_status()/_reverse_effective_hz(), so changing the
+    Behaviour-tab spinner alone -- the WebSDR page itself never moved --
+    looked exactly like a genuine page click of that same delta, and got
+    pushed to the rig. Found by a bug-hunter review pass, reproduced live.
+    The fix must re-baseline (not push) when the offset itself changes."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074600, mode="USB")  # page: rig freq + 600 Hz offset
+    engine._rig, engine._rig_active = stub_rig, True
+    driver = LiveCWOffsetDriver(status, cw_offset_hz=600)
+    engine._driver, engine._websdr_active = driver, True
+    engine.settings.cw_offset_hz = 600
+    engine._applied_cw_offset_hz = 600  # as if a prior tick already synced it, matching connect-time
+    _settle_and_capture_baseline(engine)
+
+    # Operator edits the spinner. The page itself does not move.
+    engine.settings.cw_offset_hz = 700
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+    _clear_reverse_debounce(engine)
+    _clear_holdoff(engine)
+    asyncio.run(engine._tick())
+
+    assert stub_rig.set_freqs == [], "changing the CW offset alone must never retune the rig"
+    assert driver.cw_offset_hz == 700, "the driver must still pick up the new offset"

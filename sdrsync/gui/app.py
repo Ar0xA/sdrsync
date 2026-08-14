@@ -192,6 +192,14 @@ class MainFrame(wx.Frame):
         # news yet" apart from "actually over" and skip tearing down the
         # connect-in-progress UI/window on a merely-stale snapshot.
         self._websdr_connect_pending = False
+        # Armed only by _begin_websdr_connect() (a real user Connect
+        # click), consumed the next time _apply_status_snapshot() sees
+        # the connection actually complete. NOT armed by idle auto-resume,
+        # an attach flap's own reconnect, or page-death recovery -- a
+        # bug-hunter review pass found the panel-auto-fold feature below
+        # firing on every one of those too (none involve a click), which
+        # could snap the panel shut mid-edit under the operator's hands.
+        self._fold_transceiver_panel_on_connect = False
         # What the WebSDR panel last told the engine to load -- None means
         # "not active".
         self._active_websdr_site: Optional[WebSDRSite] = None
@@ -472,6 +480,7 @@ class MainFrame(wx.Frame):
 
     def _begin_websdr_connect(self, site: WebSDRSite) -> None:
         self._websdr_connect_pending = True
+        self._fold_transceiver_panel_on_connect = True
         self.settings.last_site_url = site.url
         self.settings.last_site_driver_type = site.driver_type if self._find_selectable_site_by_url(site.url) is None else ""
         self.settings.save()
@@ -882,6 +891,7 @@ class MainFrame(wx.Frame):
             self._rig_active = False
             self._websdr_active = False
             self._websdr_connect_pending = False
+            self._fold_transceiver_panel_on_connect = False
             self._strip_connect_busy_label = None
             self._active_websdr_site = None
             self._state.rig_connected = False
@@ -921,6 +931,7 @@ class MainFrame(wx.Frame):
         if not snap.websdr_active:
             if not self._websdr_connect_pending or snap.websdr is not None:
                 self._websdr_connect_pending = False
+                self._fold_transceiver_panel_on_connect = False
                 self._strip_connect_busy_label = None
                 self._active_websdr_site = None
                 self._state.sdr_connected = False
@@ -940,12 +951,21 @@ class MainFrame(wx.Frame):
             newly_connected = bool(ws and ws.connected) and not self._state.sdr_connected
             self._state.sdr_connected = bool(ws and ws.connected)
             self._state.sdr_audio_active = ws.audio_active if ws else None
-            # Auto-fold the Transceiver settings panel once the WebSDR
-            # connection actually completes, rather than making the
-            # operator disconnect/reconnect the rig just to get it out of
-            # the way -- requested 2026-08-14.
-            if newly_connected and self._state.open_panel == "transceiver":
-                self._open_settings_panel(None)
+            # Auto-fold the Transceiver settings panel once a WebSDR
+            # connection the OPERATOR just clicked Connect for actually
+            # completes, rather than making them disconnect/reconnect the
+            # rig just to get it out of the way -- requested 2026-08-14.
+            # Gated on _fold_transceiver_panel_on_connect (armed only by
+            # _begin_websdr_connect(), a real click), NOT on the raw
+            # newly_connected edge alone -- that edge also fires on idle
+            # auto-resume, an attach flap's own reconnect, and page-death
+            # recovery, none of which involve a click, and would
+            # otherwise snap the panel shut mid-edit under the operator's
+            # hands (found by a bug-hunter review pass).
+            if newly_connected and self._fold_transceiver_panel_on_connect:
+                if self._state.open_panel == "transceiver":
+                    self._open_settings_panel(None)
+                self._fold_transceiver_panel_on_connect = False
             # Reconcile from the engine's own reported site identity
             # whenever the GUI's locally-tracked one is missing or stale.
             # Covers the idle auto-resume path specifically: SyncEngine.

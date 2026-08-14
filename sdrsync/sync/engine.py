@@ -551,6 +551,16 @@ class SyncEngine:
         # change at all and an idle-stopped session would never resume.
         self._rig_was_connected_last_tick: bool = False
 
+        # cw_offset_hz as last applied to self._driver -- None until the
+        # first driver exists. Compared against self.settings.cw_offset_hz
+        # each tick so a LIVE change (the user editing the Behaviour-tab
+        # spinner mid-session) can be told apart from "just attached, this
+        # is what the driver was already constructed with" -- see _tick()'s
+        # own use of this for why that distinction matters (a live change
+        # must reseed the reverse-sync baseline, not be read as a page
+        # edit).
+        self._applied_cw_offset_hz: Optional[int] = None
+
         # Sync dedupe latches -- reset whenever either subsystem
         # (re)starts, since "already sent to X" is meaningless once X has
         # changed out from under them.
@@ -1036,6 +1046,7 @@ class SyncEngine:
             site.url, cw_offset_hz=self.settings.cw_offset_hz,
             auto_click_audio_unlock=self.settings.auto_click_audio_unlock,
         )
+        self._applied_cw_offset_hz = self.settings.cw_offset_hz
         self._websdr_active = True
         self._reset_sync_latches()
         # Runs for the WebSDR subsystem's whole lifetime, independently of
@@ -1172,6 +1183,7 @@ class SyncEngine:
             site.url, cw_offset_hz=self.settings.cw_offset_hz,
             auto_click_audio_unlock=self.settings.auto_click_audio_unlock,
         )
+        self._applied_cw_offset_hz = self.settings.cw_offset_hz
         self._reset_sync_latches()
         # Re-bound against the SAME page for the new generation -- see
         # WxPageAdapter.set_on_dead()'s docstring for why this can't be
@@ -1992,13 +2004,45 @@ class SyncEngine:
         being independently startable means neither can assume the other
         is present."""
         # cw_offset_hz was previously only ever read at driver
-        # construction time (see driver_cls(...) call sites below), so
+        # construction time (see driver_cls(...) call sites above), so
         # changing it in Behaviour settings while already connected had
         # no effect until a disconnect/reconnect or site switch -- kept
-        # the OLD value applied indefinitely. Synced live, every tick,
-        # instead.
-        if self._driver is not None:
+        # the OLD value applied indefinitely.
+        #
+        # A blind per-tick overwrite (the first attempt at this fix) is
+        # itself a real bug, caught by a bug-hunter review pass: the
+        # offset also feeds the REVERSE direction (WebSDR -> rig, via
+        # each driver's rig_freq_from_status()/_reverse_effective_hz()),
+        # so changing it mid-session shifts what "the page's current
+        # frequency" is read AS, with the page itself not having moved at
+        # all -- _reverse_sync_tick() then sees a phantom jump of exactly
+        # the offset delta and, with REVERSE_FREQ_CHANGE_THRESHOLD_HZ=0,
+        # pushes it to the rig as if the operator had clicked the page.
+        # Reproduced live: editing the spinner alone retuned the rig by
+        # the offset delta. Only sync a GENUINE change (compared against
+        # what was last actually applied, not re-detected every tick from
+        # a value that never moves), and treat it the same way a
+        # mode-driven effective-frequency shift already is elsewhere in
+        # this method: force a forward re-push (_last_sent_freq = None)
+        # and a reverse re-baseline (_reverse_reseed_due = True) instead
+        # of letting the shift be misread as a page edit.
+        if self._driver is not None and self.settings.cw_offset_hz != self._applied_cw_offset_hz:
             self._driver.cw_offset_hz = self.settings.cw_offset_hz
+            self._applied_cw_offset_hz = self.settings.cw_offset_hz
+            self._last_sent_freq = None
+            self._reverse_reseed_due = True
+
+        # auto_click_audio_unlock has the identical staleness shape
+        # cw_offset_hz had -- same bug-hunter finding -- but no reverse-
+        # sync side effect (it only gates a background overlay-clicking
+        # watcher, doesn't feed any frequency/mode mapping), so a blind
+        # per-tick overwrite is safe here, unlike cw_offset_hz above.
+        # Each driver's watcher loop (kiwisdr.py/openwebrx.py) re-checks
+        # this attribute every iteration, so a live change actually
+        # stands an already-running watcher down instead of only taking
+        # effect on the next reconnect.
+        if self._driver is not None:
+            self._driver._auto_click_audio_unlock = self.settings.auto_click_audio_unlock
 
         websdr_status = await self._driver.get_status() if self._websdr_active and self._driver else None
 
