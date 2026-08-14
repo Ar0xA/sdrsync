@@ -15,8 +15,8 @@ from . import theme
 from .fonts import big_freq_font, value_font_at
 from .format import fmt_hz_split
 from .state import AppState, ptt_tag_state
-from .strip_panel import _Dot, _LabelValue, _PttTag, _VDivider
-from .widgets import CheckBox, FlatButton, ToggleButton
+from .strip_panel import MUTE_ON_TX_HELP, _Dot, _LabelValue, _PttTag, _VDivider
+from .widgets import CheckBox, FlatButton, ToggleButton, help_hint
 
 FRAME_SIZE = (720, 92)
 
@@ -104,6 +104,9 @@ class CompactFrame(wx.Frame):
 
         self.mute_btn = CheckBox(self, "mute tx", emphasize_when_checked=True)
         sizer.Add(self.mute_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
+
+        self.mute_help = help_hint(self, MUTE_ON_TX_HELP)
+        sizer.Add(self.mute_help, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(3))
 
         self.dock_btn = FlatButton(self, "Dock", is_primary=True)
         self.dock_btn.Bind(wx.EVT_BUTTON, lambda evt: self.on_dock and self.on_dock())

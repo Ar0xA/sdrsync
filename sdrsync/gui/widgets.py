@@ -423,3 +423,16 @@ class CheckBox(_OwnerDrawnMixin, wx.Control):
         gc.SetFont(self.GetFont(), self._text_colour())
         _, th = gc.GetTextExtent(self._label)
         gc.DrawText(self._label, box + gap, (rect.height - th) / 2)
+
+
+def help_hint(parent: wx.Window, tooltip: str) -> wx.StaticText:
+    """Small "[?]" marker with a hover tooltip, for a setting whose correct
+    value depends on external, easy-to-misconfigure third-party state (e.g.
+    Mute on TX's rig-software PTT-polling requirement -- see
+    strip_panel.py's MUTE_ON_TX_HELP)."""
+    hint = wx.StaticText(parent, label="[?]")
+    hint.SetFont(value_font())
+    hint.SetForegroundColour(theme.MUTED)
+    hint.SetCursor(wx.Cursor(wx.CURSOR_QUESTION_ARROW))
+    hint.SetToolTip(tooltip)
+    return hint

@@ -11,7 +11,30 @@ from . import theme
 from .fonts import label_font, value_font
 from .format import fmt_delta, fmt_hz
 from .state import AppState, ptt_tag_state
-from .widgets import CheckBox, FlatButton, ToggleButton, _OwnerDrawnMixin
+from .widgets import CheckBox, FlatButton, ToggleButton, help_hint, _OwnerDrawnMixin
+
+# Mute on TX only reacts to PTT your rig software actually reports live --
+# if PTT is wired through a line it only ever *sets* itself (never reads
+# back from the rig), CW/mic/footswitch PTT keyed directly at the rig goes
+# unnoticed. Verified live against real rigctld/flrig behavior this session
+# (an IC-7300 and FTX-1/FTdx10 profile) -- see project_brief.md.
+MUTE_ON_TX_HELP = (
+    "Mute on TX needs your rig software to report LIVE PTT status, not just "
+    "a line it drove itself -- otherwise CW/mic/footswitch PTT keyed "
+    "directly at the rig won't be seen.\n\n"
+    "rigctld: use -P RIG (the default for most modern rigs), not -P RTS/DTR "
+    "with a separate PTT-only -p port -- that only reads back the pin it "
+    "last set, never the rig's real state.\n\n"
+    "flrig: set \"PTT on CAT serial port\" to Both (not Get or Set alone), "
+    "and don't use a separate PTT-only serial port for RTS/DTR -- same "
+    "blind spot. Also tick the separate \"PTT\" checkbox in the Polling "
+    "section of flrig's transceiver setup (next to Volume/Mic/RF/Power/IF) "
+    "-- without it flrig never actually queries live PTT at all, no matter "
+    "what the CAT setting above is. After changing either setting, hit the "
+    "\"Init\" button on flrig's XCVR setup tab to re-init the connection -- "
+    "confirmed live: the new PTT settings didn't take effect until the "
+    "connection was re-initialized."
+)
 
 
 class _Dot(wx.Window):
@@ -365,6 +388,9 @@ class StripPanel(wx.Panel):
 
         self.mute_btn = CheckBox(self, "mute tx", emphasize_when_checked=True)
         sizer.Add(self.mute_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
+
+        self.mute_help = help_hint(self, MUTE_ON_TX_HELP)
+        sizer.Add(self.mute_help, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(3))
 
         sizer.Add(_VDivider(self), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, gap)
 
