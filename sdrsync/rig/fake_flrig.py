@@ -2,8 +2,9 @@
 flrig software.
 
 Registers the RPC methods sdrsync.rig.flrig.FlrigClient actually calls:
-main.get_version, rig.get_xcvr, rig.get_vfo, rig.get_mode, rig.get_bw,
-rig.get_ptt, and (v11 reverse sync) rig.set_vfoA, rig.set_mode. Run standalone
+main.get_version, rig.get_xcvr, rig.get_vfo, rig.get_vfoA, rig.get_mode,
+rig.get_bw, rig.get_ptt, and (v11 reverse sync) rig.set_vfoA, rig.set_mode.
+Run standalone
 (`python -m sdrsync.rig.fake_flrig`) to get an interactive prompt that
 lets you change frequency/mode/PTT while the rest of the app polls this
 server exactly like a real flrig instance.
@@ -179,6 +180,14 @@ def _register_methods(server: _FlrigXMLRPCServer, state: FakeFlrigState) -> None
     server.register_function(lambda: FLRIG_MOCK_VERSION, "main.get_version")
     server.register_function(lambda: _get_xcvr(state), "rig.get_xcvr")
     server.register_function(lambda: _get_vfo(state), "rig.get_vfo")
+    # rig.get_vfoA: real flrig's handler always does a genuine live CAT
+    # read (unlike rig.get_vfo's in-memory cache read -- see flrig.py's
+    # set_freq() docstring, fixed by a bug-hunter review pass to poll
+    # this instead). This fake server doesn't model separate VFO A/B
+    # state at all, so _get_vfo's own pending-countdown simulation of
+    # "takes N polls to become visible" already stands in correctly for
+    # either RPC from a client's observable poll-until-match behavior.
+    server.register_function(lambda: _get_vfo(state), "rig.get_vfoA")
     server.register_function(lambda: _get_mode(state), "rig.get_mode")
     server.register_function(lambda: [str(state.passband_hz), ""], "rig.get_bw")
     server.register_function(lambda: int(state.ptt), "rig.get_ptt")

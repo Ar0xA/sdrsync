@@ -69,6 +69,20 @@ AUDIO_UNLOCK_WATCH_ATTEMPT_S = 5.0
 # own fade-out is w3_opacity(...,0) then w3_hide() 1100ms later, so this
 # needs to be a bit longer than that.
 AUDIO_UNLOCK_OVERLAY_FADE_S = 1.2
+# How many consecutive "clicked, but the overlay is still there" outcomes
+# before the watcher stops clicking and switches to probe-only (see
+# _watch_for_audio_unlock_overlay's own comment). A require_id receiver
+# makes every click a permanent no-op -- confirmed live -- so with no cap
+# the watcher clicked forever: a bug-hunter review pass measured a real
+# OS-level mouse click (via wx.UIActionSimulator) roughly every
+# AUDIO_UNLOCK_WATCH_ATTEMPT_S + AUDIO_UNLOCK_OVERLAY_FADE_S seconds,
+# indefinitely, actively hijacking the cursor the operator needs to type
+# their ID into the page in the first place.
+AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER = 3
+# How often the probe-only phase re-checks once clicking has given up --
+# no more urgency once we're just waiting for the operator (or the page
+# itself) to clear the overlay some other way.
+AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S = 5.0
 
 # hamlib mode name -> (kiwi base mode, kiwi narrow-variant mode or None if
 # this mode has no narrow variant). Narrow-variant strings are taken
@@ -290,8 +304,21 @@ class KiwiSDRDriver:
         out to the event loop's default task-exception logging: a page-
         closed/navigated-away BrowserError here is routine (the operator
         disconnected or switched sites while this was still watching),
-        not a real error."""
+        not a real error.
+
+        After AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER consecutive clicks that
+        didn't actually clear the overlay (the require_id case -- see
+        below), stops clicking and switches to probe-only: still watches
+        for the overlay to disappear (e.g. the operator typed their ID
+        and dismissed it themselves), just without touching the mouse any
+        more. Found by a bug-hunter review pass: with no cap, this loop
+        clicked forever on a require_id receiver -- a real OS-level mouse
+        click roughly every 6s, indefinitely, actively hijacking the
+        cursor the operator needs to use to type into the very page this
+        was trying to help with."""
         logger.debug("Audio-unlock overlay watcher started for %s", self.url)
+        consecutive_ineffective_clicks = 0
+        clicking = True
         try:
             while self._attached:
                 # Re-checked every loop iteration, not just at spawn time
@@ -304,6 +331,17 @@ class KiwiSDRDriver:
                 if not self._auto_click_audio_unlock:
                     await asyncio.sleep(1.0)
                     continue
+
+                if not clicking:
+                    await asyncio.sleep(AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S)
+                    if not await element_is_present(page, ".id-play-button-container"):
+                        logger.info(
+                            "Audio-unlock overlay at %s cleared (probe-only, not by our own "
+                            "click)", self.url,
+                        )
+                        return
+                    continue
+
                 clicked = await click_element_if_present(
                     page, ".id-play-button-container", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S,
                 )
@@ -321,6 +359,16 @@ class KiwiSDRDriver:
                 # a moment to finish first.
                 await asyncio.sleep(AUDIO_UNLOCK_OVERLAY_FADE_S)
                 if await element_is_present(page, ".id-play-button-container"):
+                    consecutive_ineffective_clicks += 1
+                    if consecutive_ineffective_clicks >= AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER:
+                        clicking = False
+                        logger.info(
+                            "Audio-unlock overlay at %s did not clear after %d clicks -- "
+                            "likely a require_id receiver (the operator needs to enter an "
+                            "ID/callsign on the page itself); no longer clicking, will keep "
+                            "watching", self.url, consecutive_ineffective_clicks,
+                        )
+                        continue
                     logger.debug(
                         "Audio-unlock overlay at %s still present after being clicked "
                         "(likely a require_id receiver -- the operator needs to enter an "

@@ -2044,10 +2044,25 @@ class SyncEngine:
         if self._driver is not None:
             self._driver._auto_click_audio_unlock = self.settings.auto_click_audio_unlock
 
-        websdr_status = await self._driver.get_status() if self._websdr_active and self._driver else None
+        # NOT fetched unconditionally up front any more -- a bug-hunter
+        # review pass found this call was ALWAYS made (one full WebView
+        # JS round-trip) but only ever actually used by the three
+        # early-return branches below (rig inactive/still-connecting/
+        # nulled-mid-tick). In the steady state (rig connected, nothing
+        # to early-return for) it was computed and immediately discarded,
+        # doubling get_status()'s real per-tick page-poll cost for
+        # nothing -- confirmed live: 2 calls/tick instead of 1. Fetched
+        # lazily now, once per branch that actually needs it, at the same
+        # point in the sequence the single eager fetch used to occupy
+        # (still BEFORE that branch's own _idle_disconnect_if_due() call,
+        # so a session it tears down mid-branch is still described by the
+        # status captured just before teardown, same as before).
+        async def _websdr_status_now() -> Optional[WebSDRStatus]:
+            return await self._driver.get_status() if self._websdr_active and self._driver else None
 
         if not self._rig_active or self._rig is None:
             self._rig_was_connected_last_tick = False
+            websdr_status = await _websdr_status_now()
             if await self._idle_disconnect_if_due():
                 # The session described by websdr_status was just torn
                 # down -- don't publish a snapshot describing it (same
@@ -2066,9 +2081,8 @@ class SyncEngine:
                 logger.warning(give_up_message)
                 # _stop_rig() publishes its own fresh snapshot (reflecting
                 # rig_active=False and, via its cascade, websdr_active=False
-                # too) -- don't also publish the stale websdr_status
-                # computed above, which describes a session that's about
-                # to be torn down.
+                # too) -- don't also publish a websdr_status describing a
+                # session that's about to be torn down.
                 await self._stop_rig(error=give_up_message)
                 return
             # The ordinary still-trying-to-connect path -- note this is
@@ -2077,6 +2091,7 @@ class SyncEngine:
             # success and the give-up branch above can never fire again.
             # That is the realistic unattended failure case, and it must
             # not hold a public receiver's audio slot indefinitely.
+            websdr_status = await _websdr_status_now()
             if await self._idle_disconnect_if_due():
                 websdr_status = None
             self._publish(rig_connected=False, websdr=websdr_status)
@@ -2098,6 +2113,7 @@ class SyncEngine:
             # read this tick. Same not-connected publish/return as the
             # guard at the top of this method for the identical condition.
             self._rig_was_connected_last_tick = False
+            websdr_status = await _websdr_status_now()
             if await self._idle_disconnect_if_due():
                 websdr_status = None
             self._publish(rig_connected=False, websdr=websdr_status)

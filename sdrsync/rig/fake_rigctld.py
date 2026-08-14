@@ -45,6 +45,15 @@ class FakeRigState:
         self._pending_freq_hz: Optional[int] = None
         self._pending_mode: Optional[str] = None
         self._pending_passband_hz: Optional[int] = None
+        # 500ms is real hamlib's own default (confirmed live via a real
+        # rigctld's '\get_cache') -- RigctldClient.connect() now always
+        # sends '\set_cache 0' to disable it (see rigctld.py's
+        # _disable_write_through_cache() docstring for why), and this
+        # fake server tracks that the same way the real one does so tests
+        # can exercise both the disable-it-on-connect path and (by
+        # setting reject_set_cache) the older-rigctld fallback path.
+        self.cache_timeout_ms = 500
+        self.reject_set_cache = False
 
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: FakeRigState) -> None:
@@ -89,6 +98,15 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 writer.write(f"{state.ptt}\n".encode())
             elif cmd == "v":
                 writer.write(b"Dummy\n")
+            elif cmd == "\\get_cache":
+                writer.write(f"{state.cache_timeout_ms}\n".encode())
+            elif cmd.startswith("\\set_cache "):
+                parts = cmd.split()
+                if state.reject_set_cache or len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+                    writer.write(b"RPRT -11\n")
+                else:
+                    state.cache_timeout_ms = int(parts[1])
+                    writer.write(b"RPRT 0\n")
             elif cmd.startswith("F "):
                 parts = cmd.split()
                 if state.set_rejected or len(parts) != 2 or not parts[1].lstrip("-").isdigit():

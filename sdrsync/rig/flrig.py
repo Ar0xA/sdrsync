@@ -337,7 +337,24 @@ class FlrigClient:
             await asyncio.sleep(SET_VERIFY_POLL_INTERVAL_S)
             if self._proxy is None:
                 break
-            resp = await self._poll_call(lambda: self._proxy.rig.get_vfo())
+            # rig.get_vfoA, NOT rig.get_vfo -- a bug-hunter review pass
+            # found this verify loop was reading rig.get_vfo, whose
+            # handler (confirmed against flrig's real source,
+            # src/server/xml_server.cxx) just returns whichever of
+            # vfoA.freq/vfoB.freq is cached in memory (no live CAT read
+            # at all -- updated only by flrig's own periodic serial-poll
+            # thread or a prior set_vfoA call), so a poll landing before
+            # that background thread's next cycle could echo the very
+            # value THIS set_vfoA call just wrote to that same cache,
+            # "confirming" a push regardless of whether the physical rig
+            # ever actually took it. rig.get_vfoA's handler instead calls
+            # `selrig->get_vfoA()` unconditionally -- a genuine live CAT
+            # read every call -- and is also the correct VFO to check in
+            # the first place: set_vfoA always targets VFO A specifically,
+            # while get_vfo reads "whichever VFO flrig currently has in
+            # use" (vfoB.freq during a split/dual-VFO operation), a
+            # second, independent mismatch this also happens to fix.
+            resp = await self._poll_call(lambda: self._proxy.rig.get_vfoA())
             actual = parse_freq_response(resp)
             if actual is not None and abs(actual - freq_hz) <= FREQ_VERIFY_TOLERANCE_HZ:
                 return True
@@ -347,25 +364,57 @@ class FlrigClient:
         return False
 
     async def set_mode(self, mode_name: str, verify_budget_s: Optional[float] = None) -> bool:
-        """Reverse-sync (WebSDR -> rig). Sets ONLY the mode via
-        rig.set_mode -- never touches filter/bandwidth. flrig does have a
-        separate rig.set_bandwidth RPC (confirmed against flrig's source,
-        src/server/xml_server.cxx: registered signature "i:i") and an
-        earlier version of this method called it, but a user reported
-        live that having reverse sync touch the filter at all was
-        unwelcome, matching the same "mode-only" ask that changed
+        """Reverse-sync (WebSDR -> rig). Calls ONLY rig.set_mode -- this
+        driver never itself calls rig.set_bandwidth (confirmed against
+        flrig's source, src/server/xml_server.cxx: registered signature
+        "i:i"; an earlier version of this method called it, but a user
+        reported live that having reverse sync touch the filter at all
+        was unwelcome, matching the same "mode-only" ask that changed
         RigctldClient.set_mode() to always send hamlib's -1 ("leave
         bandwidth alone") sentinel instead of a concrete width -- see
-        that method's docstring. flrig's rig.set_bandwidth has no
-        equivalent "leave alone" input of its own (a 0 clamps to the
-        NARROWEST supported filter, confirmed via source), so for this
-        backend "never touch it" means simply never calling it, not
-        calling it with a sentinel value.
+        that method's docstring).
+
+        This is NOT actually equivalent to rigctld's -1 sentinel, though
+        -- flrig has no "leave bandwidth alone" input at all (set_bandwidth's
+        own 0 clamps to the NARROWEST supported filter, confirmed via
+        source), and more importantly rig.set_mode's OWN server-side
+        handler resets the filter to that mode's default internally
+        regardless of what this driver calls (confirmed against flrig's
+        real source, src/server/xml_server.cxx's rig_set_mode class and
+        src/support/support.cxx's serviceA(): `nuvals.iBW =
+        selrig->def_bandwidth(i)`, applied via set_bwA() if it differs
+        from the current filter). So a reverse-sync mode change on flrig
+        DOES change your filter width to that mode's flrig-configured
+        default -- there is no way to avoid this via flrig's XML-RPC
+        surface at all, not just something this driver chooses not to
+        do. Found by a bug-hunter review pass; left as-is (not restoring
+        the prior bandwidth via an explicit set_bandwidth call
+        afterward) per explicit user direction, given the earlier
+        set_bandwidth-touching version was already found unwelcome once.
 
         Verified via a bounded poll-until-match readback of get_mode() --
         set_mode's own RPC response silently no-ops on an unrecognized
         mode string rather than erroring. verify_budget_s: see
-        set_freq() -- including the same xcvr-offline refusal."""
+        set_freq() -- including the same xcvr-offline refusal.
+
+        Unlike set_freq()'s verify loop (fixed to use rig.get_vfoA, a
+        genuine live CAT read every call), there is no live-read
+        equivalent available for mode: confirmed against flrig's real
+        source that BOTH rig.get_mode and rig.get_modeA just read an
+        in-memory struct field (vfo->imode / vfoA.imode) with no CAT
+        query at all -- updated only by flrig's own periodic serial-poll
+        thread or a prior set_mode call, same staleness risk as the old
+        rig.get_vfo. get_mode (not get_modeA) is still the right one to
+        poll, though: rig.set_mode targets "whichever VFO flrig
+        currently has in use" (serviceA/serviceB based on
+        selrig->inuse), which is exactly what get_mode reads back --
+        get_modeA would be reading the wrong VFO during a split/dual-VFO
+        operation. This staleness window is real but narrower in
+        practice than set_freq()'s was: SET_VERIFY_POLL_INTERVAL_S
+        (250ms) is close to flrig's own serial-poll cadence, so most
+        polls land on an already-refreshed value; found by a bug-hunter
+        review pass, left as a known, documented limitation rather than
+        a false claim of full verification."""
         if self._proxy is None or not await self._xcvr_online():
             return False
         budget = SET_VERIFY_BUDGET_S if verify_budget_s is None else verify_budget_s

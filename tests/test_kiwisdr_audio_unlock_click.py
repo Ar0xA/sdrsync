@@ -175,3 +175,67 @@ def test_skips_the_click_when_disabled_via_settings():
     assert driver._audio_unlock_task is None
     assert page.click_calls == []
     assert driver.attached is True
+
+
+def test_stops_clicking_after_give_up_threshold_on_a_require_id_receiver(monkeypatch):
+    """Found by a bug-hunter review pass: with no cap, a require_id
+    receiver (every click a permanent no-op) made the watcher click
+    forever -- a real OS-level mouse click roughly every
+    AUDIO_UNLOCK_WATCH_ATTEMPT_S + AUDIO_UNLOCK_OVERLAY_FADE_S seconds,
+    indefinitely, actively hijacking the cursor the operator needs to
+    type their ID into the very page this was trying to help with. After
+    AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER ineffective clicks, it must stop
+    clicking (while still watching, in case the operator clears the
+    overlay themselves)."""
+    monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_OVERLAY_FADE_S", 0.01)
+    monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_WATCH_ATTEMPT_S", 0.02)
+    monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(browser_shim, "CLICK_ELEMENT_POLL_INTERVAL_S", 0.01)
+    page = StubPage(overlay_rect={"x": 50.0, "y": 60.0}, never_disappears=True)
+    driver = KiwiSDRDriver("http://example.invalid")
+
+    async def _run():
+        await driver.attach(page)
+        await asyncio.sleep(0.3)  # well past AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER clicks
+        count_after_giving_up = len(page.click_calls)
+        await asyncio.sleep(0.3)  # probe-only phase -- must not click any more
+        task = driver._audio_unlock_task
+        await driver.close()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        return count_after_giving_up
+
+    count_after_giving_up = asyncio.run(_run())
+
+    assert count_after_giving_up == kiwisdr_module.AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER
+    assert len(page.click_calls) == count_after_giving_up, "must not click again during the probe-only phase"
+
+
+def test_probe_only_phase_reports_success_if_the_overlay_clears_itself(monkeypatch):
+    """Once the watcher has given up clicking, it should still notice the
+    operator (or the page itself) clearing the overlay some other way,
+    and stop watching -- not spin forever."""
+    monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_OVERLAY_FADE_S", 0.01)
+    monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_WATCH_ATTEMPT_S", 0.02)
+    monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(browser_shim, "CLICK_ELEMENT_POLL_INTERVAL_S", 0.01)
+    page = StubPage(overlay_rect={"x": 50.0, "y": 60.0}, never_disappears=True)
+    driver = KiwiSDRDriver("http://example.invalid")
+
+    async def _run():
+        await driver.attach(page)
+        # Let it give up clicking (AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER clicks).
+        await asyncio.sleep(0.3)
+        assert len(page.click_calls) == kiwisdr_module.AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER
+        # Operator clears it themselves, with no further click from us.
+        page._never_disappears = False
+        page._clicked = True
+        task = driver._audio_unlock_task
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(_run())
+
+    assert len(page.click_calls) == kiwisdr_module.AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER

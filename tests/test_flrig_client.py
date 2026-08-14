@@ -289,3 +289,38 @@ def test_timeout_transport_bounds_a_hung_connection():
         stop.set()
         listener.close()
         thread.join(timeout=2.0)
+
+
+def test_set_freq_verify_reads_get_vfoA_not_the_potentially_stale_get_vfo():
+    """A bug-hunter review pass found the verify loop was polling
+    rig.get_vfo, whose real handler just returns an in-memory cached
+    value (no live CAT read at all -- confirmed against flrig's actual
+    source) that could still be echoing the very value THIS set_vfoA
+    call just wrote into that same cache, regardless of whether the
+    physical rig ever took it. rig.get_vfoA's handler does a genuine
+    live CAT read every call and is also the VFO set_vfoA actually
+    targets. This test makes the two RPCs diverge (get_vfo always wrong/
+    stale, get_vfoA correct) to prove set_freq() reads the right one."""
+    async def run():
+        handle, state = await start_server(port=0)
+        # get_vfo permanently reports a stale value, as if flrig's own
+        # background serial-poll thread hadn't refreshed it yet.
+        handle._server.register_function(lambda: "99999999", "rig.get_vfo")
+        # get_vfoA reports the real, current value -- same as the
+        # default _get_vfo behavior (including the pending-countdown
+        # simulation), just registered separately so it's independently
+        # verifiable that THIS is the one being polled.
+        from sdrsync.rig.fake_flrig import _get_vfo
+        handle._server.register_function(lambda: _get_vfo(state), "rig.get_vfoA")
+
+        client = FlrigClient("127.0.0.1", handle.port)
+        try:
+            assert await client.connect() is True
+            assert await client.set_freq(7074000) is True
+            assert state.freq_hz == 7074000
+        finally:
+            await client.close()
+            handle.close()
+            await handle.wait_closed()
+
+    asyncio.run(run())

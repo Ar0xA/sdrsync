@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import Optional
 
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
@@ -205,7 +206,17 @@ class WebsdrOrgDriver:
                 timeout=LOAD_TIMEOUT_MS,
             )
             await self._load_band_table()
-            if self._auto_click_audio_unlock:
+            # Windows/Edge WebView2 already runs with
+            # --autoplay-policy=no-user-gesture-required (browser/backend.py)
+            # so this click is unneeded there and was, until a bug-hunter
+            # review pass caught it, moving the user's real mouse on every
+            # Windows attach for nothing -- KiwiSDR's and OpenWebRX's
+            # watchers already gate the same way (sys.platform != "win32"),
+            # this driver's own click just hadn't been given the same
+            # gate. Also contradicts AppSettings.auto_click_audio_unlock's
+            # own docstring ("No effect on Windows/WebView2"), which was
+            # false for this specific driver until now.
+            if sys.platform != "win32" and self._auto_click_audio_unlock:
                 await self._satisfy_audio_gate()
         except WebSDRIncompatibleError as e:
             self._last_attach_error = str(e)

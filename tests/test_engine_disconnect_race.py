@@ -15,7 +15,17 @@ so the real code can no longer actually yield there. The test is still a
 real regression guard for the later guards it exercises (a stub whose
 set_muted() does NOT touch engine state would make it pass whether or not
 those guards existed at all -- confirmed by a bug-hunter review pass, not
-just asserted here)."""
+just asserted here).
+
+get_status() call counts below assume ONE get_status() call per tick in
+the steady state (rig connected, no early return), not two -- a LATER
+bug-hunter review pass found _tick() used to also fetch it unconditionally
+at the very top, whether or not any of the three early-return branches
+that actually use that value fire, doubling the real per-tick WebView
+page-poll cost in the common case for nothing. Fetched lazily now, only
+by the branches that need it -- none of which run in these tests (the rig
+is always active/connected here), so the only get_status() call left is
+the one inside the not-transmitting forward-push/reverse-sync block."""
 import asyncio
 import queue
 
@@ -120,11 +130,12 @@ def test_driver_going_none_mid_tick_during_ptt_mute_does_not_crash():
     asyncio.run(engine._tick())
 
     assert page.mute_calls == [True]
-    # get_status() is legitimately called once at the very top of _tick()
-    # (before the mute call/race), while the driver was still real -- the
-    # SECOND, later call this tick (the one this fix guards) must have been
-    # skipped rather than crashing or firing again against the gone driver.
-    assert driver.get_status_calls == 1
+    # get_status() is only ever called inside the not-transmitting
+    # forward-push/reverse-sync block -- PTT is True here, so
+    # "transmitting" skips that whole block, and get_status() must never
+    # be called at all (not even once): the driver is already gone by the
+    # time anything downstream would try.
+    assert driver.get_status_calls == 0
     assert engine._driver is None
     assert engine._page is None
     assert engine._websdr_active is False
@@ -151,22 +162,22 @@ def test_driver_going_none_mid_tick_during_mode_push_does_not_crash():
 
     asyncio.run(engine._tick())
 
-    # Same reasoning as the mute-path test: called once at the top of
-    # _tick() before the mode-push race, not a second time afterward.
-    assert driver.get_status_calls == 1
+    # The mode push (which nulls the driver) runs BEFORE the block's own
+    # get_status() call, so that call must never happen at all -- the
+    # None-check ahead of it must see the driver already gone.
+    assert driver.get_status_calls == 0
     assert engine._driver is None
 
 
-def test_driver_going_none_during_the_second_get_status_call_skips_reverse_sync():
-    """The second, later get_status() call (the one right before the
-    reverse-sync gate) can itself complete successfully -- bound to the
-    OLD driver object at call time -- even though engine._driver has
-    already gone None by the time it returns (a concurrent
-    _stop_websdr()/_stop_rig() completing while this exact await was
-    suspended). _reverse_sync_tick() dereferences self._driver
-    immediately with no guard of its own, so the reverse-sync gate at the
-    call site must re-check self._driver is not None, not just
-    websdr_status is not None."""
+def test_driver_going_none_during_the_get_status_call_skips_reverse_sync():
+    """The get_status() call right before the reverse-sync gate can
+    itself complete successfully -- bound to the OLD driver object at
+    call time -- even though engine._driver has already gone None by the
+    time it returns (a concurrent _stop_websdr()/_stop_rig() completing
+    while this exact await was suspended). _reverse_sync_tick()
+    dereferences self._driver immediately with no guard of its own, so
+    the reverse-sync gate at the call site must re-check self._driver is
+    not None, not just websdr_status is not None."""
     settings = AppSettings(mute_on_tx=True)
     engine = SyncEngine(settings, status_queue=queue.Queue(), webview_host=_UnusedWebViewHost())
     engine._rig = StubRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
@@ -185,14 +196,16 @@ def test_driver_going_none_during_the_second_get_status_call_skips_reverse_sync(
 
         async def get_status(self) -> WebSDRStatus:
             self.get_status_calls += 1
-            if self.get_status_calls == 2:
-                # The SECOND call this tick -- right before the reverse-
-                # sync gate. Simulate a concurrent stop completing while
-                # this exact await was in flight: it still returns a real,
-                # connected status (bound to this driver instance), but
-                # engine._driver is gone by the time control returns.
-                self.engine._driver = None
-                self.engine._websdr_active = False
+            # The ONE call this tick (the not-transmitting block's own
+            # get_status(), right before the reverse-sync gate -- see the
+            # module docstring, this is no longer preceded by a separate
+            # eager top-of-tick call). Simulate a concurrent stop
+            # completing while this exact await was in flight: it still
+            # returns a real, connected status (bound to this driver
+            # instance), but engine._driver is gone by the time control
+            # returns.
+            self.engine._driver = None
+            self.engine._websdr_active = False
             return WebSDRStatus(connected=True)
 
     driver = DisconnectingStatusDriver(engine)
@@ -201,5 +214,5 @@ def test_driver_going_none_during_the_second_get_status_call_skips_reverse_sync(
 
     asyncio.run(engine._tick())  # must not raise
 
-    assert driver.get_status_calls == 2
+    assert driver.get_status_calls == 1
     assert engine._driver is None

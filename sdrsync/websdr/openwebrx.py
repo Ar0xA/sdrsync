@@ -69,6 +69,13 @@ AUDIO_UNLOCK_WATCH_ATTEMPT_S = 5.0
 # own hideOverlay() fades it out via a CSS transition rather than
 # removing it instantly.
 AUDIO_UNLOCK_OVERLAY_FADE_S = 1.2
+# How many consecutive "clicked, but the overlay is still there" outcomes
+# before the watcher stops clicking and switches to probe-only -- see
+# kiwisdr.py's identical constant (a bug-hunter review pass found the
+# unbounded version could click forever with no way to ever stop).
+AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER = 3
+# How often the probe-only phase re-checks once clicking has given up.
+AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S = 5.0
 
 # hamlib mode name -> OpenWebRX modulation string. Confirmed live via
 # Modes.getModes() that these carry no narrow/wide suffix convention (unlike
@@ -302,7 +309,18 @@ class OpenWebRXDriver:
         the event loop's default task-exception logging: a page-closed/
         navigated-away BrowserError here is routine (the operator
         disconnected or switched sites while this was still watching), not
-        a real error."""
+        a real error.
+
+        Stops clicking (switches to probe-only) after
+        AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER ineffective clicks -- see
+        kiwisdr.py's identical watcher for why: a bug-hunter review pass
+        found the unbounded version could click forever, with no way to
+        ever stop, on any page state where clicking is a permanent no-op
+        (confirmed live on KiwiSDR's require_id receivers; not specifically
+        confirmed on an OpenWebRX instance, but the same code shape carries
+        the same risk here)."""
+        consecutive_ineffective_clicks = 0
+        clicking = True
         try:
             while self._attached:
                 # Re-checked every loop iteration -- see kiwisdr.py's
@@ -313,6 +331,17 @@ class OpenWebRXDriver:
                 if not self._auto_click_audio_unlock:
                     await asyncio.sleep(1.0)
                     continue
+
+                if not clicking:
+                    await asyncio.sleep(AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S)
+                    if not await element_is_present(page, "#openwebrx-autoplay-overlay"):
+                        logger.info(
+                            "Audio-unlock overlay at %s cleared (probe-only, not by our own "
+                            "click)", self.url,
+                        )
+                        return
+                    continue
+
                 clicked = await click_element_if_present(
                     page, "#openwebrx-autoplay-overlay", timeout_s=AUDIO_UNLOCK_WATCH_ATTEMPT_S,
                 )
@@ -329,6 +358,15 @@ class OpenWebRXDriver:
                 # transition rather than removing it instantly.
                 await asyncio.sleep(AUDIO_UNLOCK_OVERLAY_FADE_S)
                 if await element_is_present(page, "#openwebrx-autoplay-overlay"):
+                    consecutive_ineffective_clicks += 1
+                    if consecutive_ineffective_clicks >= AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER:
+                        clicking = False
+                        logger.info(
+                            "Audio-unlock overlay at %s did not clear after %d clicks -- "
+                            "no longer clicking, will keep watching", self.url,
+                            consecutive_ineffective_clicks,
+                        )
+                        continue
                     logger.debug(
                         "Audio-unlock overlay at %s still present after being clicked; "
                         "will keep watching", self.url,

@@ -178,3 +178,35 @@ def test_skips_the_click_when_disabled_via_settings():
     assert driver._audio_unlock_task is None
     assert page.click_calls == []
     assert driver.attached is True
+
+
+def test_stops_clicking_after_give_up_threshold(monkeypatch):
+    """See kiwisdr.py's identical test -- a bug-hunter review pass found
+    the unbounded version could click forever. After
+    AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER ineffective clicks, it must stop
+    clicking (while still watching)."""
+    monkeypatch.setattr(openwebrx_module, "AUDIO_UNLOCK_OVERLAY_FADE_S", 0.01)
+    monkeypatch.setattr(openwebrx_module, "AUDIO_UNLOCK_WATCH_ATTEMPT_S", 0.02)
+    monkeypatch.setattr(openwebrx_module, "AUDIO_UNLOCK_PROBE_ONLY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(browser_shim, "CLICK_ELEMENT_POLL_INTERVAL_S", 0.01)
+    page = StubPage(overlay_rect={"x": 50.0, "y": 60.0}, never_disappears=True)
+    driver = OpenWebRXDriver("http://example.invalid")
+
+    async def _run():
+        await driver.attach(page)
+        await asyncio.sleep(0.3)
+        count_after_giving_up = len(page.click_calls)
+        await asyncio.sleep(0.3)
+        task = driver._audio_unlock_task
+        await driver.close()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        return count_after_giving_up
+
+    count_after_giving_up = asyncio.run(_run())
+
+    assert count_after_giving_up == openwebrx_module.AUDIO_UNLOCK_CLICK_GIVE_UP_AFTER
+    assert len(page.click_calls) == count_after_giving_up, "must not click again during the probe-only phase"

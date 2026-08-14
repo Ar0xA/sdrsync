@@ -348,3 +348,48 @@ def test_set_freq_verify_poll_timeout_reconnects_without_corrupting_the_stream()
             server.close()
 
     asyncio.run(run())
+
+
+def test_connect_disables_rigctlds_write_through_cache():
+    """rigctld caches the REQUESTED value of a SET for up to 500ms by
+    default (real hamlib behavior, confirmed live -- see
+    rigctld.py's _disable_write_through_cache() docstring), which can
+    make a readback poll during that window echo the request back
+    regardless of whether the rig actually took it. connect() must send
+    '\\set_cache 0' so every subsequent get_freq()/get_mode()/set_freq()/
+    set_mode() verify poll is a genuine read, not a stale cache hit."""
+    async def run():
+        server, state = await start_server(port=0)
+        port = server.sockets[0].getsockname()[1]
+        assert state.cache_timeout_ms == 500  # real hamlib's own default
+        client = RigctldClient("127.0.0.1", port)
+        try:
+            assert await client.connect() is True
+            assert state.cache_timeout_ms == 0
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_connect_survives_an_older_rigctld_that_rejects_set_cache():
+    """A hamlib version too old to support '\\set_cache' must not break
+    the connection -- best-effort only, logged and moved on."""
+    async def run():
+        server, state = await start_server(port=0)
+        port = server.sockets[0].getsockname()[1]
+        state.reject_set_cache = True
+        client = RigctldClient("127.0.0.1", port)
+        try:
+            assert await client.connect() is True
+            assert client.connected is True
+            # Still fully usable afterward.
+            assert await client.get_freq() == 14074000
+        finally:
+            await client.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())

@@ -1316,3 +1316,37 @@ def test_changing_cw_offset_mid_session_does_not_retune_the_rig():
 
     assert stub_rig.set_freqs == [], "changing the CW offset alone must never retune the rig"
     assert driver.cw_offset_hz == 700, "the driver must still pick up the new offset"
+
+
+class _CountingStatusDriver(StubReverseDriver):
+    def __init__(self, status: WebSDRStatus) -> None:
+        super().__init__(status)
+        self.get_status_calls = 0
+
+    async def get_status(self) -> WebSDRStatus:
+        self.get_status_calls += 1
+        return await super().get_status()
+
+
+def test_get_status_is_called_exactly_once_per_steady_state_tick():
+    """A bug-hunter review pass found _tick() used to fetch get_status()
+    unconditionally at the very top -- one full WebView page-poll round
+    trip -- even though that value was only ever actually used by the
+    three early-return branches (rig inactive/still-connecting/nulled-
+    mid-tick). In the steady state (rig connected, nothing to early-
+    return for -- the common case, and what this test exercises) it was
+    computed and immediately discarded, silently doubling the real
+    per-tick page-poll cost for no reason. Fetched lazily now, only by
+    the branches that actually need it."""
+    engine = make_engine()
+    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
+    status = WebSDRStatus(connected=True, freq_hz=14074000, mode="USB")
+    engine._rig, engine._rig_active = stub_rig, True
+    driver = _CountingStatusDriver(status)
+    engine._driver, engine._websdr_active = driver, True
+    _settle_and_capture_baseline(engine)
+
+    driver.get_status_calls = 0
+    asyncio.run(engine._tick())
+
+    assert driver.get_status_calls == 1

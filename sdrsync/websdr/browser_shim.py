@@ -1001,6 +1001,32 @@ class WxPageAdapter:
                 if not self._alive:  # SafeYield can re-enter and process a Destroy queued elsewhere
                     return
                 screen_pos = self.webview.ClientToScreen(wx.Point(x, y))
+                # Confirmed the target actually reaches OUR window before
+                # injecting anything -- a bug-hunter review pass found no
+                # such check existed: a minimized/iconized host frame, or
+                # anything else currently covering that exact screen
+                # point (another app's window, a screensaver, a dialog),
+                # would still get a real OS-level click sent to it, since
+                # ClientToScreen() happily returns coordinates for a
+                # window that isn't actually visible there. wx.
+                # FindWindowAtPoint() only ever returns a window that
+                # belongs to THIS process, so None here already means
+                # "something else occupies that point" without needing a
+                # separate ownership check.
+                top_level = self.webview.GetTopLevelParent()
+                if top_level is None or not top_level.IsShown() or top_level.IsIconized():
+                    logger.debug(
+                        "Simulated click at (%d, %d) skipped: host window is not shown "
+                        "(minimized or hidden)", x, y,
+                    )
+                    return
+                found = wx.FindWindowAtPoint(screen_pos)
+                if found is None or found.GetTopLevelParent() is not top_level:
+                    logger.debug(
+                        "Simulated click at (%d, %d) skipped: that screen position is "
+                        "currently not under our own window", x, y,
+                    )
+                    return
                 sim = wx.UIActionSimulator()
                 sim.MouseMove(screen_pos)
                 wx.MilliSleep(30)

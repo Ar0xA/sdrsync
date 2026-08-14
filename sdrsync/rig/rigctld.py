@@ -47,6 +47,12 @@ The verify loop also always sleeps once before its first readback poll
 (never polls at t=0) -- an immediate poll fires in the same instant the
 SET command was written, when the rig is certain not to have applied it
 yet, and is the poll most likely to collide with that command on the bus.
+
+connect() also sends rigctld's own '\\set_cache 0' -- see
+_disable_write_through_cache()'s docstring for why: rigctld caches the
+*requested* value of a SET for up to 500ms by default, which the verify
+loop above could otherwise read back as confirmation regardless of
+whether the rig actually took the command.
 """
 from __future__ import annotations
 
@@ -178,9 +184,49 @@ class RigctldClient:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), timeout=self.connect_timeout
             )
-            return True
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
             return False
+        await self._disable_write_through_cache()
+        return True
+
+    async def _disable_write_through_cache(self) -> None:
+        """rigctld itself (not the physical rig) caches the value of a
+        just-issued SET for CACHE_TIMEOUT_DEFAULT_MS (500ms in hamlib
+        4.5.5, confirmed live via '\\get_cache' against a real rigctld) --
+        rig_set_freq()/rig_set_mode() write the REQUESTED value into that
+        cache before the CAT command necessarily reaches the rig, and a
+        readback poll landing inside that window echoes the request back
+        regardless of whether the rig actually took it. Confirmed live,
+        via this project's own set_freq()/set_mode() verify loop against
+        real rigctld: a poll at 250ms reported success while the rig was
+        provably still on its old frequency/mode. This defeats the whole
+        point of the readback verification the module docstring describes
+        (and was found by a bug-hunter review pass, not this project's
+        own live testing).
+
+        '\\set_cache 0' (confirmed live: takes effect immediately,
+        '\\get_cache' afterward reports 0) disables the cache outright, so
+        every subsequent get_freq()/get_mode()/get_ptt() is a genuine CAT
+        read -- not just fixing set_freq()/set_mode()'s own verify loop,
+        but also the ordinary forward-sync poll, which was equally
+        capable of reading a stale cached value instead of the rig's real
+        current state.
+
+        Best-effort: an RPRT error (a hamlib version too old to support
+        '\\set_cache') is logged but not fatal -- the connection is still
+        usable, just with the cache-window false-positive risk this
+        exists to close. Not re-sent on reconnect-mid-session by anything
+        other than connect() itself, since every fresh connection needs
+        it applied again (rigctld's cache setting lives on the
+        connection/session, confirmed via the same live test)."""
+        resp = await self._send_raw("\\set_cache 0")
+        if resp != "RPRT 0":
+            logger.warning(
+                "rigctld did not accept '\\set_cache 0' (got %r) -- this rigctld version may be "
+                "too old; reverse-sync verification may see stale cached readbacks for up to "
+                "500ms after a SET",
+                resp,
+            )
 
     def reconnect_delay(self) -> float:
         """Exponential backoff delay for the *next* reconnect attempt."""

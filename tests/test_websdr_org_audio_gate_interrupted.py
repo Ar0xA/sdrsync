@@ -55,3 +55,58 @@ def test_suspended_state_still_triggers_resume(monkeypatch):
 def test_running_state_does_not_call_resume(monkeypatch):
     page = _run_audio_gate("running", monkeypatch)
     assert not page.resume_called
+
+
+class _AttachStubPage:
+    """Just enough of Page for attach() to complete: goto()/
+    wait_for_function() no-op, evaluate() answers the band-table read."""
+
+    def __init__(self) -> None:
+        self.mouse = _StubMouse()
+
+    def on(self, event, handler):
+        pass
+
+    async def goto(self, url, timeout=None):
+        pass
+
+    async def wait_for_function(self, js, timeout=None):
+        pass
+
+    async def evaluate(self, js, *_args):
+        return [{"c": 14074, "s": 12}]  # one band, keeps _load_band_table() happy
+
+
+def test_audio_gate_click_is_skipped_on_windows(monkeypatch):
+    """Windows/Edge WebView2 already runs with
+    --autoplay-policy=no-user-gesture-required (browser/backend.py) --
+    this driver's own click was NOT platform-gated (unlike KiwiSDR's/
+    OpenWebRX's identical watchers), found by a bug-hunter review pass:
+    it moved the user's real mouse on every Windows attach for nothing,
+    and contradicted AppSettings.auto_click_audio_unlock's own docstring
+    ("No effect on Windows/WebView2")."""
+    monkeypatch.setattr(websdr_org.sys, "platform", "win32")
+    driver = WebsdrOrgDriver("http://example.invalid")
+    gate_calls = []
+    driver._satisfy_audio_gate = lambda: gate_calls.append(1) or _immediate()
+    page = _AttachStubPage()
+
+    asyncio.run(driver.attach(page))
+
+    assert gate_calls == []
+
+
+def test_audio_gate_click_still_happens_off_windows(monkeypatch):
+    monkeypatch.setattr(websdr_org.sys, "platform", "linux")
+    driver = WebsdrOrgDriver("http://example.invalid")
+    gate_calls = []
+    driver._satisfy_audio_gate = lambda: gate_calls.append(1) or _immediate()
+    page = _AttachStubPage()
+
+    asyncio.run(driver.attach(page))
+
+    assert gate_calls == [1]
+
+
+async def _immediate():
+    return None
