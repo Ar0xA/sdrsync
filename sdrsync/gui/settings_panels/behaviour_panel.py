@@ -8,8 +8,8 @@ import wx
 
 from .. import theme
 from ..fonts import label_font, value_font
-from ..widgets import CheckBox
-from ...config import AppSettings
+from ..widgets import CheckBox, FlatButton
+from ...config import CW_HZ_MAX, CW_HZ_MIN, AppSettings
 
 SYNC_DIRECTION_ONE_WAY = "Rig -> WebSDR"
 SYNC_DIRECTION_BIDIRECTIONAL = "Rig <-> WebSDR (reverse within range)"
@@ -47,8 +47,8 @@ class BehaviourPanel(wx.Panel):
         outer = wx.BoxSizer(wx.VERTICAL)
         outer.AddSpacer(pad_top)
 
-        grid = wx.FlexGridSizer(cols=3, gap=wx.Size(self.FromDIP(14), self.FromDIP(5)))
-        for col in range(3):
+        grid = wx.FlexGridSizer(cols=4, gap=wx.Size(self.FromDIP(14), self.FromDIP(5)))
+        for col in range(4):
             grid.AddGrowableCol(col)
 
         def field(label_text: str, control: wx.Window) -> wx.BoxSizer:
@@ -56,6 +56,25 @@ class BehaviourPanel(wx.Panel):
             box.Add(_kicker(self, label_text), 0, wx.BOTTOM, self.FromDIP(5))
             box.Add(control, 0, wx.EXPAND)
             return box
+
+        self.cw_offset_ctrl = wx.SpinCtrl(self, min=CW_HZ_MIN, max=CW_HZ_MAX, initial=settings.cw_offset_hz)
+        self.cw_offset_ctrl.SetFont(value_font())
+        # Narrower than the default best-size -- 5 digits plus a sign
+        # covers the whole CW_HZ_MIN..CW_HZ_MAX range, no need for the
+        # wider default width.
+        self.cw_offset_ctrl.SetMinSize(wx.Size(self.FromDIP(70), -1))
+        self.cw_offset_ctrl.Bind(wx.EVT_SPINCTRL, self._on_cw_offset_changed)
+        # EVT_SPINCTRL fires for the up/down arrows, but a value typed
+        # directly into the text portion only registers once focus
+        # leaves the control -- an explicit Apply button lets the
+        # operator force it to take effect immediately instead, without
+        # having to click elsewhere first.
+        self.cw_offset_apply_btn = FlatButton(self, "Apply")
+        self.cw_offset_apply_btn.Bind(wx.EVT_BUTTON, self._on_cw_offset_changed)
+        cw_offset_row = wx.BoxSizer(wx.HORIZONTAL)
+        cw_offset_row.Add(self.cw_offset_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
+        cw_offset_row.Add(self.cw_offset_apply_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(6))
+        grid.Add(field("WebSDR CW offset (Hz)", cw_offset_row), 1, wx.EXPAND)
 
         idle_val = settings.websdr_idle_disconnect_min if settings.websdr_idle_disconnect_min is not None else 0
         self.idle_disconnect_ctrl = wx.SpinCtrl(self, min=0, max=600, initial=idle_val)
@@ -142,6 +161,10 @@ class BehaviourPanel(wx.Panel):
         outer.Add(checks, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad_side)
         outer.AddSpacer(pad_bottom)
         self.SetSizer(outer)
+
+    def _on_cw_offset_changed(self, _evt: wx.CommandEvent) -> None:
+        self.settings.cw_offset_hz = self.cw_offset_ctrl.GetValue()
+        self.settings.save()
 
     def _on_idle_disconnect_changed(self, _evt: wx.CommandEvent) -> None:
         value = self.idle_disconnect_ctrl.GetValue()

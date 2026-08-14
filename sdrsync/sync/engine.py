@@ -587,10 +587,9 @@ class SyncEngine:
         self._rig_was_connected_last_tick: bool = False
 
         # cw_offset_hz as last applied to self._driver -- None until the
-        # first driver exists. Compared against self._effective_cw_offset_hz()
-        # each tick so a LIVE change (the user editing either the
-        # Transceiver tab's WebSDR CW offset spinner or its CW pitch
-        # field, mid-session) can be told apart from "just attached, this
+        # first driver exists. Compared against self.settings.cw_offset_hz
+        # each tick so a LIVE change (the user editing the Behaviour-tab
+        # spinner mid-session) can be told apart from "just attached, this
         # is what the driver was already constructed with" -- see
         # _tick()'s own use of this for why that distinction matters (a
         # live change must reseed the reverse-sync baseline, not be read
@@ -1089,10 +1088,10 @@ class SyncEngine:
         self._page = page
         self.site = site
         self._driver = driver_cls(
-            site.url, cw_offset_hz=self._effective_cw_offset_hz(),
+            site.url, cw_offset_hz=self.settings.cw_offset_hz,
             auto_click_audio_unlock=self.settings.auto_click_audio_unlock,
         )
-        self._applied_cw_offset_hz = self._effective_cw_offset_hz()
+        self._applied_cw_offset_hz = self.settings.cw_offset_hz
         self._websdr_active = True
         self._reset_sync_latches()
         # Runs for the WebSDR subsystem's whole lifetime, independently of
@@ -1226,10 +1225,10 @@ class SyncEngine:
 
         self.site = site
         self._driver = driver_cls(
-            site.url, cw_offset_hz=self._effective_cw_offset_hz(),
+            site.url, cw_offset_hz=self.settings.cw_offset_hz,
             auto_click_audio_unlock=self.settings.auto_click_audio_unlock,
         )
-        self._applied_cw_offset_hz = self._effective_cw_offset_hz()
+        self._applied_cw_offset_hz = self.settings.cw_offset_hz
         self._reset_sync_latches()
         # Re-bound against the SAME page for the new generation -- see
         # WxPageAdapter.set_on_dead()'s docstring for why this can't be
@@ -2086,16 +2085,6 @@ class SyncEngine:
                 min(push.attempts - 1, len(REVERSE_PUSH_BACKOFF_S) - 1)
             ]
 
-    def _effective_cw_offset_hz(self) -> int:
-        """The single value actually applied to a driver's cw_offset_hz:
-        the Transceiver tab's "WebSDR CW offset" plus its "CW pitch"
-        (the rig's own, manually-entered pitch/sidetone setting) --
-        summed here so both feed the exact same driver attribute,
-        reusing all of its existing live-sync/reverse-sync-reseed
-        handling for free instead of threading a second offset through
-        every driver separately."""
-        return self.settings.cw_offset_hz + self.settings.transceiver_cw_pitch_hz
-
     async def _tick(self) -> None:
         """Runs one poll iteration. A no-op (beyond publishing a status
         snapshot) for whichever subsystem isn't active -- rig and WebSDR
@@ -2124,10 +2113,9 @@ class SyncEngine:
         # this method: force a forward re-push (_last_sent_freq = None)
         # and a reverse re-baseline (_reverse_reseed_due = True) instead
         # of letting the shift be misread as a page edit.
-        effective_cw_offset_hz = self._effective_cw_offset_hz()
-        if self._driver is not None and effective_cw_offset_hz != self._applied_cw_offset_hz:
-            self._driver.cw_offset_hz = effective_cw_offset_hz
-            self._applied_cw_offset_hz = effective_cw_offset_hz
+        if self._driver is not None and self.settings.cw_offset_hz != self._applied_cw_offset_hz:
+            self._driver.cw_offset_hz = self.settings.cw_offset_hz
+            self._applied_cw_offset_hz = self.settings.cw_offset_hz
             self._last_sent_freq = None
             self._reverse_reseed_due = True
 

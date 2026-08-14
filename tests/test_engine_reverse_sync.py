@@ -1318,42 +1318,6 @@ def test_changing_cw_offset_mid_session_does_not_retune_the_rig():
     assert driver.cw_offset_hz == 700, "the driver must still pick up the new offset"
 
 
-def test_effective_cw_offset_sums_websdr_offset_and_transceiver_pitch():
-    engine = make_engine()
-    engine.settings.cw_offset_hz = 600
-    engine.settings.transceiver_cw_pitch_hz = 750
-    assert engine._effective_cw_offset_hz() == 1350
-
-
-def test_changing_transceiver_cw_pitch_mid_session_does_not_retune_the_rig():
-    """Same bug shape as test_changing_cw_offset_mid_session_does_not_retune_the_rig,
-    but for the Transceiver-tab CW pitch field instead of the Behaviour-tab
-    WebSDR CW offset spinner -- both feed the same summed
-    _effective_cw_offset_hz(), so both must reseed rather than retune when
-    edited live."""
-    engine = make_engine()
-    stub_rig = StubReverseRig(RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False))
-    status = WebSDRStatus(connected=True, freq_hz=14074750, mode="USB")  # page: rig freq + 750 Hz pitch
-    engine._rig, engine._rig_active = stub_rig, True
-    driver = LiveCWOffsetDriver(status, cw_offset_hz=750)
-    engine._driver, engine._websdr_active = driver, True
-    engine.settings.cw_offset_hz = 0
-    engine.settings.transceiver_cw_pitch_hz = 750
-    engine._applied_cw_offset_hz = 750  # as if a prior tick already synced it, matching connect-time
-    _settle_and_capture_baseline(engine)
-
-    # Operator fills in their rig's CW pitch in the Transceiver tab. The page itself does not move.
-    engine.settings.transceiver_cw_pitch_hz = 800
-    _clear_holdoff(engine)
-    asyncio.run(engine._tick())
-    _clear_reverse_debounce(engine)
-    _clear_holdoff(engine)
-    asyncio.run(engine._tick())
-
-    assert stub_rig.set_freqs == [], "changing the transceiver CW pitch alone must never retune the rig"
-    assert driver.cw_offset_hz == 800, "the driver must still pick up the new (summed) offset"
-
-
 class _CountingStatusDriver(StubReverseDriver):
     def __init__(self, status: WebSDRStatus) -> None:
         super().__init__(status)

@@ -30,15 +30,10 @@ MAX_POLL_INTERVAL_S = 5.0
 MIN_WEBVIEW_WIDTH = 400
 MIN_WEBVIEW_HEIGHT = 300
 
-# Bounds for AppSettings.cw_offset_hz and .transceiver_cw_pitch_hz --
-# defined here (not in gui/settings_panels/transceiver_panel.py) so
-# load() can enforce them on a hand-edited config.json too, not just the
-# GUI's SpinCtrl widgets (same split as MIN/MAX_POLL_INTERVAL_S above).
-# Without this, a hand-edited out-of-range value would be applied as-is
-# by SyncEngine (which reads AppSettings directly), while the SpinCtrl
-# displaying it silently clamps to its own min/max on construction --
-# leaving the GUI's own "effective CW offset" readout showing a
-# different number than what's actually pushed to the driver.
+# Bounds for AppSettings.cw_offset_hz -- defined here (not in
+# gui/settings_panels/behaviour_panel.py) so load() can enforce them on
+# a hand-edited config.json too, not just the GUI's SpinCtrl widget
+# (same split as MIN/MAX_POLL_INTERVAL_S above).
 CW_HZ_MIN = -2000
 CW_HZ_MAX = 2000
 
@@ -133,24 +128,6 @@ class AppSettings:
     # upstream disappears locally too, since this isn't user-owned data.
     curated_sites: list = field(default_factory=list)
     cw_offset_hz: int = 0
-    # Transceiver settings tab, right beside cw_offset_hz's own field: the
-    # rig's OWN CW pitch/sidetone setting (e.g. from its menu), entered
-    # manually -- nothing queries the rig for this automatically
-    # (rigctld's hamlib CWPITCH level is real and readable, but the user
-    # explicitly wants a plain editable field, not an auto-query). Added
-    # to cw_offset_hz (see sync/engine.py's SyncEngine._effective_cw_offset_hz(),
-    # which sums the two into one value pushed to driver.cw_offset_hz)
-    # rather than kept as a second, separately-threaded offset -- reuses
-    # all of cw_offset_hz's existing live-sync/reverse-sync-reseed
-    # handling for free. Most rigs default this to a few hundred Hz (a
-    # common one, live-confirmed by the user's own rig: 750 Hz) --
-    # entering it here lets the WebSDR CW offset field stay at 0 for "no
-    # additional correction needed" instead of the operator having to
-    # fold the rig's own pitch into that number by hand. Both fields are
-    # kept on the same tab (moved here from Behaviour, where cw_offset_hz
-    # originally lived alone) specifically so the relationship between
-    # them is visible rather than surprising.
-    transceiver_cw_pitch_hz: int = 0
     # Reverse sync (WebSDR -> rig): when the WebSDR page is in USB/LSB,
     # send the rig's DATA-mode variant instead of plain USB/LSB (e.g.
     # PKTUSB/PKTLSB on rigctld, DATA-U/DATA-L on flrig) -- for operators
@@ -273,7 +250,7 @@ class AppSettings:
             _clamp_poll_interval(filtered)
             _clamp_reverse_sync_range(filtered)
             _clamp_idle_disconnect(filtered)
-            _clamp_cw_offsets(filtered)
+            _clamp_cw_offset(filtered)
             _validate_main_window_position(filtered)
             return cls(**filtered)
         except (json.JSONDecodeError, OSError, TypeError) as e:
@@ -311,7 +288,6 @@ _SCALAR_TYPES: dict[str, "type | tuple[type, ...]"] = {
     "last_site_url": str,
     "last_site_driver_type": str,
     "cw_offset_hz": int,
-    "transceiver_cw_pitch_hz": int,
     "force_ssb_to_data_mode": bool,
     "mute_on_tx": bool,
     "sync_tx_vfo": bool,
@@ -437,31 +413,30 @@ def clamp_idle_disconnect_min(value: Optional[int]) -> Optional[int]:
 
 
 def clamp_cw_hz(value: int) -> int:
-    """Pure sanity-check of a CW offset/pitch value: takes the value,
-    returns the corrected one. Shared by _clamp_cw_offsets() below (a
-    hand-edited config.json) and transceiver_panel.py's two SpinCtrls
-    (via CW_HZ_MIN/CW_HZ_MAX), so the two layers enforcing this bound
-    can't drift apart -- same split as clamp_reverse_sync_bounds()."""
+    """Pure sanity-check of a CW offset value: takes the value, returns
+    the corrected one. Shared by _clamp_cw_offset() below (a hand-edited
+    config.json) and behaviour_panel.py's SpinCtrl (via
+    CW_HZ_MIN/CW_HZ_MAX), so the two layers enforcing this bound can't
+    drift apart -- same split as clamp_reverse_sync_bounds()."""
     return min(max(value, CW_HZ_MIN), CW_HZ_MAX)
 
 
-def _clamp_cw_offsets(filtered: dict[str, Any]) -> None:
-    """Apply clamp_cw_hz() to cw_offset_hz and transceiver_cw_pitch_hz in
-    a loaded config dict, in place. Runs after _validate_scalars, so
-    each value (if present) is already known to be an int. Only writes a
-    key back when its value actually changed, so an absent key stays
-    absent and falls through to the dataclass default."""
-    for key in ("cw_offset_hz", "transceiver_cw_pitch_hz"):
-        if key not in filtered:
-            continue
-        value = filtered[key]
-        clamped = clamp_cw_hz(value)
-        if clamped != value:
-            logger.warning(
-                "Clamping %s in %s from %r to %r (allowed range [%s, %s])",
-                key, CONFIG_FILE, value, clamped, CW_HZ_MIN, CW_HZ_MAX,
-            )
-            filtered[key] = clamped
+def _clamp_cw_offset(filtered: dict[str, Any]) -> None:
+    """Apply clamp_cw_hz() to cw_offset_hz in a loaded config dict, in
+    place. Runs after _validate_scalars, so the value (if present) is
+    already known to be an int. Only writes the key back when its value
+    actually changed, so an absent key stays absent and falls through to
+    the dataclass default."""
+    if "cw_offset_hz" not in filtered:
+        return
+    value = filtered["cw_offset_hz"]
+    clamped = clamp_cw_hz(value)
+    if clamped != value:
+        logger.warning(
+            "Clamping cw_offset_hz in %s from %r to %r (allowed range [%s, %s])",
+            CONFIG_FILE, value, clamped, CW_HZ_MIN, CW_HZ_MAX,
+        )
+        filtered["cw_offset_hz"] = clamped
 
 
 def _clamp_idle_disconnect(filtered: dict[str, Any]) -> None:
