@@ -12,3 +12,7 @@ venv/
 build/
 dist/
 *.spec
+
+# Local-only session notes/instructions -- not shared to the remote.
+CLAUDE.md
+project_brief.md
