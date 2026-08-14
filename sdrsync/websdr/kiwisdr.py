@@ -544,7 +544,23 @@ class KiwiSDRDriver:
                 logger.debug(self._last_mode_error)
             return False
 
+        # Bug-hunter finding, confirmed against the live site's own JS:
+        # ext_tune()'s mode branch (freqmode_set_dsp_kHz) only recreates
+        # the demodulator -- which is what actually resets the filter to
+        # a mode's default -- when the mode STRING changes
+        # (`mode!=cur_mode`). Since this driver only ever sends the base
+        # mode string now (no more narrow/wide variant strings), an
+        # unchanged mode with lo=hi=null is a COMPLETE no-op for the
+        # filter, not "use the site's own default" -- so turning
+        # AppSettings.sync_passband_from_rig off (or a rig that stops
+        # reporting a passband) left whatever custom width was last sent
+        # in place forever. Falling back to our own reference default
+        # here (same table passband_edges() itself anchors on) makes
+        # every set_mode() call explicit about the filter it wants,
+        # regardless of whether the mode string happens to be changing.
         edges = passband_edges(kiwi_mode, passband_hz)
+        if edges is None:
+            edges = _DEFAULT_EDGES_HZ.get(kiwi_mode)
         lo, hi = edges if edges is not None else (None, None)
         try:
             result = await self._page.evaluate(

@@ -34,7 +34,10 @@ def make_driver() -> KiwiSDRDriver:
 
 
 def _ext_tune_args(driver: KiwiSDRDriver) -> dict:
-    for js, args in driver._page.calls:
+    """The most recent ext_tune() call's args -- last match, not first,
+    so a test driving multiple set_mode() calls can inspect each one in
+    turn rather than always seeing the first."""
+    for js, args in reversed(driver._page.calls):
         if "ext_tune" in js:
             return args[0]
     raise AssertionError("ext_tune was never called")
@@ -50,17 +53,23 @@ def test_set_mode_with_passband_sends_exact_edges():
     assert (a["lo"], a["hi"]) == (300, 2700)  # passband_edges("usb", 2400)
 
 
-def test_set_mode_without_passband_omits_the_filter():
-    """No usable passband_hz -> lo/hi both None (serializes to JS null),
-    which ext_tune()'s own isArg() check treats as "don't touch the
-    filter" -- falls back to the site's own default for the mode."""
+def test_set_mode_without_passband_explicitly_sends_the_sites_own_default():
+    """Bug-hunter finding, confirmed against the live site's own JS:
+    ext_tune()'s mode branch only resets the filter (via a fresh
+    demodulator) when the MODE STRING changes -- since this driver only
+    ever sends the base mode string now, an unchanged mode with lo=hi=
+    null is a complete no-op for the filter, not "use the site's own
+    default". So no usable passband_hz must still send the site's own
+    reference edges explicitly, not null/null -- otherwise turning
+    AppSettings.sync_passband_from_rig off left a previously-applied
+    custom width in place forever."""
     driver = make_driver()
     ok = asyncio.run(driver.set_mode("USB", None))
 
     assert ok is True
     a = _ext_tune_args(driver)
     assert a["mode"] == "usb"
-    assert (a["lo"], a["hi"]) == (None, None)
+    assert (a["lo"], a["hi"]) == (300, 2700)  # kiwisdr.py's own _DEFAULT_EDGES_HZ["usb"]
 
 
 def test_set_mode_cw_uses_the_sites_own_500hz_centred_filter():
@@ -72,6 +81,22 @@ def test_set_mode_cw_uses_the_sites_own_500hz_centred_filter():
     a = _ext_tune_args(driver)
     assert a["mode"] == "cw"
     assert (a["lo"], a["hi"]) == (300, 700)  # passband_edges("cw", 400)
+
+
+def test_turning_off_passband_sync_mid_session_actually_restores_the_default():
+    """The exact bug-hunter repro: mode stays USB throughout (KiwiSDR's
+    own JS never recreates the demodulator for an unchanged mode
+    string), only passband_hz changes from a rig-derived width to None
+    -- as AppSettings.sync_passband_from_rig being turned off would
+    produce. Must not leave the earlier custom width in place."""
+    driver = make_driver()
+    asyncio.run(driver.set_mode("USB", 1800))
+    assert _ext_tune_args(driver) == {"mode": "usb", "lo": 300, "hi": 2100}
+
+    ok = asyncio.run(driver.set_mode("USB", None))
+
+    assert ok is True
+    assert _ext_tune_args(driver) == {"mode": "usb", "lo": 300, "hi": 2700}
 
 
 def test_readback_verification_only_checks_mode_not_filter():

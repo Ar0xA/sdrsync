@@ -105,14 +105,32 @@ def map_hamlib_mode(hamlib_mode: str) -> Optional[str]:
 #   FM      setmf("fm",       -5,    5)
 # Used both as the "which edge stays fixed while width varies" convention
 # below and as passband_edges()'s per-mode existence check.
+#
+# AMSYNC deliberately has NO entry here (unlike the other 5 modes) --
+# bug-hunter finding: some real websdr.org builds (confirmed: Hack
+# Green) have no "AMSYNC" case in their own set_mode() JS switch at all,
+# so a bare window.set_mode("AMSYNC") call there is a harmless no-op,
+# exactly as it always was before this session's passband work. Giving
+# AMSYNC an entry here would route it through window.setmf("amsync",
+# ...) instead whenever a rig reports a passband -- setmf() has no such
+# per-mode validation, so it would silently ask a build that doesn't
+# implement synchronous-AM demod at all to receive in a mode it was
+# never built to support, a NEW failure mode this driver didn't have
+# before. Leaving AMSYNC out keeps it on the exact same switch-gated,
+# no-op-if-unsupported path it always used.
 _DEFAULT_EDGES_HZ: dict[str, tuple[float, float]] = {
     "USB": (300, 2700),
     "LSB": (-2700, -300),
     "AM": (-4500, 4500),
-    "AMSYNC": (-4500, 4500),
     "CW": (-950, -550),
     "FM": (-5000, 5000),
 }
+
+# The site's own iscw() is `hi-lo < 1.0` (kHz) -- see passband_edges()'s
+# own docstring for the full reasoning. Kept safely under 1000 Hz, not
+# right at it, so floating-point width/2 arithmetic can't land exactly
+# on the boundary.
+_MAX_CW_WIDTH_HZ = 900
 
 
 def passband_edges(base_mode: str, width_hz: Optional[int]) -> Optional[tuple[float, float]]:
@@ -139,8 +157,11 @@ def passband_edges(base_mode: str, width_hz: Optional[int]) -> Optional[tuple[fl
               puts it (300 Hz, clear of the carrier) and the width is
               added above it.
         LSB   the mirror of that (high edge fixed at -300 Hz).
-        AM/AMSYNC/FM   symmetric about the dial, like the site's own
-              presets for these modes -- half the width each side.
+        AM/FM   symmetric about the dial, like the site's own presets
+              for these modes -- half the width each side. (AMSYNC has
+              no entry in _DEFAULT_EDGES_HZ at all -- see that table's
+              own comment for why -- so it never reaches this function
+              with a usable default; passband_hz has no effect on it.)
         CW    symmetric about -750 Hz, NOT the dial -- this is the
               site's own hardcoded CW filter centre (the midpoint of its
               real -950/-550 Hz preset), matching a standard ~750 Hz CW
@@ -149,6 +170,19 @@ def passband_edges(base_mode: str, width_hz: Optional[int]) -> Optional[tuple[fl
               user's CW offset "0 line" reading 750 Hz wasn't a bug --
               it's this site's own built-in filter centre, unrelated to
               anything sdrsync itself adds.)
+
+    CW width is capped at _MAX_CW_WIDTH_HZ regardless of what the rig
+    reports (bug-hunter finding, confirmed against the live site's own
+    JS): the site's OWN "am I in CW" test is `hi-lo < 1.0` (kHz), not a
+    mode check -- iscw() -- and both nominalfreq()'s displayed-frequency
+    math and setfreqb()'s click/type-to-tune math branch on it. A common
+    real rig CW filter (e.g. 1200 Hz) would push hi-lo to 1.2 kHz,
+    silently flipping the site OUT of its own CW handling: the displayed
+    frequency box would jump 750 Hz (no longer subtracting the filter
+    centre), and typing/clicking a frequency on the page would land 750
+    Hz away from where a narrower CW filter would have put it. The
+    site's own default CW filter (400 Hz) was always safely under this
+    threshold, which is why the pre-passband-sync code never hit it.
     """
     defaults = _DEFAULT_EDGES_HZ.get(base_mode)
     if defaults is None or not width_hz or width_hz <= 0:
@@ -161,8 +195,9 @@ def passband_edges(base_mode: str, width_hz: Optional[int]) -> Optional[tuple[fl
         return high - width_hz, high
     if base_mode == "CW":
         center = (defaults[0] + defaults[1]) / 2
+        width_hz = min(width_hz, _MAX_CW_WIDTH_HZ)
         return center - width_hz / 2, center + width_hz / 2
-    # AM, AMSYNC, FM -- symmetric about the dial, like the site's own presets.
+    # AM, FM -- symmetric about the dial, like the site's own presets.
     return -width_hz / 2, width_hz / 2
 
 
