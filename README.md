@@ -196,7 +196,21 @@ Or, as an editable install (also registers an `sdrsync` command):
 pip install -e .
 ```
 
-**Linux:** `pip install`ing wxPython on Linux falls back to a slow,
+**Linux (recommended):** run `./sdrsync.sh` from a clone of this repo — it
+detects your distro, installs the needed wxPython/WebKitGTK packages if
+they're missing (asks first; Debian/Ubuntu confirmed, Fedora/Arch
+best-effort), sets up a `.venv`, and launches the app, all in one step:
+
+```bash
+git clone https://github.com/Ar0xA/sdrsync.git
+cd sdrsync
+./sdrsync.sh
+```
+
+Re-run the same command to launch it again later — it reuses the venv and
+only touches system packages the first time (or if they go missing).
+
+**Linux (manual):** `pip install`ing wxPython on Linux falls back to a slow,
 often-failing source build — PyPI ships no manylinux wheels for it.
 `requirements.txt`/`pyproject.toml` both skip wxPython on Linux for this
 reason; install your distro's package instead, *then* install the rest:
@@ -225,8 +239,8 @@ startup, the error message names the exact packages it's missing.
    (Or check **Use mock rig** in the Transceiver panel instead — see below
    — if you just want to try it out without a radio; works with either
    backend.)
-2. Start sdrsync — double-click `SDRSync.exe` if you're on the packaged Windows build, or from
-   source:
+2. Start sdrsync — double-click `SDRSync.exe` if you're on the packaged Windows build, run
+   `./sdrsync.sh` on Linux, or from source on any platform:
    ```bash
    python -m sdrsync.main
    ```
@@ -366,12 +380,9 @@ GPL-3.0-only — see [LICENSE](LICENSE).
   `SDRSync-vX.Y.Z-windows.zip` (unzip, run `SDRSync.exe`, no Python
   needed).
 - **Linux**: supported, but currently **run from source only** — no
-  packaged tarball has shipped since v1.1.0. Install the distro
-  wxPython/WebKitGTK packages (see "Install" above), then launch the
-  same way as any platform:
-  ```bash
-  python -m sdrsync.main
-  ```
+  packaged tarball has shipped since v1.1.0. Run `./sdrsync.sh` from a
+  clone of this repo (see "Install" above) — it handles the distro
+  wxPython/WebKitGTK packages, a venv, and launching, all in one step.
   (WebKitGTK is the embedded browser.) Live-verified inside WSL2/WSLg and,
   as of v2.2.7, on a bare-metal Linux desktop (Linux Mint/Cinnamon, X11) —
   the latter needed a fix for WebSDR audio staying silent there (WebKitGTK
