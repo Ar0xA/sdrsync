@@ -13,13 +13,24 @@ driver stays attached (see attach()'s own comment, same reasoning as
 kiwisdr.py's identical watcher), so these tests explicitly await
 driver._audio_unlock_task after attach() returns -- a bare asyncio.run()
 around attach() alone would tear the loop down before that task ever got
-to run."""
+to run.
+
+The watcher itself is gated off entirely on win32 -- see kiwisdr.py's
+identical test file's module docstring for why tests that exercise the
+watcher actually clicking are marked _NOT_WIN32 (skip cleanly on
+Windows, rather than failing)."""
 import asyncio
 import sys
+
+import pytest
 
 from sdrsync.websdr import browser_shim
 from sdrsync.websdr import openwebrx as openwebrx_module
 from sdrsync.websdr.openwebrx import OpenWebRXDriver
+
+_NOT_WIN32 = pytest.mark.skipif(
+    sys.platform == "win32", reason="audio-unlock click watcher is disabled entirely on win32"
+)
 
 
 class StubPage:
@@ -70,6 +81,7 @@ async def _attach_and_wait_for_watcher(driver: OpenWebRXDriver, page: StubPage) 
         await driver._audio_unlock_task
 
 
+@_NOT_WIN32
 def test_clicks_overlay_when_present(monkeypatch):
     monkeypatch.setattr(openwebrx_module, "AUDIO_UNLOCK_OVERLAY_FADE_S", 0.01)
     page = StubPage(overlay_rect={"x": 50.0, "y": 60.0})
@@ -81,6 +93,7 @@ def test_clicks_overlay_when_present(monkeypatch):
     assert driver.attached is True
 
 
+@_NOT_WIN32
 def test_keeps_watching_when_click_was_a_no_op(monkeypatch):
     # A dispatched click is not proof it did anything -- see kiwisdr.py's
     # identical watcher/test for the confirmed real-world case this
@@ -108,6 +121,7 @@ def test_keeps_watching_when_click_was_a_no_op(monkeypatch):
     assert len(page.click_calls) > 1
 
 
+@_NOT_WIN32
 def test_does_not_click_when_overlay_absent(monkeypatch):
     # e.g. Windows/WebView2, where sdrsync's own --autoplay-policy flag
     # means the overlay never renders in the first place. The watcher only
@@ -180,6 +194,7 @@ def test_skips_the_click_when_disabled_via_settings():
     assert driver.attached is True
 
 
+@_NOT_WIN32
 def test_stops_clicking_after_give_up_threshold(monkeypatch):
     """See kiwisdr.py's identical test -- a bug-hunter review pass found
     the unbounded version could click forever. After

@@ -15,13 +15,30 @@ had the overlay still not present a full 20s after session start, well
 past what seemed like a generous one-shot window), so these tests
 explicitly await driver._audio_unlock_task after attach() returns -- a
 bare asyncio.run() around attach() alone would tear the loop down before
-that task ever got to run."""
+that task ever got to run.
+
+The watcher itself is gated off entirely on win32 (see attach()'s own
+`sys.platform != "win32"` check -- WebView2 never needs it). Tests that
+exercise the watcher actually clicking are marked _NOT_WIN32 below, so
+running this file for real on Windows reports them as SKIPPED rather
+than FAILED -- they're testing functionality that's intentionally
+disabled there, not a cross-platform regression. Only
+test_skips_the_click_entirely_on_windows and
+test_skips_the_click_when_disabled_via_settings are meant to run on
+every host OS (they verify the gating logic itself, which must hold
+regardless of what platform pytest happens to run on)."""
 import asyncio
 import sys
+
+import pytest
 
 from sdrsync.websdr import browser_shim
 from sdrsync.websdr import kiwisdr as kiwisdr_module
 from sdrsync.websdr.kiwisdr import KiwiSDRDriver
+
+_NOT_WIN32 = pytest.mark.skipif(
+    sys.platform == "win32", reason="audio-unlock click watcher is disabled entirely on win32"
+)
 
 
 class StubPage:
@@ -67,6 +84,7 @@ async def _attach_and_wait_for_watcher(driver: KiwiSDRDriver, page: StubPage) ->
         await driver._audio_unlock_task
 
 
+@_NOT_WIN32
 def test_clicks_overlay_when_present(monkeypatch):
     monkeypatch.setattr(kiwisdr_module, "AUDIO_UNLOCK_OVERLAY_FADE_S", 0.01)
     page = StubPage(overlay_rect={"x": 50.0, "y": 60.0})
@@ -78,6 +96,7 @@ def test_clicks_overlay_when_present(monkeypatch):
     assert driver.attached is True
 
 
+@_NOT_WIN32
 def test_keeps_watching_when_click_was_a_no_op(monkeypatch):
     # Regression coverage: a receiver with cfg.require_id set renders the
     # exact same overlay class with onclick='' (an ID/callsign text field
@@ -109,6 +128,7 @@ def test_keeps_watching_when_click_was_a_no_op(monkeypatch):
     assert len(page.click_calls) > 1
 
 
+@_NOT_WIN32
 def test_does_not_click_when_overlay_absent(monkeypatch):
     # e.g. Windows/WebView2, where sdrsync's own --autoplay-policy flag
     # means the overlay never renders in the first place. The watcher only
@@ -177,6 +197,7 @@ def test_skips_the_click_when_disabled_via_settings():
     assert driver.attached is True
 
 
+@_NOT_WIN32
 def test_stops_clicking_after_give_up_threshold_on_a_require_id_receiver(monkeypatch):
     """Found by a bug-hunter review pass: with no cap, a require_id
     receiver (every click a permanent no-op) made the watcher click
@@ -214,6 +235,7 @@ def test_stops_clicking_after_give_up_threshold_on_a_require_id_receiver(monkeyp
     assert len(page.click_calls) == count_after_giving_up, "must not click again during the probe-only phase"
 
 
+@_NOT_WIN32
 def test_probe_only_phase_reports_success_if_the_overlay_clears_itself(monkeypatch):
     """Once the watcher has given up clicking, it should still notice the
     operator (or the page itself) clearing the overlay some other way,
