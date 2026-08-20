@@ -85,6 +85,14 @@ def test_load_clamps_out_of_range_poll_interval(monkeypatch, tmp_path):
     assert AppSettings.load().poll_interval_s == config_module.MAX_POLL_INTERVAL_S
 
 
+def test_load_replaces_non_finite_poll_interval_with_default(monkeypatch, tmp_path):
+    config_file = _use_tmp_config(monkeypatch, tmp_path)
+
+    for value in (float("nan"), float("inf"), float("-inf")):
+        config_file.write_text(json.dumps({"poll_interval_s": value}), encoding="utf-8")
+        assert AppSettings.load().poll_interval_s == AppSettings().poll_interval_s
+
+
 def test_load_accepts_valid_reverse_sync_range(monkeypatch, tmp_path):
     config_file = _use_tmp_config(monkeypatch, tmp_path)
     config_file.write_text(

@@ -78,7 +78,7 @@ from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
 from sdrsync.websdr.browser_shim import click_element_if_present, element_is_present
 
-from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, same_site
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, is_finite_frequency, same_site
 
 logger = logging.getLogger("sdrsync.websdr.openwebrx")
 
@@ -469,7 +469,7 @@ class OpenWebRXDriver:
         here -- this driver's readback verification is synchronous and
         inline (below), not a delayed background task, so there's nothing
         for verify=False to skip."""
-        if not self._attached:
+        if not self._attached or not is_finite_frequency(freq_hz):
             return False
         effective_hz = freq_hz
         if self._current_mode == "cw":
@@ -633,16 +633,18 @@ class OpenWebRXDriver:
         edges = passband_edges(mode, passband_hz, default_bandpass)
         target = edges if edges is not None else default_bandpass
         try:
-            await self._page.evaluate(
+            filter_result = await self._page.evaluate(
                 "(a) => { "
                 "var d = $('#openwebrx-panel-receiver').demodulatorPanel().getDemodulator(); "
                 # Guards against a mode change racing this call between the
                 # two round trips (bug-hunter finding) -- a filter meant
                 # for the mode we just set must never land on some OTHER
                 # mode the operator switched to in the meantime.
-                "if (!d || d.modulation !== a.mode) return; "
+                "if (!d) return 'no_demodulator'; "
+                "if (d.modulation !== a.mode) return 'mode_changed'; "
                 "if (a.lo !== null && a.hi !== null) { d.setBandpass({low_cut: a.lo, high_cut: a.hi}); } "
                 "else { d.disableBandpass(); } "
+                "return 'applied'; "
                 "}",
                 {"mode": mode, "lo": target[0] if target is not None else None,
                  "hi": target[1] if target is not None else None},
@@ -653,6 +655,16 @@ class OpenWebRXDriver:
             # filter must not cost us the mode change" philosophy as
             # ubersdr.py's set_mode()).
             logger.warning("setBandpass() failed after a successful setMode(): %s", e)
+            self._last_mode_error = f"OpenWebRX filter update failed after setting {mode!r}: {e}"
+            return False
+
+        if filter_result != "applied":
+            self._last_mode_error = (
+                f"OpenWebRX filter update was not applied after setting {mode!r} "
+                f"({filter_result or 'no result'})"
+            )
+            logger.warning(self._last_mode_error)
+            return False
 
         self._current_mode = mode
         self._last_mode_error = None

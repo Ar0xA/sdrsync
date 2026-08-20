@@ -6,9 +6,20 @@ sync engine and GUI only ever talk to this interface.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Protocol
 from urllib.parse import urlsplit
+
+
+def is_finite_frequency(value: object) -> bool:
+    """Whether *value* is a usable numeric frequency.
+
+    Keep this check at every external boundary: ``int(float('nan'))`` and
+    ``round(float('inf'))`` raise, while comparisons with NaN silently return
+    false and can make invalid values look in-range.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def same_site(current_url: str, expected_url: str) -> bool:

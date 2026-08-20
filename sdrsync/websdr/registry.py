@@ -24,6 +24,20 @@ DRIVERS = {
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
 
 
+def matching_driver_types(html: str) -> tuple[str, ...]:
+    """Return every registered driver whose script markers match *html*."""
+    script_srcs = _SCRIPT_SRC_RE.findall(html)
+    return tuple(
+        driver_type
+        for driver_type, driver_cls in DRIVERS.items()
+        if any(
+            marker in src
+            for src in script_srcs
+            for marker in getattr(driver_cls, "FINGERPRINT_MARKERS", ())
+        )
+    )
+
+
 def detect_driver_type(html: str) -> Optional[str]:
     """Guess a driver_type from a WebSDR site's raw root-page HTML.
 
@@ -34,16 +48,7 @@ def detect_driver_type(html: str) -> Optional[str]:
     guess") rather than picking one -- DRIVERS dict ordering must never
     become a load-bearing tie-break rule.
     """
-    script_srcs = _SCRIPT_SRC_RE.findall(html)
-    matches = [
-        driver_type
-        for driver_type, driver_cls in DRIVERS.items()
-        if any(
-            marker in src
-            for src in script_srcs
-            for marker in getattr(driver_cls, "FINGERPRINT_MARKERS", ())
-        )
-    ]
+    matches = matching_driver_types(html)
     if len(matches) == 1:
         return matches[0]
     return None

@@ -1,4 +1,4 @@
-from sdrsync.websdr.registry import detect_driver_type
+from sdrsync.websdr.registry import detect_driver_type, matching_driver_types
 
 WEBSDR_ORG_HTML = """
 <html><head>
@@ -110,6 +110,11 @@ def test_ambiguous_matches_return_none_not_first_registered():
 
 def test_three_way_ambiguous_matches_return_none():
     assert detect_driver_type(ALL_THREE_MARKERS_HTML) is None
+
+
+def test_matching_driver_types_distinguishes_ambiguous_from_unknown():
+    assert matching_driver_types(UNRELATED_HTML) == ()
+    assert matching_driver_types(BOTH_MARKERS_HTML) == ("websdr_org", "kiwisdr")
 
 
 def test_marker_string_in_body_text_is_not_a_match():

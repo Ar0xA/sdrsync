@@ -45,7 +45,7 @@ from sdrsync.rig.fake_rigctld import FakeRigState
 from sdrsync.rig.fake_rigctld import start_server as start_mock_rigctld
 from sdrsync.rig.flrig import FlrigClient
 from sdrsync.rig.rigctld import RigctldClient
-from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, is_finite_frequency
 from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
 from sdrsync.websdr.registry import DRIVERS
@@ -614,6 +614,11 @@ class SyncEngine:
         self._last_logged_rig_freq: Optional[int] = None
         self._last_sent_mode_key: Optional[tuple[str, Optional[int]]] = None
         self._last_ptt: Optional[bool] = None
+        # Last native mute state successfully requested for the current
+        # page. Kept separate from _last_ptt so changing mute_on_tx while
+        # PTT is already active reconciles immediately without waiting for
+        # another PTT edge. None means a fresh page with no mute request yet.
+        self._last_muted: Optional[bool] = None
         # See FULL_RESYNC_INTERVAL_S.
         self._last_full_resync_at: float = time.monotonic()
         # See WEBSDR_MIN_WRITE_GAP_S -- 0.0 ("long ago") so the very first
@@ -1719,6 +1724,7 @@ class SyncEngine:
         self._pending_freq = None
         self._last_sent_mode_key = None
         self._last_ptt = None
+        self._last_muted = None
         self._last_full_resync_at = time.monotonic()
         # 0.0 ("long ago"), not now: a fresh attach must not be held back
         # by a gap measured against a write to the page that no longer
@@ -1783,6 +1789,9 @@ class SyncEngine:
         generation = self._sync_latch_generation
         obs_mode = self._driver.hamlib_mode_from_status(websdr_status)
         obs_freq = self._driver.rig_freq_from_status(websdr_status)
+        if obs_freq is not None and not is_finite_frequency(obs_freq):
+            logger.warning("Ignoring non-finite WebSDR frequency: %r", obs_freq)
+            obs_freq = None
 
         if not self._reverse_baseline_captured or self._reverse_reseed_due:
             # First observation after WebSDR (re)attach/toggle-on, OR the
@@ -2206,6 +2215,9 @@ class SyncEngine:
             self._publish(rig_connected=False, websdr=websdr_status)
             return
         state = await self._rig.get_state()
+        if state.freq_hz is not None and not is_finite_frequency(state.freq_hz):
+            logger.warning("Ignoring non-finite rig frequency: %r", state.freq_hz)
+            state = replace(state, freq_hz=None)
         # Diagnostic only (v2.2.2) -- see _last_logged_rig_freq's docstring.
         if state.freq_hz is not None and state.freq_hz != self._last_logged_rig_freq:
             logger.info("rig freq_hz read: %d (was %s)", state.freq_hz, self._last_logged_rig_freq)
@@ -2242,26 +2254,17 @@ class SyncEngine:
             # limit is.
             can_write_websdr = time.monotonic() - self._last_websdr_write_at >= WEBSDR_MIN_WRITE_GAP_S
 
-            # _last_ptt is deliberately NOT latched unless self._page
-            # actually exists: a PTT edge arriving with no page to mute
-            # must still fire once one exists again, or an unmute could
-            # be lost for the rest of the session (the same failure mode
-            # the falling-edge comment below already guards against).
-            if state.ptt is not None and state.ptt != self._last_ptt and self._page is not None:
+            # Reconcile the desired audio state, not merely PTT edges. This
+            # makes a live mute_on_tx setting change take effect during an
+            # existing transmission. Unknown state after any reset is also
+            # reconciled in both directions: a driver can reattach on the
+            # same native WebView, whose mute survives the driver reset.
+            if state.ptt is not None and self._page is not None:
                 self._last_ptt = state.ptt
-                if state.ptt:
-                    if self.settings.mute_on_tx:
-                        await self._page.set_muted(True)
-                else:
-                    # Always unmute on the falling edge, regardless of the
-                    # *current* mute_on_tx value -- if the user unchecks
-                    # mute_on_tx while still muted from an earlier TX, the
-                    # old gate-both-directions logic would skip this call
-                    # (since it also checked mute_on_tx here), leaving the
-                    # WebSDR muted indefinitely with no further edge ever
-                    # able to clear it. Unmuting when not actually muted
-                    # is a harmless no-op.
-                    await self._page.set_muted(False)
+                desired_muted = bool(state.ptt and self.settings.mute_on_tx)
+                if desired_muted != self._last_muted:
+                    await self._page.set_muted(desired_muted)
+                    self._last_muted = desired_muted
 
             transmitting = bool(self._last_ptt)
 

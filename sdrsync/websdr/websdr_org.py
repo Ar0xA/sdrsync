@@ -56,7 +56,7 @@ from sdrsync.websdr.browser_shim import PageLike as Page
 # Error in the versions we support, so catching PlaywrightError alone covers
 # it -- avoids depending on an export that isn't present in every version.
 
-from sdrsync.websdr.base import WebSDRDriver, WebSDRIncompatibleError, WebSDRStatus
+from sdrsync.websdr.base import WebSDRDriver, WebSDRIncompatibleError, WebSDRStatus, is_finite_frequency
 
 logger = logging.getLogger("sdrsync.websdr.websdr_org")
 
@@ -452,7 +452,7 @@ class WebsdrOrgDriver:
         WebSDRDriver.tune_hz's docstring for why (periodic full-resync of
         an unchanged frequency must not arm a corrective re-tune that can
         fight a concurrent reverse-sync push)."""
-        if not self._attached:
+        if not self._attached or not is_finite_frequency(freq_hz):
             return False
         effective_hz = freq_hz
         if self._current_mode in ("CW",):
@@ -718,9 +718,11 @@ class WebsdrOrgDriver:
             # (mirrors set_mode()'s own self._current_mode stripping above).
             raw_mode = data.get("mode")
             mode = raw_mode[:-1] if isinstance(raw_mode, str) and raw_mode.endswith("N") else raw_mode
+            raw_freq = data.get("freq")
+            freq_khz = float(raw_freq) if raw_freq is not None else None
             return WebSDRStatus(
                 connected=True,
-                freq_hz=int(round(float(data["freq"]) * 1000)) if data.get("freq") is not None else None,
+                freq_hz=int(round(freq_khz * 1000)) if is_finite_frequency(freq_khz) else None,
                 mode=mode,
                 audio_active=data.get("audio"),
                 last_error=self._combined_error(),

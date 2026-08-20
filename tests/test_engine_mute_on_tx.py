@@ -122,8 +122,78 @@ def test_mute_stays_gated_off_when_mute_on_tx_disabled_before_transmission():
 
     asyncio.run(engine._tick())
 
-    # mute_on_tx was already off before the rising edge -- must not mute.
-    assert stub_page.mute_calls == []
+    # A reset state is explicitly reconciled to unmuted. This is harmless
+    # on a fresh page and necessary when a driver reattaches on the same,
+    # still-muted native WebView.
+    assert stub_page.mute_calls == [False]
+
+
+def test_disabling_mute_on_tx_unmutes_during_existing_transmission():
+    settings = AppSettings(mute_on_tx=True)
+    engine, stub_page = _make_engine(
+        settings, RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=True)
+    )
+
+    async def run():
+        await engine._tick()
+        settings.mute_on_tx = False
+        await engine._tick()  # no PTT edge
+
+    asyncio.run(run())
+
+    assert stub_page.mute_calls == [True, False]
+
+
+def test_enabling_mute_on_tx_mutes_during_existing_transmission():
+    settings = AppSettings(mute_on_tx=False)
+    engine, stub_page = _make_engine(
+        settings, RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=True)
+    )
+
+    async def run():
+        await engine._tick()
+        settings.mute_on_tx = True
+        await engine._tick()  # no PTT edge
+
+    asyncio.run(run())
+
+    assert stub_page.mute_calls == [False, True]
+
+
+def test_steady_transmission_does_not_repeat_native_mute_every_tick():
+    settings = AppSettings(mute_on_tx=True)
+    engine, stub_page = _make_engine(
+        settings, RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=True)
+    )
+
+    async def run():
+        await engine._tick()
+        await engine._tick()
+
+    asyncio.run(run())
+
+    assert stub_page.mute_calls == [True]
+
+
+def test_reattach_reset_unmutes_same_page_after_transmission_ended():
+    settings = AppSettings(mute_on_tx=True)
+    engine, stub_page = _make_engine(
+        settings, RigState(freq_hz=14074000, mode="USB", passband_hz=2700, ptt=True)
+    )
+
+    async def run():
+        await engine._tick()
+        # Driver reattachment resets sync latches but can reuse the same
+        # native WebView, whose mute state persists across that reset.
+        engine._reset_sync_latches()
+        engine._rig.state = RigState(
+            freq_hz=14074000, mode="USB", passband_hz=2700, ptt=False
+        )
+        await engine._tick()
+
+    asyncio.run(run())
+
+    assert stub_page.mute_calls == [True, False]
 
 
 def test_mute_fires_immediately_even_inside_the_websdr_write_gap():

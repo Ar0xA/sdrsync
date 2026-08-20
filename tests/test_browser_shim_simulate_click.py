@@ -166,3 +166,25 @@ def test_click_proceeds_when_the_point_is_genuinely_under_our_own_window(monkeyp
 
     assert len(_FakeSimulator.instances) == 1
     assert ("click", wx.MOUSE_BTN_LEFT) in _FakeSimulator.instances[0].calls
+
+
+def test_native_click_exception_returns_false(monkeypatch):
+    top_level = _FakeTopLevel(shown=True, iconized=False)
+
+    class _FoundOurs:
+        def GetTopLevelParent(self):
+            return top_level
+
+    class _FailingSimulator(_FakeSimulator):
+        def MouseClick(self, button) -> None:
+            raise RuntimeError("native injection failed")
+
+    monkeypatch.setattr(wx, "FindWindowAtPoint", lambda pos: _FoundOurs())
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        adapter = _make_adapter(monkeypatch, loop, top_level)
+        monkeypatch.setattr(wx, "UIActionSimulator", _FailingSimulator)
+        return await adapter._simulate_click(5, 5)
+
+    assert asyncio.run(run()) is False

@@ -148,6 +148,18 @@ def _http_get_body_sync(url: str, timeout: float) -> Optional[str]:
         return None
 
 
+def _identify_websdr_html(url: str, html: str) -> tuple[Optional[str], str]:
+    """Classify fetched HTML, preserving unknown vs ambiguous outcomes."""
+    matches = registry.matching_driver_types(html)
+    if len(matches) > 1:
+        readable = ", ".join(matches)
+        return None, f"Ambiguous WebSDR type at {url}: matched multiple drivers ({readable})"
+    if not matches:
+        return None, f"Could not identify {url} as a supported WebSDR type"
+    driver_type = matches[0]
+    return driver_type, f"Detected: {driver_type}"
+
+
 async def detect_websdr_type(url: str, timeout: float = WEBSDR_CHECK_TIMEOUT_S) -> tuple[Optional[str], str]:
     """Fetch a URL's HTML and guess which registered WebSDR driver it needs.
 
@@ -159,9 +171,4 @@ async def detect_websdr_type(url: str, timeout: float = WEBSDR_CHECK_TIMEOUT_S) 
     if html is None:
         return None, f"Could not reach {url} to detect its WebSDR type"
 
-    driver_type = registry.detect_driver_type(html)
-    if driver_type is None:
-        return None, f"Could not identify {url} as a supported WebSDR type"
-    return driver_type, f"Detected: {driver_type}"
-
-
+    return _identify_websdr_html(url, html)

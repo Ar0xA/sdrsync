@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -335,7 +336,11 @@ def _clamp_poll_interval(filtered: dict[str, Any]) -> None:
     if "poll_interval_s" not in filtered:
         return
     value = filtered["poll_interval_s"]
-    clamped = min(max(value, MIN_POLL_INTERVAL_S), MAX_POLL_INTERVAL_S)
+    clamped = (
+        min(max(value, MIN_POLL_INTERVAL_S), MAX_POLL_INTERVAL_S)
+        if math.isfinite(value)
+        else AppSettings().poll_interval_s
+    )
     if clamped != value:
         logger.warning(
             "Clamping poll_interval_s in %s from %r to %r (allowed range [%s, %s])",

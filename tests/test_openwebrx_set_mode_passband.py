@@ -59,7 +59,7 @@ class StubPage:
             # the JS source directly instead.
             a = args[0]
             self.low_cut, self.high_cut = a["lo"], a["hi"]
-            return None
+            return "applied"
         return None
 
 
@@ -157,3 +157,19 @@ def test_second_call_guards_against_a_mode_change_racing_it():
     assert ok is True
     setbandpass_call = next(js for js, args in driver._page.calls if "setBandpass" in js)
     assert "d.modulation !== a.mode" in setbandpass_call
+
+
+def test_mode_change_race_is_reported_as_failure_not_success():
+    driver = make_driver({"usb": (300, 2700)})
+
+    class RacingPage(StubPage):
+        async def evaluate(self, js, *args):
+            if "setBandpass" in js:
+                self.calls.append((js, args))
+                return "mode_changed"
+            return await super().evaluate(js, *args)
+
+    driver._page = RacingPage({"usb": (300, 2700)})
+
+    assert asyncio.run(driver.set_mode("USB", 1200)) is False
+    assert "not applied" in driver._last_mode_error

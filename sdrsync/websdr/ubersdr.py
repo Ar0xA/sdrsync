@@ -68,7 +68,7 @@ from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
 from sdrsync.websdr.browser_shim import click_element_if_present
 
-from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, same_site
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, is_finite_frequency, same_site
 
 logger = logging.getLogger("sdrsync.websdr.ubersdr")
 
@@ -778,7 +778,7 @@ class UberSDRDriver:
         there's no delayed background correction for verify=False to skip
         (same reasoning as KiwiSDR's and OpenWebRX's tune_hz()).
         """
-        if not self._attached:
+        if not self._attached or not is_finite_frequency(freq_hz):
             return False
         effective_hz = freq_hz + (self.cw_offset_hz if self._is_cw() else 0)
 
@@ -895,7 +895,7 @@ class UberSDRDriver:
         mode = tuning.get("mode")
         return WebSDRStatus(
             connected=True,
-            freq_hz=int(freq) if isinstance(freq, (int, float)) else None,
+            freq_hz=int(freq) if is_finite_frequency(freq) else None,
             mode=str(mode).upper() if mode else None,
             # The receiver's own answer to "is audio playing", pushed to us
             # rather than inferred from a socket's readyState as the other

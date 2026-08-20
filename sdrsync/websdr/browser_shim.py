@@ -339,7 +339,7 @@ class PageLike(Protocol):
     async def wait_for_function(self, js: str, timeout: Optional[float] = None) -> None: ...
     async def set_muted(self, muted: bool) -> None: ...
     def on(self, event: str, handler: Callable) -> None: ...
-    mouse: Any  # .click(x: int, y: int) -> Awaitable[None]
+    mouse: Any  # .click(x: int, y: int) -> Awaitable[bool | None]
 
 
 # Default polling budget for click_element_if_present() below, used for a
@@ -454,10 +454,11 @@ async def click_element_if_present(
             # caller's own try/except BrowserError for a real attach
             # failure.
             try:
-                await page.mouse.click(click_x, click_y)
+                clicked = await page.mouse.click(click_x, click_y)
             except BrowserError as e:
                 logger.debug("click_element_if_present(%r) click itself failed: %s", selector, e)
-            return True
+                return False
+            return clicked is not False
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(CLICK_ELEMENT_POLL_INTERVAL_S)
@@ -526,8 +527,8 @@ class _Mouse:
     def __init__(self, adapter: "WxPageAdapter") -> None:
         self._adapter = adapter
 
-    async def click(self, x: int, y: int) -> None:
-        await self._adapter._simulate_click(x, y)
+    async def click(self, x: int, y: int) -> bool:
+        return await self._adapter._simulate_click(x, y)
 
 
 class WxPageAdapter:
@@ -967,7 +968,7 @@ class WxPageAdapter:
                 self._loop.call_soon_threadsafe(_safe_set_exception, gfut, exc)
 
     # ------------------------------------------------------------------ internal: click/audio-unlock
-    async def _simulate_click(self, x: int, y: int) -> None:
+    async def _simulate_click(self, x: int, y: int) -> bool:
         """Real OS-level click (wx.UIActionSimulator), not a JS
         .click()/dispatchEvent() -- Chromium/WebView2 explicitly treats
         JS-dispatched events as untrusted and excludes them from
@@ -980,7 +981,7 @@ class WxPageAdapter:
         input at all."""
         _require_background_thread("mouse.click")
         if not self._alive:
-            return
+            return False
         if self._on_screen_presenter is None:
             if not self._warned_no_presenter:
                 self._warned_no_presenter = True
@@ -988,8 +989,9 @@ class WxPageAdapter:
                     "mouse.click() called with no on_screen_presenter configured -- audio "
                     "autoplay-gate clicks will silently no-op, WebSDR audio may never unlock"
                 )
-            return
+            return False
         done = threading.Event()
+        outcome = {"clicked": False}
 
         def do_click():
             if not self._alive:
@@ -1028,9 +1030,12 @@ class WxPageAdapter:
                     )
                     return
                 sim = wx.UIActionSimulator()
-                sim.MouseMove(screen_pos)
+                moved = sim.MouseMove(screen_pos)
                 wx.MilliSleep(30)
-                sim.MouseClick(wx.MOUSE_BTN_LEFT)
+                clicked = sim.MouseClick(wx.MOUSE_BTN_LEFT)
+                if moved is False or clicked is False:
+                    logger.debug("Simulated click at (%d, %d) was rejected by wx", x, y)
+                    return
                 # MouseClick() injects via SendInput and returns before
                 # the OS actually delivers the WM_LBUTTONDOWN/UP to the
                 # window -- restoring off-screen on the very next line
@@ -1038,15 +1043,19 @@ class WxPageAdapter:
                 # from under the pointer before delivery, so the click
                 # lands nowhere and the autoplay gesture never registers.
                 wx.MilliSleep(150)
+                outcome["clicked"] = True
             except Exception as e:
                 logger.debug("Simulated click failed (non-fatal): %s", e)
             finally:
-                if self._alive:
-                    self._on_screen_presenter(False)
-                done.set()
+                try:
+                    if self._alive:
+                        self._on_screen_presenter(False)
+                finally:
+                    done.set()
 
         wx.CallAfter(do_click)
-        await self._loop.run_in_executor(None, done.wait, 5.0)
+        completed = await self._loop.run_in_executor(None, done.wait, 5.0)
+        return bool(completed and outcome["clicked"])
 
     # ------------------------------------------------------------------ internal: teardown
     def _cleanup_widget_bindings(self) -> None:

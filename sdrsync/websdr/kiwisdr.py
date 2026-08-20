@@ -62,7 +62,7 @@ from sdrsync.websdr.browser_shim import BrowserError as PlaywrightError
 from sdrsync.websdr.browser_shim import PageLike as Page
 from sdrsync.websdr.browser_shim import click_element_if_present, element_is_present
 
-from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus
+from sdrsync.websdr.base import WebSDRIncompatibleError, WebSDRStatus, is_finite_frequency
 
 logger = logging.getLogger("sdrsync.websdr.kiwisdr")
 
@@ -473,7 +473,7 @@ class KiwiSDRDriver:
         here -- this driver's readback verification is synchronous and
         inline (below), not a delayed background task, so there's nothing
         for verify=False to skip."""
-        if not self._attached:
+        if not self._attached or not is_finite_frequency(freq_hz):
             return False
         effective_hz = freq_hz
         if self._current_mode is not None and _base_mode_of(self._current_mode) == "cw":
@@ -658,7 +658,7 @@ class KiwiSDRDriver:
             freq_hz: Optional[int] = None
             if freq_str is not None:
                 freq_khz = float(freq_str)
-                if not math.isnan(freq_khz):
+                if is_finite_frequency(freq_khz):
                     freq_hz = int(round(freq_khz * 1000))
             return WebSDRStatus(
                 connected=True,

@@ -13,9 +13,10 @@ from sdrsync.websdr.browser_shim import BrowserError, click_element_if_present
 
 
 class StubPage:
-    def __init__(self, rect=None, raise_on_evaluate: bool = False):
+    def __init__(self, rect=None, raise_on_evaluate: bool = False, click_result=None):
         self._rect = rect
         self._raise_on_evaluate = raise_on_evaluate
+        self._click_result = click_result
         self.evaluate_calls = 0
         self.click_calls: list = []
         self.mouse = self
@@ -28,6 +29,7 @@ class StubPage:
 
     async def click(self, x, y):
         self.click_calls.append((x, y))
+        return self._click_result
 
 
 def _fast_polling(monkeypatch):
@@ -56,3 +58,10 @@ def test_evaluate_error_treated_as_not_present_not_raised(monkeypatch):
     result = asyncio.run(click_element_if_present(page, "#some-overlay"))
     assert result is False
     assert page.click_calls == []
+
+
+def test_native_click_rejection_is_not_reported_as_success():
+    page = StubPage(rect={"x": 10, "y": 20}, click_result=False)
+    result = asyncio.run(click_element_if_present(page, "#some-overlay"))
+    assert result is False
+    assert page.click_calls == [(10, 20)]
